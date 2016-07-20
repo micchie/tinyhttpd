@@ -46,19 +46,40 @@ struct dbinfo {
 	};
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READPMEM	0x2
+#define DBI_FLAGS_PASTE		0x4
 	int flags;
 	char ifname[IFNAMSIZ+8]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct fks_desc *fkd;
+	char *rxbuf;
+	int rxlen;
+	char *txbuf;
+	int txlen;
+	uint64_t pst_ent; /* 32 bit buf_idx + 16 bit off + 16 bit len */
 #endif /* WITH_STACKMAP */
 } dbi;
+
+static struct timespec ts = {0, 0};
+static inline void
+clflush(volatile void *p)
+{
+	//nanosleep(&ts, NULL);
+	asm volatile ("clflush (%0)" :: "r"(p));
+}
+static __inline void
+mfence(void)
+{
+	__asm __volatile("mfence" : : : "memory");
+}
+
+#define CACHE_LINE_SIZE	64 /* XXX */
 
 #define MAXCONNECTIONS 2048
 #define MAXQUERYLEN 65535
 #define MAXDUMBSIZE	204800
 #ifdef WITH_STACKMAP
 #define tcp_offset (sizeof(struct ethhdr) + sizeof(struct iphdr) \
-	+ sizeof(struct tcphdr)) + FKS_TCP_OPTLEN
+	+ sizeof(struct tcphdr) + FKS_TCP_OPTLEN)
 #define stackmap_offset (FKS_DMA_OFFSET + tcp_offset)
 static inline char *
 STACKMAP_BUF(struct netmap_ring *r, int i)
@@ -78,6 +99,11 @@ STACKMAP_RX_NXT(struct netmap_ring *rxr, struct netmap_ring *exr, int fd, struct
 		return &rxr->slot[i];
 	return &exr->slot[i - rxr->num_slots];
 }
+struct paste_hdr {
+	char ifname[IFNAMSIZ + 64];
+	char path[256];
+	uint32_t buf_ofs;
+};
 #endif /* WITH_STACKMAP */
 
 enum { DT_NONE=0, DT_DUMB, DT_SQLITE};
@@ -219,15 +245,24 @@ int do_accept(int fd, int epfd)
 int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 {
 	char buf[MAXQUERYLEN];
+	char *rxbuf, *txbuf;
 	static u_int seq = 0;
 	ssize_t len;
        
+	rxbuf = txbuf = buf;
 	if (dbi->flags & DBI_FLAGS_READPMEM) {
 		len = dbi->mmap; /* page size */
 		goto direct;
 	}
-	len = read(fd, buf, sizeof(buf));
-
+#ifdef WITH_STACKMAP
+	if (dbi->fkd) {
+		rxbuf = dbi->rxbuf;
+		txbuf = dbi->txbuf;
+		len = dbi->rxlen;
+	} else
+#endif /* WITH_STACKMAP */
+	{
+	len = read(fd, rxbuf, sizeof(buf));
 	if (len == 0) {
 		close(fd);
 		return 0;
@@ -235,15 +270,37 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 		perror("read");
 		return -1;
 	}
+	}
 
-	if (strncmp(buf, "GET ", strlen("GET ")) == 0) {
-		len = generate_httphdr(msglen, buf, NULL);
-	} else if (strncmp(buf, "POST ", strlen("POST ")) == 0) {
+	if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
+		len = generate_httphdr(msglen, txbuf, NULL);
+	} else if (strncmp(rxbuf, "POST ", strlen("POST ")) == 0) {
 		if (dbi->type == DT_DUMB) {
 direct:
-			if (dbi->mmap) {
+#ifdef WITH_STACKMAP
+			if (dbi->flags & DBI_FLAGS_PASTE) {
 				char *p;
+				int i;
+
+				if (dbi->cur + sizeof(dbi->pst_ent) > 
+				    dbi->maplen - sizeof(struct paste_hdr))
+					dbi->cur = 0;
+
+				p = dbi->paddr + sizeof(struct paste_hdr) + 
+					dbi->cur;
+				*(uint64_t *)p = dbi->pst_ent;
+				clflush(p);
+				/* also flush data buffer */
+				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
+					clflush(rxbuf + i);
+				}
+				mfence();
+				dbi->cur += sizeof(dbi->pst_ent);
+			} else
+#endif /* WITH_STACKMAP */
+			if (dbi->mmap) {
 				int d;
+				char *p;
 
 				d = (len & (dbi->mmap-1));
 				if (d)
@@ -261,7 +318,7 @@ direct:
 						close(fd);
 						return 0;
 					}
-					if (strncmp(buf, "GET ", 
+					if (strncmp(p, "GET ", 
 					    strlen("GET ")) == 0)
 						goto gen_httpok;
 					else if (strncmp(p, "POST ",
@@ -269,12 +326,12 @@ direct:
 						return -1; /* next pos stays */
 
 				} else
-					memcpy(p, buf, len);
+					memcpy(p, rxbuf, len);
 				if (msync(p, len, MS_SYNC))
 					perror("msync");
 				dbi->cur += len;
 			} else {
-				len = write(dbi->dumbfd, buf, len);
+				len = write(dbi->dumbfd, rxbuf, len);
 				if (len < 0)
 					perror("write");
 				else if ((dbi->flags & DBI_FLAGS_FDSYNC ?
@@ -296,7 +353,7 @@ direct:
 
 			snprintf(query, sizeof(query),
 				"BEGIN TRANSACTION; insert into %s values (%d, '%s'); COMMIT;",
-			       	SQLDBTABLE, seq++, buf);
+			       	SQLDBTABLE, seq++, rxbuf);
 			ret = sqlite3_exec(dbi->sql_conn, query, print_resp, 
 					NULL, &err_msg);
 			if (ret != SQLITE_OK) {
@@ -309,9 +366,16 @@ direct:
 		}
 #endif /* SQLITE */
 gen_httpok:
-		len = generate_httphdr(msglen, buf, NULL);
+		len = generate_httphdr(msglen, txbuf, NULL);
 	}
-	write(fd, buf, len);
+#ifdef WITH_STACKMAP
+	if (!dbi->fkd)
+#endif /* WITH_STACKMAP */
+		write(fd, txbuf, len);
+#ifdef WITH_STACKMAP
+	else
+		dbi->txlen = len;
+#endif /* WITH_STACKMAP */
 	return 0;
 }
 
@@ -341,7 +405,7 @@ main(int argc, char **argv)
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
 
-	while ((ch = getopt(argc, argv, "p:l:bmd:DNi:")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:bmd:DNi:P")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -381,6 +445,9 @@ main(int argc, char **argv)
 			break;
 		case 'i':
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
+			break;
+		case 'P': /* PASTE */
+			dbi.flags |= DBI_FLAGS_PASTE;
 			break;
 		}
 
@@ -423,6 +490,15 @@ main(int argc, char **argv)
 				perror("mmap");
 				goto close;
 			}
+#ifdef WITH_STACKMAP
+			if (dbi.flags & DBI_FLAGS_PASTE) {
+				/* write WAL header */
+				struct paste_hdr *ph = (struct paste_hdr *)dbi.paddr;
+
+				strncpy(ph->ifname, dbi.ifname, sizeof(dbi.ifname));
+				strncpy(ph->path, dbi.ifname, strlen(dbi.path));
+			}
+#endif /* WITH_STACKMAP */
 		}
 	}
 #ifdef WITH_SQLITE
@@ -563,32 +639,26 @@ error:
 							NULL);
 				txslot = &txring->slot[txcur];
 				while (rxslot) {
-					char *p;
 					struct netmap_slot *tmp;
 
 
-					p = STACKMAP_BUF(rxring, 
-							rxslot->buf_idx);
-					/* do something */
-					if (!strncmp(p, "POST ", strlen("POST "))) {
-						if (dbi->mmap)
-
-					}
-					if (!strncmp(p, "GET ", strlen("GET "))
-					    && txlim) {
-						char *d;
-						int len;
-
-						d = NETMAP_BUF(txring, 
-								txslot->buf_idx);
-						d += stackmap_offset;
-						len = generate_httphdr(msglen,
-							       	d, NULL);
-						txslot->len = len;
-						txslot->fd = fd;
-						txcur = nm_ring_next(txring, 
-								txcur);
-						txlim--;
+					if (txlim) {
+					  dbi.rxbuf = STACKMAP_BUF(rxring, 
+					    rxslot->buf_idx);
+					  dbi.rxlen = rxslot->len;
+					  dbi.txbuf = NETMAP_BUF(txring,
+							  txslot->buf_idx);
+					  dbi.txbuf += stackmap_offset;
+					  dbi.txlen = 0; /* XXX */
+					  dbi.pst_ent = (uint64_t)
+							rxslot->buf_idx << 32 |
+							tcp_offset << 16 | 
+							rxslot->len;
+					  do_established(-1, msglen, &dbi);
+					  txslot->len = dbi.txlen;
+					  txslot->fd = fd;
+					  txcur = nm_ring_next(txring, txcur);
+					  txlim--;
 					}
 					tmp = rxslot;
 					rxslot = STACKMAP_RX_NXT(rxring, exring,
