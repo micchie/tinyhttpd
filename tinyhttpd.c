@@ -59,7 +59,7 @@ struct dbinfo {
 #endif /* WITH_STACKMAP */
 } dbi;
 
-static struct timespec ts = {0, 0};
+//static struct timespec ts = {0, 0};
 static inline void
 clflush(volatile void *p)
 {
