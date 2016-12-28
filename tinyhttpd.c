@@ -47,6 +47,7 @@ struct dbinfo {
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READPMEM	0x2
 #define DBI_FLAGS_PASTE		0x4
+#define DBI_FLAGS_BATCH		0x8
 	int flags;
 	char ifname[IFNAMSIZ+8]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
@@ -288,8 +289,10 @@ direct:
 
 				p = dbi->paddr + sizeof(struct paste_hdr) + 
 					dbi->cur;
-				*(uint64_t *)p = dbi->pst_ent;
-				clflush(p);
+				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
+					*(uint64_t *)p = dbi->pst_ent;
+					clflush(p);
+				}
 				/* also flush data buffer */
 				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
 					clflush(rxbuf + i);
@@ -327,8 +330,15 @@ direct:
 
 				} else
 					memcpy(p, rxbuf, len);
-				if (msync(p, len, MS_SYNC))
-					perror("msync");
+				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
+					int j;
+				    	for (j=0;j<len;j+=CACHE_LINE_SIZE) {
+					clflush(p + j);
+				    	}
+					mfence();
+					//if (msync(p, len, MS_SYNC))
+					//	perror("msync");
+				}
 				dbi->cur += len;
 			} else {
 				len = write(dbi->dumbfd, rxbuf, len);
@@ -405,7 +415,7 @@ main(int argc, char **argv)
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
 
-	while ((ch = getopt(argc, argv, "p:l:bmd:DNi:P")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:bmd:DNi:PB")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -442,6 +452,9 @@ main(int argc, char **argv)
 			break;
 		case 'N':
 			dbi.flags |= DBI_FLAGS_READPMEM;
+			break;
+		case 'B':
+			dbi.flags |= DBI_FLAGS_BATCH;
 			break;
 		case 'i':
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
@@ -621,6 +634,7 @@ error:
 			struct netmap_if *enifp = dbi.fkd->exnmd->nifp;
 			struct netmap_slot *rxslot, *txslot;
 			u_int txcur, txlim, rxnum = 0;
+			int oldcur = dbi.cur;
 
 			rxring = NETMAP_RXRING(nifp, 0);
 			exring = NETMAP_RXRING(enifp, 0);
@@ -670,6 +684,54 @@ error:
 			}
 			txring->cur = txcur;
 			rxring->head = rxring->cur = rxring->tail;
+
+			if (dbi.flags & DBI_FLAGS_BATCH) {
+
+				if (dbi.flags & DBI_FLAGS_PASTE) {
+				    char *p = dbi.paddr +
+				      sizeof(struct paste_hdr) +
+				      oldcur;
+				    int l = dbi.cur - oldcur;
+				    int j;
+
+				    if (l < 0) {
+					l = dbi.maplen - sizeof(
+					  struct paste_hdr) - oldcur;
+					for (j = 0; j < l;
+					  j += CACHE_LINE_SIZE) {
+					    clflush(p + j);
+					}
+					l = dbi.cur;
+					p = dbi.paddr +
+					    sizeof(struct paste_hdr);
+				    }
+				    for (j=0;j<l;j+=CACHE_LINE_SIZE) {
+					clflush(p + j);
+				    }
+				    mfence(); /* do we need this? */
+				} else {
+				    char *p = dbi.paddr + oldcur;
+				    int l = dbi.cur - oldcur, j;
+
+				    if (l < 0) {
+					l = dbi.maplen - oldcur;
+					//if (msync(p, l, MS_SYNC))
+					//	perror("msync");
+				    	for (j=0;j<l;j+=CACHE_LINE_SIZE) {
+						clflush(p + j);
+				    	}
+					l = dbi.cur;
+					p = dbi.paddr;
+
+				    }
+				    //if (msync(p, l, MS_SYNC))
+					//perror("msync");
+				    for (j=0;j<l;j+=CACHE_LINE_SIZE) {
+					clflush(p + j);
+				    }
+				    mfence(); /* do we need this? */
+				}
+			}
 			continue;
 		} else
 #endif /* WITH_STACKMAP */
