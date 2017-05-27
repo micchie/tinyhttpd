@@ -26,15 +26,19 @@
 #include <sqlite3.h>
 #endif /* WITH_SQLITE */
 #ifdef WITH_STACKMAP
-#include <frankenstack.h>
-#include <frankenstack_user.h>
+#include <net/netmap.h>
+#include <net/netmap_user.h>
+#define STMNAME	"stack:0"
+#define STMNAME_MAX	32
 #endif /* WITH_STACKMAP */
 
 struct dbinfo {
 	int	type;
 	char 	*path;
 	union {
+#ifdef WITH_SQLITE
 		sqlite3 *sql_conn;
+#endif
 		int	dumbfd;
 	};
 	int mmap;
@@ -51,12 +55,14 @@ struct dbinfo {
 	int flags;
 	char ifname[IFNAMSIZ+8]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
-	struct fks_desc *fkd;
+	struct nm_desc *nmd;
+	struct nm_ifreq ifreq;
 	char *rxbuf;
-	int rxlen;
 	char *txbuf;
-	int txlen;
 	uint64_t pst_ent; /* 32 bit buf_idx + 16 bit off + 16 bit len */
+	uint16_t txlen; // slot length
+	uint16_t rxlen;
+	uint16_t voff; // virt_hdr_len + protocol header offset
 #endif /* WITH_STACKMAP */
 } dbi;
 
@@ -79,27 +85,9 @@ mfence(void)
 #define MAXQUERYLEN 65535
 #define MAXDUMBSIZE	204800
 #ifdef WITH_STACKMAP
-#define tcp_offset (sizeof(struct ethhdr) + sizeof(struct iphdr) \
-	+ sizeof(struct tcphdr) + FKS_TCP_OPTLEN)
-#define stackmap_offset (FKS_DMA_OFFSET + tcp_offset)
-static inline char *
-STACKMAP_BUF(struct netmap_ring *r, int i)
-{
-	return (NETMAP_BUF(r, i) + stackmap_offset);
-}
+#define TCPIP_OFFSET (sizeof(struct ethhdr) + sizeof(struct iphdr) \
+	+ sizeof(struct tcphdr) + 12)
 
-static inline struct netmap_slot *
-STACKMAP_RX_NXT(struct netmap_ring *rxr, struct netmap_ring *exr, int fd, struct netmap_slot *hint)
-{
-	int i;
-
-	i = hint ? hint->next_idx : rxr->fdhead[fd];
-	if (i < 0)
-		return NULL;
-	else if (likely(i < rxr->num_slots))
-		return &rxr->slot[i];
-	return &exr->slot[i - rxr->num_slots];
-}
 struct paste_hdr {
 	char ifname[IFNAMSIZ + 64];
 	char path[256];
@@ -129,7 +117,9 @@ close_db(struct dbinfo *dbip)
 {
 	struct stat st;
 	const char *path = dbip->path;
+#ifdef WITH_SQLITE
 	char path_wal[64], path_shm[64];
+#endif
 
 	/* close reference */
 	if (dbip->type == DT_DUMB) {
@@ -247,7 +237,9 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 {
 	char buf[MAXQUERYLEN];
 	char *rxbuf, *txbuf;
+#ifdef WITH_SQLITE
 	static u_int seq = 0;
+#endif
 	ssize_t len;
        
 	rxbuf = txbuf = buf;
@@ -256,7 +248,7 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 		goto direct;
 	}
 #ifdef WITH_STACKMAP
-	if (dbi->fkd) {
+	if (dbi->nmd) {
 		rxbuf = dbi->rxbuf;
 		txbuf = dbi->txbuf;
 		len = dbi->rxlen;
@@ -379,7 +371,7 @@ gen_httpok:
 		len = generate_httphdr(msglen, txbuf, NULL);
 	}
 #ifdef WITH_STACKMAP
-	if (!dbi->fkd)
+	if (!dbi->nmd)
 #endif /* WITH_STACKMAP */
 		write(fd, txbuf, len);
 #ifdef WITH_STACKMAP
@@ -400,15 +392,11 @@ main(int argc, char **argv)
 	struct epoll_event ev;
 	struct epoll_event evts[MAXCONNECTIONS];
 	ssize_t msglen = 1;
-	int eptimeout = 0;
+	int polltimeo = 0;
 	struct dbinfo dbi;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
-#ifdef WITH_STACKMAP
-	//struct fks_desc *stackmap_desc;
-	//struct nm_desc *ex_desc;
-#endif /* WITH_STACKMAP */
 	int i, nfd = 0; /* XXX initialize only to avoid warning  */
 
 	bzero(&dbi, sizeof(dbi));
@@ -427,8 +415,8 @@ main(int argc, char **argv)
 		case 'l': /* HTTP OK content length */
 			msglen = atoi(optarg);
 			break;
-		case 'b': /* arg to epoll_wait() (-1 for blocking) */
-			eptimeout = -1;
+		case 'b': /* give the epoll_wait() timeo argument -1 */
+			polltimeo = -1;
 			break;
 		case 'd':
 			{
@@ -477,7 +465,7 @@ main(int argc, char **argv)
 
 	if (dbi.flags & DBI_FLAGS_READPMEM) {
 		if (!((dbi.type == DT_DUMB) && dbi.mmap)) {
-			fprintf(stderr, "READPMEM must be used with dumb db and mmap\n");
+			fprintf(stderr, "READPMEM must use dumb db and mmap\n");
 			usage();
 		}
 	}
@@ -506,9 +494,11 @@ main(int argc, char **argv)
 #ifdef WITH_STACKMAP
 			if (dbi.flags & DBI_FLAGS_PASTE) {
 				/* write WAL header */
-				struct paste_hdr *ph = (struct paste_hdr *)dbi.paddr;
+				struct paste_hdr *ph;
 
-				strncpy(ph->ifname, dbi.ifname, sizeof(dbi.ifname));
+				ph = (struct paste_hdr *)dbi.paddr;
+				strncpy(ph->ifname, dbi.ifname,
+						sizeof(dbi.ifname));
 				strncpy(ph->path, dbi.ifname, strlen(dbi.path));
 			}
 #endif /* WITH_STACKMAP */
@@ -600,17 +590,41 @@ error:
 	}
 #ifdef WITH_STACKMAP
 	if (dbi.ifname[0]) {
-		dbi.fkd = fks_open(dbi.ifname);
-		if (!dbi.fkd) {
-			D("fks_open() failed");
+		char nm_name[STMNAME_MAX+1];
+		//char *p;
+		struct nmreq req;
+		struct nm_ifreq *ifreq = &dbi.ifreq;
+
+		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
+			D("too long name %s", dbi.ifname);
 			goto close_socket;
 		}
-		fks_add_fd(dbi.fkd, sd);
+		strcat(strcat(strcpy(nm_name, STMNAME), "+"), dbi.ifname);
+		dbi.nmd = nm_open(nm_name, NULL, 0, NULL);
+		if (!dbi.nmd) {
+			D("Unable to open %s: %s", dbi.ifname, strerror(errno));
+			goto close_socket;
+		}
+
+		/* pre-initialize ifreq for accept() */
+		bzero(ifreq, sizeof(*ifreq));
+		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
+
+		/* ask vnet_hdr_len */
+		bzero(&req, sizeof(req));
+		bcopy(dbi.nmd->req.nr_name, req.nr_name, sizeof(req.nr_name));
+		req.nr_version = NETMAP_API;
+		req.nr_cmd = NETMAP_VNET_HDR_GET;
+		if (ioctl(dbi.nmd->fd, NIOCREGIF, &req)) {
+			D("Unable to get header length");
+			goto close_nmd;
+		}
+		dbi.voff = req.nr_arg1 + TCPIP_OFFSET;
+		D("nm_open() %s done (offset %u)", nm_name, dbi.voff);
 	} else
 #endif /* WITH_STACKMAP */
 	{
-
-	memset(&ev, 0, sizeof(ev));
+	bzero(&ev, sizeof(ev));
 	ev.events = POLLIN;
 	ev.data.fd = sd;
 	epoll_ctl(epfd, EPOLL_CTL_ADD, sd, &ev);
@@ -628,115 +642,107 @@ error:
 		/* fetch events */
 #ifdef WITH_STACKMAP
 		if (dbi.ifname[0]) {
-			struct netmap_ring *rxring, *txring, *exring;
-			struct fks_request fksr; /* XXX */
-			struct netmap_if *nifp = dbi.fkd->nmd->nifp;
-			struct netmap_if *enifp = dbi.fkd->exnmd->nifp;
-			struct netmap_slot *rxslot, *txslot;
-			u_int txcur, txlim, rxnum = 0;
-			int oldcur = dbi.cur;
+			struct nm_desc *nmd = dbi.nmd;
+			struct netmap_if *nifp = nmd->nifp;
+			struct pollfd pfd[2];
+			u_int first_rx_ring = nmd->first_rx_ring;
+			u_int last_rx_ring = nmd->last_rx_ring;
 
-			rxring = NETMAP_RXRING(nifp, 0);
-			exring = NETMAP_RXRING(enifp, 0);
-			txring = NETMAP_TXRING(nifp, 0);
+			pfd[0].fd = nmd->fd;
+			pfd[0].events = POLLIN | POLLOUT;
+			pfd[1].fd = sd;
+			pfd[1].events = POLLIN | POLLOUT;
 
-			ioctl(dbi.fkd->fd, FKSIOCNSSYNC, &fksr);
-
-			txcur = txring->cur;
-			txlim = nm_ring_space(txring);
-
-			for (i = 0; i < rxring->nevt; i++) {
-				int fd;
-
-				fd = rxring->evts[i];
-				rxslot = STACKMAP_RX_NXT(rxring, exring, fd,
-							NULL);
-				txslot = &txring->slot[txcur];
-				while (rxslot) {
-					struct netmap_slot *tmp;
-
-
-					if (txlim) {
-					  dbi.rxbuf = STACKMAP_BUF(rxring, 
-					    rxslot->buf_idx);
-					  dbi.rxlen = rxslot->len;
-					  dbi.txbuf = NETMAP_BUF(txring,
-							  txslot->buf_idx);
-					  dbi.txbuf += stackmap_offset;
-					  dbi.txlen = 0; /* XXX */
-					  dbi.pst_ent = (uint64_t)
-							rxslot->buf_idx << 32 |
-							tcp_offset << 16 | 
-							rxslot->len;
-					  do_established(-1, msglen, &dbi);
-					  txslot->len = dbi.txlen;
-					  txslot->fd = fd;
-					  txcur = nm_ring_next(txring, txcur);
-					  txlim--;
-					}
-					tmp = rxslot;
-					rxslot = STACKMAP_RX_NXT(rxring, exring,
-							fd, rxslot);
-					tmp->next_idx = -1;
-					rxnum++;
-				}
-				rxring->fdhead[fd] = -1;
+			i = poll(pfd, 2, polltimeo);
+			if (i < 0) {
+				perror("poll");
+				goto close_nmd;
 			}
-			txring->cur = txcur;
-			rxring->head = rxring->cur = rxring->tail;
 
-			if (dbi.flags & DBI_FLAGS_BATCH) {
+			/*
+			 * check the listen socket
+			 */
+			if (pfd[1].revents & POLLIN) {
+				struct sockaddr_storage tmp;
+				struct nm_ifreq *ifreq = &dbi.ifreq;
+				int newfd;
+				socklen_t len = sizeof(tmp);
 
-				if (dbi.flags & DBI_FLAGS_PASTE) {
-				    char *p = dbi.paddr +
-				      sizeof(struct paste_hdr) +
-				      oldcur;
-				    int l = dbi.cur - oldcur;
-				    int j;
-
-				    if (l < 0) {
-					l = dbi.maplen - sizeof(
-					  struct paste_hdr) - oldcur;
-					for (j = 0; j < l;
-					  j += CACHE_LINE_SIZE) {
-					    clflush(p + j);
-					}
-					l = dbi.cur;
-					p = dbi.paddr +
-					    sizeof(struct paste_hdr);
-				    }
-				    for (j=0;j<l;j+=CACHE_LINE_SIZE) {
-					clflush(p + j);
-				    }
-				    mfence(); /* do we need this? */
-				} else {
-				    char *p = dbi.paddr + oldcur;
-				    int l = dbi.cur - oldcur, j;
-
-				    if (l < 0) {
-					l = dbi.maplen - oldcur;
-					//if (msync(p, l, MS_SYNC))
-					//	perror("msync");
-				    	for (j=0;j<l;j+=CACHE_LINE_SIZE) {
-						clflush(p + j);
-				    	}
-					l = dbi.cur;
-					p = dbi.paddr;
-
-				    }
-				    //if (msync(p, l, MS_SYNC))
-					//perror("msync");
-				    for (j=0;j<l;j+=CACHE_LINE_SIZE) {
-					clflush(p + j);
-				    }
-				    mfence(); /* do we need this? */
+				newfd = accept(pfd[1].fd, (struct sockaddr *)
+					    &tmp, &len);
+				if (newfd < 0) {
+					perror("accept");
+					/* ignore this socket */
+					goto accepted;
 				}
+				memcpy(ifreq->data, &newfd, sizeof(newfd));
+				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
+					perror("ioctl");
+					close(newfd);
+					close(pfd[1].fd);
+					/* be conservative to this error... */
+					goto close_nmd;
+				}
+				D("new connection");
 			}
-			continue;
+accepted:
+			/*
+			 * check accepted sockets
+			 */
+			if (!(pfd[0].revents & POLLIN))
+				continue;
+
+			for (i = first_rx_ring; i <= last_rx_ring; i++) {
+				struct netmap_ring *rxr, *txr;
+				struct netmap_slot *rxs;
+				u_int txcur, txlim, rxcur, rx;
+
+				rxr = NETMAP_RXRING(nifp, i);
+				txr = NETMAP_TXRING(nifp, i);
+
+				txcur = txr->cur;
+				rxcur = rxr->cur;
+				/* XXX 1 reqequest triggers 1 response */
+				txlim = nm_ring_space(txr);
+				if (txlim > nm_ring_space(rxr)) {
+					txlim = nm_ring_space(rxr);
+				}
+				for (rx = 0; rx < txlim; rx++) {
+					struct netmap_slot *txs;
+					char *p;
+
+					rxs = &rxr->slot[rxcur];
+					p = NETMAP_BUF(rxr, rxs->buf_idx);
+					p += rxs->offset;
+
+					dbi.rxbuf = p;
+					dbi.rxlen = rxs->len;
+					txs = &txr->slot[txcur];
+					dbi.txbuf =
+						NETMAP_BUF(txr, txs->buf_idx);
+					dbi.txbuf += dbi.voff;
+					dbi.txlen = 0; // just initialize
+					dbi.pst_ent = (uint64_t)
+						rxs->buf_idx << 32 |
+						dbi.voff << 16 | rxs->len;
+					do_established(-1, msglen, &dbi);
+					txs->len = dbi.txlen;
+					txs->fd = rxs->fd;
+					printf("rxs->fd %d", txs->fd);
+					txcur = nm_ring_next(txr, txcur);
+					txlim--;
+					rxcur = nm_ring_next(rxr, rxcur);
+				}
+				txr->head = txr->cur = txcur;
+				rxr->head = rxr->cur = rxcur;
+
+				/* No batch support yet */
+			}
+
 		} else
 #endif /* WITH_STACKMAP */
 	       	{
-			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, eptimeout);
+			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, polltimeo);
 #if 0
 		if (nfd > 0) {
 			stat_eps++;
@@ -768,15 +774,15 @@ error:
 
 	}
 
+#ifdef WITH_STACKMAP
+close_nmd:
+	nm_close(dbi.nmd);
+#endif /* WITH_STACKMAP */
 close_socket:
 	close(sd);
 close_ep:
 	if (dbi.ifname[0])
 		close(epfd);
-#ifdef WITH_STACKMAP
-	else
-		fks_close(dbi.fkd);
-#endif /* WITH_STACKMAP */
 close:
 	close_db(&dbi);
 	return (0);

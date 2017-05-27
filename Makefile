@@ -2,13 +2,13 @@ CFLAGS += -Werror -Wall -O2
 LDFLAGS += -lpthread -ldl # sqlite requires them
 #LDFLAGS += -lrt # for clock_gettime()
 EXTRA_CFLAGS += -I/usr/local/include -I../libsqlite/include
-EXTRA_LDFLAGS += ../libsqlite/lib/libsqlite3.a -lrt
+#EXTRA_LDFLAGS += ../libsqlite/lib/libsqlite3.a -lrt
 CFLAGS += $(EXTRA_CFLAGS)
 PROG = tinyhttpd tinyhttpd-s
 OBJS = tinyhttpd.o tinyhttpd-s.o
-OPT = -DWITH_SQLITE
+#OPT = -DWITH_SQLITE
 SOPT = -DWITH_STACKMAP
-SPATH ?= -I../frankenstack -I../netmap/sys/ -DNETMAP_WITH_LIBS
+SPATH ?= -I../netmap/sys/ -DNETMAP_WITH_LIBS
 
 all: $(PROG)
 
