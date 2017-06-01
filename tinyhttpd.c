@@ -62,7 +62,8 @@ struct dbinfo {
 	uint64_t pst_ent; /* 32 bit buf_idx + 16 bit off + 16 bit len */
 	uint16_t txlen; // slot length
 	uint16_t rxlen;
-	uint16_t voff; // virt_hdr_len + protocol header offset
+	uint16_t voff; // virt_hdr_len
+	uint16_t soff;
 #endif /* WITH_STACKMAP */
 } dbi;
 
@@ -172,7 +173,6 @@ generate_httphdr(ssize_t content_length, char *buf, char *content)
 	 "Content-Length: ",
 	 "Connection: keep-alive\r\n\r\n"};
 	ssize_t l;
-
 
 	memcpy(p, lines[0], strlen(lines[0]));
 	p += strlen(lines[0]);
@@ -619,8 +619,9 @@ error:
 			D("Unable to get header length");
 			goto close_nmd;
 		}
-		dbi.voff = req.nr_arg1 + TCPIP_OFFSET;
-		D("nm_open() %s done (offset %u)", nm_name, dbi.voff);
+		dbi.voff = req.nr_arg1;
+		dbi.soff = TCPIP_OFFSET;
+		D("nm_open() %s done (offset %u)", nm_name, dbi.voff + dbi.soff);
 	} else
 #endif /* WITH_STACKMAP */
 	{
@@ -720,15 +721,15 @@ accepted:
 					txs = &txr->slot[txcur];
 					dbi.txbuf =
 						NETMAP_BUF(txr, txs->buf_idx);
-					dbi.txbuf += dbi.voff;
+					dbi.txbuf += dbi.voff + dbi.soff;
 					dbi.txlen = 0; // just initialize
 					dbi.pst_ent = (uint64_t)
 						rxs->buf_idx << 32 |
 						dbi.voff << 16 | rxs->len;
 					do_established(-1, msglen, &dbi);
-					txs->len = dbi.txlen;
+					txs->len = dbi.txlen + dbi.voff + dbi.soff;
+					txs->offset = TCPIP_OFFSET;
 					txs->fd = rxs->fd;
-					printf("rxs->fd %d", txs->fd);
 					txcur = nm_ring_next(txr, txcur);
 					txlim--;
 					rxcur = nm_ring_next(rxr, rxcur);
