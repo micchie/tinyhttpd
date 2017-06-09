@@ -369,6 +369,8 @@ direct:
 #endif /* SQLITE */
 gen_httpok:
 		len = generate_httphdr(msglen, txbuf, NULL);
+	} else {
+		len = 0;
 	}
 #ifdef WITH_STACKMAP
 	if (!dbi->nmd)
@@ -392,7 +394,7 @@ main(int argc, char **argv)
 	struct epoll_event ev;
 	struct epoll_event evts[MAXCONNECTIONS];
 	ssize_t msglen = 1;
-	int polltimeo = 0;
+	int polltimeo = 2000;
 	struct dbinfo dbi;
 #ifdef WITH_SQLITE
 	int ret = 0;
@@ -403,7 +405,7 @@ main(int argc, char **argv)
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
 
-	while ((ch = getopt(argc, argv, "p:l:bmd:DNi:PB")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PB")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -416,7 +418,7 @@ main(int argc, char **argv)
 			msglen = atoi(optarg);
 			break;
 		case 'b': /* give the epoll_wait() timeo argument -1 */
-			polltimeo = -1;
+			polltimeo = atoi(optarg);
 			break;
 		case 'd':
 			{
@@ -605,6 +607,7 @@ error:
 			D("Unable to open %s: %s", dbi.ifname, strerror(errno));
 			goto close_socket;
 		}
+		sleep(2);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
@@ -650,9 +653,9 @@ error:
 			u_int last_rx_ring = nmd->last_rx_ring;
 
 			pfd[0].fd = nmd->fd;
-			pfd[0].events = POLLIN | POLLOUT;
+			pfd[0].events = POLLIN;
 			pfd[1].fd = sd;
-			pfd[1].events = POLLIN | POLLOUT;
+			pfd[1].events = POLLIN;
 
 			i = poll(pfd, 2, polltimeo);
 			if (i < 0) {
@@ -676,6 +679,7 @@ error:
 					/* ignore this socket */
 					goto accepted;
 				}
+				D("accepted new connection %d", newfd);
 				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
@@ -684,7 +688,6 @@ error:
 					/* be conservative to this error... */
 					goto close_nmd;
 				}
-				D("new connection");
 			}
 accepted:
 			/*
@@ -714,6 +717,7 @@ accepted:
 
 					rxs = &rxr->slot[rxcur];
 					p = NETMAP_BUF(rxr, rxs->buf_idx);
+					p += dbi.voff;
 					p += rxs->offset;
 
 					dbi.rxbuf = p;
@@ -727,9 +731,14 @@ accepted:
 						rxs->buf_idx << 32 |
 						dbi.voff << 16 | rxs->len;
 					do_established(-1, msglen, &dbi);
-					txs->len = dbi.txlen + dbi.voff + dbi.soff;
-					txs->offset = TCPIP_OFFSET;
-					txs->fd = rxs->fd;
+					if (dbi.txlen) {
+						txs->len = dbi.txlen +
+							dbi.voff + dbi.soff;
+						txs->offset = TCPIP_OFFSET;
+						txs->fd = rxs->fd;
+					} else {
+						txs->len = 0;
+					}
 					txcur = nm_ring_next(txr, txcur);
 					txlim--;
 					rxcur = nm_ring_next(rxr, rxcur);
