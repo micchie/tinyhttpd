@@ -679,7 +679,6 @@ error:
 					/* ignore this socket */
 					goto accepted;
 				}
-				D("accepted new connection %d", newfd);
 				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
