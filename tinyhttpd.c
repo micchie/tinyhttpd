@@ -32,6 +32,7 @@
 #define STMNAME_MAX	32
 #endif /* WITH_STACKMAP */
 
+#define MAX_HTTPLEN	65535
 struct dbinfo {
 	int	type;
 	char 	*path;
@@ -65,6 +66,8 @@ struct dbinfo {
 	uint16_t voff; // virt_hdr_len
 	uint16_t soff;
 #endif /* WITH_STACKMAP */
+	char *http;
+	int httplen;
 } dbi;
 
 //static struct timespec ts = {0, 0};
@@ -266,7 +269,12 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 	}
 
 	if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
-		len = generate_httphdr(msglen, txbuf, NULL);
+		if (!dbi->httplen) {
+			len = generate_httphdr(msglen, txbuf, NULL);
+		} else {
+			len = dbi->httplen;
+			memcpy(txbuf, dbi->http, len);
+		}
 	} else if (strncmp(rxbuf, "POST ", strlen("POST ")) == 0) {
 		if (dbi->type == DT_DUMB) {
 direct:
@@ -405,7 +413,7 @@ main(int argc, char **argv)
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
 
-	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PB")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBc")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -452,9 +460,21 @@ main(int argc, char **argv)
 		case 'P': /* PASTE */
 			dbi.flags |= DBI_FLAGS_PASTE;
 			break;
+		case 'c':
+			dbi.httplen = 1;
+			break;
 		}
 
 	}
+	if (dbi.httplen) {
+		dbi.http = calloc(1, MAX_HTTPLEN);
+		if (!dbi.http) {
+			perror("malloc");
+			usage();
+		}
+		dbi.httplen = generate_httphdr(msglen, dbi.http, NULL);
+	}
+
 	fprintf(stderr, "%s built %s %s db: %s\n",
 		argv[0], __DATE__, __TIME__, dbi.path ? dbi.path : "none");
 	usleep(1000);
