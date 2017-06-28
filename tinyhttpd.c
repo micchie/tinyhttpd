@@ -29,8 +29,57 @@
 #include <net/netmap.h>
 #include <net/netmap_user.h>
 #define STMNAME	"stack:0"
-#define STMNAME_MAX	32
+#define STMNAME_MAX	64
 #endif /* WITH_STACKMAP */
+
+#ifndef D
+#define D(fmt, ...) \
+	printf(""fmt"\n", ##__VA_ARGS__)
+#endif
+
+#ifdef WITH_STACKMAP
+/* cut/paste from pkt-gen.c */
+static int
+nm_parse_nmr_config(const char* conf, struct nmreq *nmr)
+{
+	char *w, *tok;
+	int i, v;
+
+	nmr->nr_tx_rings = nmr->nr_rx_rings = 0;
+	nmr->nr_tx_slots = nmr->nr_rx_slots = 0;
+	if (conf == NULL || ! *conf)
+		return 0;
+	w = strdup(conf);
+	for (i = 0, tok = strtok(w, ","); tok; i++, tok = strtok(NULL, ",")) {
+		v = atoi(tok);
+		switch (i) {
+		case 0:
+			nmr->nr_tx_slots = nmr->nr_rx_slots = v;
+			break;
+		case 1:
+			nmr->nr_rx_slots = v;
+			break;
+		case 2:
+			nmr->nr_tx_rings = nmr->nr_rx_rings = v;
+			break;
+		case 3:
+			nmr->nr_rx_rings = v;
+			break;
+		default:
+			D("ignored config: %s", tok);
+			break;
+		}
+	}
+	D("txr %d txd %d rxr %d rxd %d",
+			nmr->nr_tx_rings, nmr->nr_tx_slots,
+			nmr->nr_rx_rings, nmr->nr_rx_slots);
+	free(w);
+	return (nmr->nr_tx_rings || nmr->nr_tx_slots ||
+                        nmr->nr_rx_rings || nmr->nr_rx_slots) ?
+		NM_OPEN_RING_CFG : 0;
+}
+#endif
+
 
 #define MAX_HTTPLEN	65535
 struct dbinfo {
@@ -54,9 +103,10 @@ struct dbinfo {
 #define DBI_FLAGS_PASTE		0x4
 #define DBI_FLAGS_BATCH		0x8
 	int flags;
-	char ifname[IFNAMSIZ+8]; /* stackmap ifname (also used as indicator) */
+	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct nm_desc *nmd;
+	char *nmr_config;
 	struct nm_ifreq ifreq;
 	char *rxbuf;
 	char *txbuf;
@@ -101,11 +151,6 @@ struct paste_hdr {
 
 enum { DT_NONE=0, DT_DUMB, DT_SQLITE};
 const char *SQLDBTABLE = "tinytable";
-
-#ifndef D
-#define D(fmt, ...) \
-	printf(""fmt"\n", ##__VA_ARGS__)
-#endif
 
 static int do_abort = 0;
 #if 0
@@ -412,8 +457,11 @@ main(int argc, char **argv)
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
+#ifdef WITH_STACKMAP
+	dbi.nmr_config = "";
+#endif
 
-	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBc")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBcC:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -455,6 +503,12 @@ main(int argc, char **argv)
 			dbi.flags |= DBI_FLAGS_BATCH;
 			break;
 		case 'i':
+			/*
+			if (p = strstr(optarg, ",")) {
+				*p++ = '\0';
+				strncpy(dbi.memname, p, sizeof(dbi.memname));
+			}
+			*/
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
 			break;
 		case 'P': /* PASTE */
@@ -463,6 +517,11 @@ main(int argc, char **argv)
 		case 'c':
 			dbi.httplen = 1;
 			break;
+#ifdef WITH_STACKMAP
+		case 'C':
+			dbi.nmr_config = strdup(optarg);
+			break;
+#endif
 		}
 
 	}
@@ -622,12 +681,17 @@ error:
 			goto close_socket;
 		}
 		strcat(strcat(strcpy(nm_name, STMNAME), "+"), dbi.ifname);
-		dbi.nmd = nm_open(nm_name, NULL, 0, NULL);
+		/* configure rings */
+		bzero(&req, sizeof(req));
+		nm_parse_nmr_config(dbi.nmr_config, &req);
+
+		dbi.nmd = nm_open(nm_name, &req, 0, NULL);
 		if (!dbi.nmd) {
 			D("Unable to open %s: %s", dbi.ifname, strerror(errno));
 			goto close_socket;
 		}
 		sleep(2);
+		D("nm_open done: req.nr_name %s", req.nr_name);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
@@ -644,7 +708,7 @@ error:
 		}
 		dbi.voff = req.nr_arg1;
 		dbi.soff = TCPIP_OFFSET;
-		D("nm_open() %s done (offset %u)", nm_name, dbi.voff + dbi.soff);
+		D("nm_open() %s done (offset %u ring_num %u)", nm_name, dbi.voff + dbi.soff, dbi.nmd->nifp->ni_tx_rings);
 	} else
 #endif /* WITH_STACKMAP */
 	{
