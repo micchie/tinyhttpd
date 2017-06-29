@@ -15,6 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stddef.h>	// typeof
 
 #include <time.h>
 
@@ -25,9 +26,12 @@
 #ifdef WITH_SQLITE
 #include <sqlite3.h>
 #endif /* WITH_SQLITE */
+#include <pthread.h>
 #ifdef WITH_STACKMAP
 #include <net/netmap.h>
 #include <net/netmap_user.h>
+#include "nmlib.h"
+
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
 #endif /* WITH_STACKMAP */
@@ -36,50 +40,6 @@
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
-
-#ifdef WITH_STACKMAP
-/* cut/paste from pkt-gen.c */
-static int
-nm_parse_nmr_config(const char* conf, struct nmreq *nmr)
-{
-	char *w, *tok;
-	int i, v;
-
-	nmr->nr_tx_rings = nmr->nr_rx_rings = 0;
-	nmr->nr_tx_slots = nmr->nr_rx_slots = 0;
-	if (conf == NULL || ! *conf)
-		return 0;
-	w = strdup(conf);
-	for (i = 0, tok = strtok(w, ","); tok; i++, tok = strtok(NULL, ",")) {
-		v = atoi(tok);
-		switch (i) {
-		case 0:
-			nmr->nr_tx_slots = nmr->nr_rx_slots = v;
-			break;
-		case 1:
-			nmr->nr_rx_slots = v;
-			break;
-		case 2:
-			nmr->nr_tx_rings = nmr->nr_rx_rings = v;
-			break;
-		case 3:
-			nmr->nr_rx_rings = v;
-			break;
-		default:
-			D("ignored config: %s", tok);
-			break;
-		}
-	}
-	D("txr %d txd %d rxr %d rxd %d",
-			nmr->nr_tx_rings, nmr->nr_tx_slots,
-			nmr->nr_rx_rings, nmr->nr_rx_slots);
-	free(w);
-	return (nmr->nr_tx_rings || nmr->nr_tx_slots ||
-                        nmr->nr_rx_rings || nmr->nr_rx_slots) ?
-		NM_OPEN_RING_CFG : 0;
-}
-#endif
-
 
 #define MAX_HTTPLEN	65535
 struct dbinfo {
@@ -105,20 +65,19 @@ struct dbinfo {
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
-	struct nm_desc *nmd;
-	char *nmr_config;
-	struct nm_ifreq ifreq;
+	struct nm_garg g;
 	char *rxbuf;
 	char *txbuf;
 	uint64_t pst_ent; /* 32 bit buf_idx + 16 bit off + 16 bit len */
 	uint16_t txlen; // slot length
 	uint16_t rxlen;
-	uint16_t voff; // virt_hdr_len
 	uint16_t soff;
 #endif /* WITH_STACKMAP */
+	int sd;
 	char *http;
 	int httplen;
-} dbi;
+	int msglen;
+};
 
 //static struct timespec ts = {0, 0};
 static inline void
@@ -240,19 +199,6 @@ generate_httphdr(ssize_t content_length, char *buf, char *content)
 }
 
 static void
-sig_h(int sig)
-{
-	//(void)sig;	/* UNUSED */
-	D("got signal %d", sig);
-	do_abort = 1;
-	D("Stop process");
-	if (sig == SIGINT)
-		signal(SIGINT, SIG_DFL);
-	else if (sig == SIGHUP)
-		signal(SIGHUP, SIG_DFL);
-}
-
-static void
 usage(void)
 {
 	fprintf(stderr,
@@ -296,7 +242,7 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 		goto direct;
 	}
 #ifdef WITH_STACKMAP
-	if (dbi->nmd) {
+	if (dbi->g.nmd) {
 		rxbuf = dbi->rxbuf;
 		txbuf = dbi->txbuf;
 		len = dbi->rxlen;
@@ -426,7 +372,7 @@ gen_httpok:
 		len = 0;
 	}
 #ifdef WITH_STACKMAP
-	if (!dbi->nmd)
+	if (!dbi->g.nmd)
 #endif /* WITH_STACKMAP */
 		write(fd, txbuf, len);
 #ifdef WITH_STACKMAP
@@ -435,6 +381,134 @@ gen_httpok:
 #endif /* WITH_STACKMAP */
 	return 0;
 }
+
+#define container_of(ptr, type, member) ({                      \
+		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+		      (type *)( (char *)__mptr - offsetof(type,member) );})
+
+#ifdef WITH_STACKMAP
+static void *
+_worker(void *data)
+{
+	struct nm_targ *targ = (struct nm_targ *) data;
+	struct nm_garg *g = targ->g;
+	struct pollfd pfd[2] = {{ .fd = targ->fd }};
+	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
+	int msglen = dbip->msglen;
+
+	while (!targ->cancel) {
+		if (g->dev_type == DEV_NETMAP) {
+			struct nm_desc *nmd = g->nmd;
+			struct netmap_if *nifp = nmd->nifp;
+			u_int first_rx_ring = nmd->first_rx_ring;
+			u_int last_rx_ring = nmd->last_rx_ring;
+			int i;
+
+			pfd[0].fd = nmd->fd;
+			pfd[0].events = POLLIN;
+			pfd[1].fd = dbip->sd;
+			pfd[1].events = POLLIN;
+
+			i = poll(pfd, 2, g->polltimeo);
+			if (i < 0) {
+				perror("poll");
+				goto quit;
+			}
+
+			/*
+			 * check the listen socket
+			 */
+			if (pfd[1].revents & POLLIN) {
+				struct sockaddr_storage tmp;
+				struct nm_ifreq *ifreq = &g->ifreq;
+				int newfd;
+				socklen_t len = sizeof(tmp);
+
+				newfd = accept(pfd[1].fd, (struct sockaddr *)
+					    &tmp, &len);
+				if (newfd < 0) {
+					perror("accept");
+					/* ignore this socket */
+					goto accepted;
+				}
+				memcpy(ifreq->data, &newfd, sizeof(newfd));
+				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
+					perror("ioctl");
+					close(newfd);
+					close(pfd[1].fd);
+					/* be conservative to this error... */
+					goto quit;
+				}
+			}
+accepted:
+			/*
+			 * check accepted sockets
+			 */
+			if (!(pfd[0].revents & POLLIN))
+				continue;
+
+			for (i = first_rx_ring; i <= last_rx_ring; i++) {
+				struct netmap_ring *rxr, *txr;
+				struct netmap_slot *rxs;
+				u_int txcur, txlim, rxcur, rx;
+
+				rxr = NETMAP_RXRING(nifp, i);
+				txr = NETMAP_TXRING(nifp, i);
+
+				txcur = txr->cur;
+				rxcur = rxr->cur;
+				/* XXX 1 reqequest triggers 1 response */
+				txlim = nm_ring_space(txr);
+				if (txlim > nm_ring_space(rxr)) {
+					txlim = nm_ring_space(rxr);
+				}
+				for (rx = 0; rx < txlim; rx++) {
+					struct netmap_slot *txs;
+					char *p;
+
+					rxs = &rxr->slot[rxcur];
+					p = NETMAP_BUF(rxr, rxs->buf_idx);
+					p += g->virt_header;
+					p += rxs->offset;
+
+					dbip->rxbuf = p;
+					dbip->rxlen = rxs->len;
+					txs = &txr->slot[txcur];
+					dbip->txbuf =
+						NETMAP_BUF(txr, txs->buf_idx);
+					dbip->txbuf +=
+						g->virt_header + dbip->soff;
+					dbip->txlen = 0; // just initialize
+					dbip->pst_ent = (uint64_t)
+						rxs->buf_idx << 32 |
+						g->virt_header << 16 | rxs->len;
+					do_established(-1, msglen, dbip);
+					if (dbip->txlen) {
+						txs->len = dbip->txlen +
+							g->virt_header +
+							dbip->soff;
+						txs->offset = TCPIP_OFFSET;
+						txs->fd = rxs->fd;
+					} else {
+						txs->len = 0;
+					}
+					txcur = nm_ring_next(txr, txcur);
+					txlim--;
+					rxcur = nm_ring_next(rxr, rxcur);
+				}
+				txr->head = txr->cur = txcur;
+				rxr->head = rxr->cur = rxcur;
+
+				/* No batch support yet */
+			}
+
+		}
+	}
+quit:
+	targ->used = 0;
+	return (NULL);
+}
+#endif /* WITH_STACKMAP */
 
 int
 main(int argc, char **argv)
@@ -446,8 +520,6 @@ main(int argc, char **argv)
 	int port = 0;
 	struct epoll_event ev;
 	struct epoll_event evts[MAXCONNECTIONS];
-	ssize_t msglen = 1;
-	int polltimeo = 2000;
 	struct dbinfo dbi;
 #ifdef WITH_SQLITE
 	int ret = 0;
@@ -457,11 +529,15 @@ main(int argc, char **argv)
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
+	dbi.msglen = 0;
 #ifdef WITH_STACKMAP
-	dbi.nmr_config = "";
+	dbi.g.nmr_config = "";
+	dbi.g.nthreads = 1;
+	dbi.g.td_body = _worker;
+	dbi.g.polltimeo = 2000;
 #endif
 
-	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBcC:")) != -1) {
+	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBcC:a:t:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -471,10 +547,10 @@ main(int argc, char **argv)
 			port = atoi(optarg);
 			break;
 		case 'l': /* HTTP OK content length */
-			msglen = atoi(optarg);
+			dbi.msglen = atoi(optarg);
 			break;
 		case 'b': /* give the epoll_wait() timeo argument -1 */
-			polltimeo = atoi(optarg);
+			dbi.g.polltimeo = atoi(optarg);
 			break;
 		case 'd':
 			{
@@ -503,12 +579,6 @@ main(int argc, char **argv)
 			dbi.flags |= DBI_FLAGS_BATCH;
 			break;
 		case 'i':
-			/*
-			if (p = strstr(optarg, ",")) {
-				*p++ = '\0';
-				strncpy(dbi.memname, p, sizeof(dbi.memname));
-			}
-			*/
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
 			break;
 		case 'P': /* PASTE */
@@ -517,9 +587,15 @@ main(int argc, char **argv)
 		case 'c':
 			dbi.httplen = 1;
 			break;
+		case 'a':
+			dbi.g.affinity = atoi(optarg);
+			break;
+		case 't':
+			dbi.g.nthreads = atoi(optarg);
+			break;
 #ifdef WITH_STACKMAP
 		case 'C':
-			dbi.nmr_config = strdup(optarg);
+			dbi.g.nmr_config = strdup(optarg);
 			break;
 #endif
 		}
@@ -531,7 +607,7 @@ main(int argc, char **argv)
 			perror("malloc");
 			usage();
 		}
-		dbi.httplen = generate_httphdr(msglen, dbi.http, NULL);
+		dbi.httplen = generate_httphdr(dbi.msglen, dbi.http, NULL);
 	}
 
 	fprintf(stderr, "%s built %s %s db: %s\n",
@@ -541,7 +617,7 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if (!port || !msglen)
+	if (!port || !dbi.msglen)
 		usage();
 
 	if (dbi.flags & DBI_FLAGS_READPMEM) {
@@ -669,46 +745,35 @@ error:
 		perror("listen");
 		goto close_socket;
 	}
+	dbi.sd = sd;
 #ifdef WITH_STACKMAP
 	if (dbi.ifname[0]) {
-		char nm_name[STMNAME_MAX+1];
-		//char *p;
-		struct nmreq req;
-		struct nm_ifreq *ifreq = &dbi.ifreq;
+		char *p = dbi.g.ifname;
+		struct nm_ifreq *ifreq = &dbi.g.ifreq;
 
 		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
 			D("too long name %s", dbi.ifname);
 			goto close_socket;
 		}
-		strcat(strcat(strcpy(nm_name, STMNAME), "+"), dbi.ifname);
-		/* configure rings */
-		bzero(&req, sizeof(req));
-		nm_parse_nmr_config(dbi.nmr_config, &req);
-
-		dbi.nmd = nm_open(nm_name, &req, 0, NULL);
-		if (!dbi.nmd) {
-			D("Unable to open %s: %s", dbi.ifname, strerror(errno));
-			goto close_socket;
-		}
-		sleep(2);
-		D("nm_open done: req.nr_name %s", req.nr_name);
+		strcat(strcat(strcpy(p, STMNAME), "+"), dbi.ifname);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
-
-		/* ask vnet_hdr_len */
-		bzero(&req, sizeof(req));
-		bcopy(dbi.nmd->req.nr_name, req.nr_name, sizeof(req.nr_name));
-		req.nr_version = NETMAP_API;
-		req.nr_cmd = NETMAP_VNET_HDR_GET;
-		if (ioctl(dbi.nmd->fd, NIOCREGIF, &req)) {
-			D("Unable to get header length");
-			goto close_nmd;
-		}
-		dbi.voff = req.nr_arg1;
 		dbi.soff = TCPIP_OFFSET;
-		D("nm_open() %s done (offset %u ring_num %u)", nm_name, dbi.voff + dbi.soff, dbi.nmd->nifp->ni_tx_rings);
+
+		dbi.g.dev_type = DEV_NETMAP;
+		dbi.g.td_type = TD_TYPE_OTHER;
+
+		if (nm_start(&dbi.g) < 0)
+			goto close_socket;
+		ND("nm_open() %s done (offset %u ring_num %u)",
+		    nm_name, dbi.soff, dbi.g.nmd->nifp->ni_tx_rings);
+
+		free(targs);
+		if (sd > 0)
+			close(sd);
+		return 0;
 	} else
 #endif /* WITH_STACKMAP */
 	{
@@ -718,124 +783,17 @@ error:
 	epoll_ctl(epfd, EPOLL_CTL_ADD, sd, &ev);
 	}
 
-	signal(SIGINT, sig_h);
-	signal(SIGHUP, sig_h);
-
 #if 0
 	stat_eps = stat_nfds = stat_maxnfds = 0;
 	stat_vnfds = 0;
 	stat_minnfds = ~0;
 #endif /* 0 */
+
 	while (!do_abort) {
 		/* fetch events */
-#ifdef WITH_STACKMAP
-		if (dbi.ifname[0]) {
-			struct nm_desc *nmd = dbi.nmd;
-			struct netmap_if *nifp = nmd->nifp;
-			struct pollfd pfd[2];
-			u_int first_rx_ring = nmd->first_rx_ring;
-			u_int last_rx_ring = nmd->last_rx_ring;
-
-			pfd[0].fd = nmd->fd;
-			pfd[0].events = POLLIN;
-			pfd[1].fd = sd;
-			pfd[1].events = POLLIN;
-
-			i = poll(pfd, 2, polltimeo);
-			if (i < 0) {
-				perror("poll");
-				goto close_nmd;
-			}
-
-			/*
-			 * check the listen socket
-			 */
-			if (pfd[1].revents & POLLIN) {
-				struct sockaddr_storage tmp;
-				struct nm_ifreq *ifreq = &dbi.ifreq;
-				int newfd;
-				socklen_t len = sizeof(tmp);
-
-				newfd = accept(pfd[1].fd, (struct sockaddr *)
-					    &tmp, &len);
-				if (newfd < 0) {
-					perror("accept");
-					/* ignore this socket */
-					goto accepted;
-				}
-				memcpy(ifreq->data, &newfd, sizeof(newfd));
-				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
-					perror("ioctl");
-					close(newfd);
-					close(pfd[1].fd);
-					/* be conservative to this error... */
-					goto close_nmd;
-				}
-			}
-accepted:
-			/*
-			 * check accepted sockets
-			 */
-			if (!(pfd[0].revents & POLLIN))
-				continue;
-
-			for (i = first_rx_ring; i <= last_rx_ring; i++) {
-				struct netmap_ring *rxr, *txr;
-				struct netmap_slot *rxs;
-				u_int txcur, txlim, rxcur, rx;
-
-				rxr = NETMAP_RXRING(nifp, i);
-				txr = NETMAP_TXRING(nifp, i);
-
-				txcur = txr->cur;
-				rxcur = rxr->cur;
-				/* XXX 1 reqequest triggers 1 response */
-				txlim = nm_ring_space(txr);
-				if (txlim > nm_ring_space(rxr)) {
-					txlim = nm_ring_space(rxr);
-				}
-				for (rx = 0; rx < txlim; rx++) {
-					struct netmap_slot *txs;
-					char *p;
-
-					rxs = &rxr->slot[rxcur];
-					p = NETMAP_BUF(rxr, rxs->buf_idx);
-					p += dbi.voff;
-					p += rxs->offset;
-
-					dbi.rxbuf = p;
-					dbi.rxlen = rxs->len;
-					txs = &txr->slot[txcur];
-					dbi.txbuf =
-						NETMAP_BUF(txr, txs->buf_idx);
-					dbi.txbuf += dbi.voff + dbi.soff;
-					dbi.txlen = 0; // just initialize
-					dbi.pst_ent = (uint64_t)
-						rxs->buf_idx << 32 |
-						dbi.voff << 16 | rxs->len;
-					do_established(-1, msglen, &dbi);
-					if (dbi.txlen) {
-						txs->len = dbi.txlen +
-							dbi.voff + dbi.soff;
-						txs->offset = TCPIP_OFFSET;
-						txs->fd = rxs->fd;
-					} else {
-						txs->len = 0;
-					}
-					txcur = nm_ring_next(txr, txcur);
-					txlim--;
-					rxcur = nm_ring_next(rxr, rxcur);
-				}
-				txr->head = txr->cur = txcur;
-				rxr->head = rxr->cur = rxcur;
-
-				/* No batch support yet */
-			}
-
-		} else
-#endif /* WITH_STACKMAP */
 	       	{
-			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, polltimeo);
+			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS,
+					dbi.g.polltimeo);
 #if 0
 		if (nfd > 0) {
 			stat_eps++;
@@ -862,14 +820,12 @@ accepted:
 				if (do_accept(sd, epfd) < 0)
 					goto close_socket;
 			} else
-				do_established(evts[i].data.fd, msglen, &dbi);
+				do_established(evts[i].data.fd, dbi.msglen, &dbi);
 		}
 
 	}
 
 #ifdef WITH_STACKMAP
-close_nmd:
-	nm_close(dbi.nmd);
 #endif /* WITH_STACKMAP */
 close_socket:
 	close(sd);
