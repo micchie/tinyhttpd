@@ -32,6 +32,10 @@
 #include <net/netmap_user.h>
 #include "nmlib.h"
 
+#define container_of(ptr, type, member) ({          \
+		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+		(type *)( (char *)__mptr - offsetof(type,member) );})
+
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
 #endif /* WITH_STACKMAP */
@@ -66,17 +70,25 @@ struct dbinfo {
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct nm_garg g;
-	char *rxbuf;
-	char *txbuf;
-	uint64_t pst_ent; /* 32 bit buf_idx + 16 bit off + 16 bit len */
-	uint16_t txlen; // slot length
-	uint16_t rxlen;
-	uint16_t soff;
 #endif /* WITH_STACKMAP */
 	int sd;
 	char *http;
 	int httplen;
 	int msglen;
+	struct nm_ifreq ifreq;
+};
+
+/* XXX DB-related info should also be moved here */
+struct thpriv {
+	struct nm_garg *g;
+	char *rxbuf;
+	char *txbuf;
+	int cur;
+	uint64_t pst_ent;
+	uint16_t txlen;
+	uint16_t rxlen;
+	int sd;
+	struct nm_ifreq ifreq;
 };
 
 //static struct timespec ts = {0, 0};
@@ -98,9 +110,6 @@ mfence(void)
 #define MAXQUERYLEN 65535
 #define MAXDUMBSIZE	204800
 #ifdef WITH_STACKMAP
-#define TCPIP_OFFSET (sizeof(struct ethhdr) + sizeof(struct iphdr) \
-	+ sizeof(struct tcphdr) + 12)
-
 struct paste_hdr {
 	char ifname[IFNAMSIZ + 64];
 	char path[256];
@@ -227,15 +236,17 @@ int do_accept(int fd, int epfd)
 	return 0;
 }
 
-int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
+int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 {
+	struct dbinfo *dbi = container_of(targ->g, struct dbinfo, g);
 	char buf[MAXQUERYLEN];
 	char *rxbuf, *txbuf;
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
 	ssize_t len;
-       
+	struct thpriv *tp = targ->td_private;
+
 	rxbuf = txbuf = buf;
 	if (dbi->flags & DBI_FLAGS_READPMEM) {
 		len = dbi->mmap; /* page size */
@@ -243,9 +254,9 @@ int do_established(int fd, ssize_t msglen, struct dbinfo *dbi)
 	}
 #ifdef WITH_STACKMAP
 	if (dbi->g.nmd) {
-		rxbuf = dbi->rxbuf;
-		txbuf = dbi->txbuf;
-		len = dbi->rxlen;
+		rxbuf = tp->rxbuf;
+		txbuf = tp->txbuf;
+		len = tp->rxlen;
 	} else
 #endif /* WITH_STACKMAP */
 	{
@@ -274,14 +285,14 @@ direct:
 				char *p;
 				int i;
 
-				if (dbi->cur + sizeof(dbi->pst_ent) > 
+				if (tp->cur + sizeof(tp->pst_ent) > 
 				    dbi->maplen - sizeof(struct paste_hdr))
-					dbi->cur = 0;
+					tp->cur = 0;
 
 				p = dbi->paddr + sizeof(struct paste_hdr) + 
-					dbi->cur;
+					tp->cur;
 				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
-					*(uint64_t *)p = dbi->pst_ent;
+					*(uint64_t *)p = tp->pst_ent;
 					clflush(p);
 				}
 				/* also flush data buffer */
@@ -289,7 +300,7 @@ direct:
 					clflush(rxbuf + i);
 				}
 				mfence();
-				dbi->cur += sizeof(dbi->pst_ent);
+				tp->cur += sizeof(tp->pst_ent);
 			} else
 #endif /* WITH_STACKMAP */
 			if (dbi->mmap) {
@@ -377,7 +388,7 @@ gen_httpok:
 		write(fd, txbuf, len);
 #ifdef WITH_STACKMAP
 	else
-		dbi->txlen = len;
+		tp->txlen = len;
 #endif /* WITH_STACKMAP */
 	return 0;
 }
@@ -395,16 +406,19 @@ _worker(void *data)
 	struct pollfd pfd[2] = {{ .fd = targ->fd }};
 	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
 	int msglen = dbip->msglen;
+	struct thpriv *tp = targ->td_private;
+
+	/* bring some information down to this thread */
+	tp->ifreq = dbip->ifreq;
 
 	while (!targ->cancel) {
 		if (g->dev_type == DEV_NETMAP) {
-			struct nm_desc *nmd = g->nmd;
-			struct netmap_if *nifp = nmd->nifp;
-			u_int first_rx_ring = nmd->first_rx_ring;
-			u_int last_rx_ring = nmd->last_rx_ring;
+			struct netmap_if *nifp = targ->nmd->nifp;
+			u_int first_rx_ring = targ->nmd->first_rx_ring;
+			u_int last_rx_ring = targ->nmd->last_rx_ring;
 			int i;
 
-			pfd[0].fd = nmd->fd;
+			pfd[0].fd = targ->fd;
 			pfd[0].events = POLLIN;
 			pfd[1].fd = dbip->sd;
 			pfd[1].events = POLLIN;
@@ -420,7 +434,7 @@ _worker(void *data)
 			 */
 			if (pfd[1].revents & POLLIN) {
 				struct sockaddr_storage tmp;
-				struct nm_ifreq *ifreq = &g->ifreq;
+				struct nm_ifreq *ifreq = &tp->ifreq;
 				int newfd;
 				socklen_t len = sizeof(tmp);
 
@@ -432,7 +446,7 @@ _worker(void *data)
 					goto accepted;
 				}
 				memcpy(ifreq->data, &newfd, sizeof(newfd));
-				if (ioctl(nmd->fd, NIOCCONFIG, ifreq)) {
+				if (ioctl(targ->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
 					close(newfd);
 					close(pfd[1].fd);
@@ -465,29 +479,29 @@ accepted:
 				for (rx = 0; rx < txlim; rx++) {
 					struct netmap_slot *txs;
 					char *p;
+					int txoff;
+				       
+					txoff = g->virt_header + IPV4TCP_HDRLEN;
 
 					rxs = &rxr->slot[rxcur];
 					p = NETMAP_BUF(rxr, rxs->buf_idx);
 					p += g->virt_header;
 					p += rxs->offset;
 
-					dbip->rxbuf = p;
-					dbip->rxlen = rxs->len;
+					tp->rxbuf = p;
+					tp->rxlen = rxs->len;
 					txs = &txr->slot[txcur];
-					dbip->txbuf =
+					tp->txbuf =
 						NETMAP_BUF(txr, txs->buf_idx);
-					dbip->txbuf +=
-						g->virt_header + dbip->soff;
-					dbip->txlen = 0; // just initialize
-					dbip->pst_ent = (uint64_t)
-						rxs->buf_idx << 32 |
-						g->virt_header << 16 | rxs->len;
-					do_established(-1, msglen, dbip);
-					if (dbip->txlen) {
-						txs->len = dbip->txlen +
-							g->virt_header +
-							dbip->soff;
-						txs->offset = TCPIP_OFFSET;
+					tp->txbuf += txoff;
+					tp->txlen = 0; // just initialize
+					tp->pst_ent = (uint64_t)
+					    rxs->buf_idx << 32 |
+					    g->virt_header << 16 | rxs->len;
+					do_established(-1, msglen, targ);
+					if (tp->txlen) {
+						txs->len = tp->txlen + txoff;
+						txs->offset = IPV4TCP_HDRLEN;
 						txs->fd = rxs->fd;
 					} else {
 						txs->len = 0;
@@ -501,7 +515,6 @@ accepted:
 
 				/* No batch support yet */
 			}
-
 		}
 	}
 quit:
@@ -749,7 +762,7 @@ error:
 #ifdef WITH_STACKMAP
 	if (dbi.ifname[0]) {
 		char *p = dbi.g.ifname;
-		struct nm_ifreq *ifreq = &dbi.g.ifreq;
+		struct nm_ifreq *ifreq = &dbi.ifreq;
 
 		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
 			D("too long name %s", dbi.ifname);
@@ -760,15 +773,15 @@ error:
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
-		dbi.soff = TCPIP_OFFSET;
 
 		dbi.g.dev_type = DEV_NETMAP;
 		dbi.g.td_type = TD_TYPE_OTHER;
+		dbi.g.td_private_len = sizeof(struct thpriv);
 
 		if (nm_start(&dbi.g) < 0)
 			goto close_socket;
 		ND("nm_open() %s done (offset %u ring_num %u)",
-		    nm_name, dbi.soff, dbi.g.nmd->nifp->ni_tx_rings);
+		    nm_name, IPV4TCP_HDRLEN, dbi.g.nmd->nifp->ni_tx_rings);
 
 		free(targs);
 		if (sd > 0)
@@ -820,7 +833,8 @@ error:
 				if (do_accept(sd, epfd) < 0)
 					goto close_socket;
 			} else
-				do_established(evts[i].data.fd, dbi.msglen, &dbi);
+				//do_established(evts[i].data.fd, dbi.msglen, &dbi);
+				do_established(evts[i].data.fd, dbi.msglen, NULL);
 		}
 
 	}

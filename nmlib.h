@@ -12,6 +12,7 @@
 #define VIRT_HDR_1	10	/* length of a base vnet-hdr */
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
+#define IPV4TCP_HDRLEN	66
 
 enum dev_type { DEV_NONE, DEV_NETMAP };
 enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER };
@@ -53,7 +54,6 @@ struct nm_garg {
 	char ifname[MAX_IFNAMELEN]; // must be here
 	struct nm_desc *nmd;
 	void *(*td_body)(void *);
-	struct nm_ifreq ifreq;
 	int nthreads;
 	int affinity;
 	int dev_type;
@@ -74,6 +74,8 @@ struct nm_garg {
 	int report_interval;
 #define OPT_PPS_STATS   2048
 	int options;
+	int td_private_len; // passed down to targ
+	struct nm_ifreq ifreq;	/* cache */
 };
 
 struct nm_targ {
@@ -92,6 +94,8 @@ struct nm_targ {
 	int me;
 	int affinity;
 	pthread_t thread;
+	void *td_private;
+	struct nm_ifreq ifreq;	/* cache */
 };
 
 static struct nm_targ *targs;
@@ -233,6 +237,11 @@ nm_start_threads(struct nm_garg *g)
 		bzero(t, sizeof(*t));
 		t->fd = -1;
 		t->g = g;
+		t->td_private = calloc(g->td_private_len, 1);
+		t->ifreq = g->ifreq;
+		if (t->td_private == NULL) {
+			continue;
+		}
 
 		if (g->dev_type == DEV_NETMAP) {
 			/* copy, we overwrite ringid */
@@ -437,12 +446,12 @@ nm_start(struct nm_garg *g)
 	struct nmreq base_nmd;
 	struct sigaction sa;
 	sigset_t ss;
+	char *p;
 
 	g->main_fd = -1;
 	g->wait_link = 3;
 	g->report_interval = 1000;
-	g->cpus = 1;
-	g->system_cpus = i = system_ncpus();
+	g->cpus = g->system_cpus = i = system_ncpus();
 	if (g->cpus < 0 || g->cpus > i) {
 		D("%d cpus is too high, have only %d cpus", g->cpus, i);
 		return -EINVAL;
@@ -479,6 +488,11 @@ nm_start(struct nm_garg *g)
 	if (g->nmd == NULL) {
 		D("Unable to open %s: %s", g->ifname, strerror(errno));
 		goto out;
+	}
+
+	/* XXX remove unnecessary suffix */
+	if ((p = index(g->ifname, ','))) {
+		*p = '\0';
 	}
 
 	if (g->nthreads > 1) {
@@ -573,7 +587,14 @@ out:
 	if (pthread_sigmask(SIG_UNBLOCK, &ss, NULL) < 0) {
 		D("failed to re-enable SIGINT: %s", strerror(errno));
 	}
+
 	nm_main_thread(g);
+
+	for (i = 0; i < g->nthreads; i++) {
+		if (targs[i].td_private)
+			free(targs[i].td_private);
+	}
+	free(targs);
 	return 0;
 }
 
