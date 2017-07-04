@@ -107,7 +107,7 @@ mfence(void)
 #define CACHE_LINE_SIZE	64 /* XXX */
 
 #define MAXCONNECTIONS 2048
-#define MAXQUERYLEN 65535
+#define MAXQUERYLEN 32767
 #define MAXDUMBSIZE	204800
 #ifdef WITH_STACKMAP
 struct paste_hdr {
