@@ -65,6 +65,7 @@ struct nm_garg {
 	int extra_bufs;		/* goes in nr_arg3 */
 	int extra_pipes;	/* goes in nr_arg1 */
 	char *nmr_config;
+	char *extmem;		/* goes to nr_arg1+ */
 #define	STATS_WIN	15
 	int win_idx;
 	int64_t win[STATS_WIN];
@@ -475,6 +476,12 @@ nm_start(struct nm_garg *g)
 	if (g->extra_pipes) {
 		base_nmd.nr_arg1 = g->extra_pipes;
 	}
+#ifdef WITH_EXTMEM
+	if (g->extmem) {
+		base_nmd.nr_cmd = NETMAP_POOLS_CREATE;
+                memcpy((void *)&base_nmd.nr_arg1, &g->extmem, sizeof(void *));
+	}
+#endif /* WITH_EXTMEM */
 	base_nmd.nr_flags |= NR_ACCEPT_VNET_HDR;
 
 	/*

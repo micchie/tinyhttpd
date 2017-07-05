@@ -38,6 +38,9 @@
 
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
+#define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
+//#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
+#define DEFAULT_EXT_MEM_SIZE    100000000 /* approx. 100 MB */
 #endif /* WITH_STACKMAP */
 
 #ifndef D
@@ -70,12 +73,13 @@ struct dbinfo {
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct nm_garg g;
+	struct nm_ifreq ifreq;
+	int extmem_fd;
 #endif /* WITH_STACKMAP */
 	int sd;
 	char *http;
 	int httplen;
 	int msglen;
-	struct nm_ifreq ifreq;
 };
 
 /* XXX DB-related info should also be moved here */
@@ -128,6 +132,27 @@ static u_int stat_maxnfds;
 static u_int stat_minnfds;
 static uint64_t stat_vnfds;
 #endif /* 0 */
+
+static char *
+_do_mmap(int fd, int len)
+{
+	char *p;
+
+	if (lseek(fd, len -1, SEEK_SET) < 0) {
+		perror("lseek");
+		return NULL;
+	}
+	if (write(fd, "", 1) != 1) {
+		perror("write");
+		return NULL;
+	}
+	p = mmap(0, len, PROT_WRITE, MAP_SHARED | MAP_FILE, fd, 0);
+	if (p == MAP_FAILED) {
+		perror("mmap");
+		return NULL;
+	}
+	return p;
+}
 
 void
 close_db(struct dbinfo *dbip)
@@ -647,20 +672,9 @@ main(int argc, char **argv)
 		}
 		if (dbi.mmap) {
 			dbi.maplen = MAXDUMBSIZE; /* XXX is size ok? */
-			if (lseek(dbi.dumbfd, dbi.maplen - 1, SEEK_SET) < 0) {
-				perror("lseek");
+			dbi.paddr = _do_mmap(dbi.dumbfd, dbi.maplen);
+			if (dbi.paddr == NULL)
 				goto close;
-			}
-			if (write(dbi.dumbfd, "", 1) != 1) {
-				perror("write");
-				goto close;
-			}
-			dbi.paddr = mmap(0, dbi.maplen, PROT_WRITE,
-				       	MAP_SHARED | MAP_FILE, dbi.dumbfd, 0);
-			if (dbi.paddr == MAP_FAILED) {
-				perror("mmap");
-				goto close;
-			}
 #ifdef WITH_STACKMAP
 			if (dbi.flags & DBI_FLAGS_PASTE) {
 				/* write WAL header */
@@ -763,6 +777,7 @@ error:
 	if (dbi.ifname[0]) {
 		char *p = dbi.g.ifname;
 		struct nm_ifreq *ifreq = &dbi.ifreq;
+		struct netmap_pools_info *pi;
 
 		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
 			D("too long name %s", dbi.ifname);
@@ -777,7 +792,20 @@ error:
 		dbi.g.dev_type = DEV_NETMAP;
 		dbi.g.td_type = TD_TYPE_OTHER;
 		dbi.g.td_private_len = sizeof(struct thpriv);
-
+#ifdef WITH_EXTMEM
+		dbi.extmem_fd = open(DEFAULT_EXT_MEM, O_RDWR|O_CREAT,
+					S_IRWXU);
+                if (dbi.extmem_fd < 0) {
+                        perror("open");
+                        goto close_socket;
+                }
+                dbi.g.extmem = _do_mmap(dbi.extmem_fd, DEFAULT_EXT_MEM_SIZE);
+                if (dbi.g.extmem == NULL) {
+                        goto close_socket;
+                }
+		pi = (struct netmap_pools_info *)dbi.g.extmem;
+		pi->memsize = DEFAULT_EXT_MEM_SIZE;
+#endif
 		if (nm_start(&dbi.g) < 0)
 			goto close_socket;
 		ND("nm_open() %s done (offset %u ring_num %u)",
@@ -842,6 +870,14 @@ error:
 #ifdef WITH_STACKMAP
 #endif /* WITH_STACKMAP */
 close_socket:
+#ifdef WITH_EXTMEM
+	if (dbi.g.extmem) {
+		if (dbi.g.extmem)
+			munmap(dbi.g.extmem, DEFAULT_EXT_MEM_SIZE);
+		close(dbi.extmem_fd);
+	}
+#endif /* WITH_EXTMEM */
+
 	close(sd);
 close_ep:
 	if (dbi.ifname[0])
