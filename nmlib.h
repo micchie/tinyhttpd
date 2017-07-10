@@ -1,3 +1,4 @@
+
 #include <math.h>
 #include<net/netmap.h>
 #include<net/netmap_user.h>
@@ -13,9 +14,31 @@
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
 #define IPV4TCP_HDRLEN	66
+#define MAP_HUGETLB	0x40000
 
-enum dev_type { DEV_NONE, DEV_NETMAP };
+enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
 enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER };
+
+#define cpuset_t        cpu_set_t
+/* set the thread affinity. */
+static inline int
+setaffinity(pthread_t me, int i)
+{
+	cpuset_t cpumask;
+
+	if (i == -1)
+		return 0;
+
+	/* Set thread affinity affinity.*/
+	CPU_ZERO(&cpumask);
+	CPU_SET(i, &cpumask);
+
+	if (pthread_setaffinity_np(me, sizeof(cpuset_t), &cpumask) != 0) {
+		D("Unable to set affinity: %s", strerror(errno));
+		return 1;
+	}
+	return 0;
+}
 
 static void
 tx_output(struct my_ctrs *cur, double delta, const char *msg)
@@ -54,6 +77,7 @@ struct nm_garg {
 	char ifname[MAX_IFNAMELEN]; // must be here
 	struct nm_desc *nmd;
 	void *(*td_body)(void *);
+	void *(*td_privbody)(void *);
 	int nthreads;
 	int affinity;
 	int dev_type;
@@ -76,7 +100,6 @@ struct nm_garg {
 #define OPT_PPS_STATS   2048
 	int options;
 	int td_private_len; // passed down to targ
-	struct nm_ifreq ifreq;	/* cache */
 };
 
 struct nm_targ {
@@ -96,7 +119,6 @@ struct nm_targ {
 	int affinity;
 	pthread_t thread;
 	void *td_private;
-	struct nm_ifreq ifreq;	/* cache */
 };
 
 static struct nm_targ *targs;
@@ -222,6 +244,22 @@ set_vnet_hdr_len(struct nm_garg *g)
 	}
 }
 
+static void *
+nm_thread(void *data)
+{
+	struct nm_targ *targ = (struct nm_targ *) data;
+	struct nm_garg *g = targ->g;
+
+	D("start, fd %d main_fd %d", targ->fd, targ->g->main_fd);
+	if (setaffinity(targ->thread, targ->affinity))
+		goto quit;
+	g->td_privbody(data);
+
+quit:
+	targ->used = 0;
+	return (NULL);
+}
+
 static int
 nm_start_threads(struct nm_garg *g)
 {
@@ -239,7 +277,6 @@ nm_start_threads(struct nm_garg *g)
 		t->fd = -1;
 		t->g = g;
 		t->td_private = calloc(g->td_private_len, 1);
-		t->ifreq = g->ifreq;
 		if (t->td_private == NULL) {
 			continue;
 		}
@@ -281,8 +318,6 @@ nm_start_threads(struct nm_garg *g)
 			}
 			t->fd = t->nmd->fd;
 
-		} else {
-			targs[i].fd = g->main_fd;
 		}
 		t->used = 1;
 		t->me = i;
@@ -297,9 +332,10 @@ nm_start_threads(struct nm_garg *g)
 	sleep(g->wait_link);
 	D("Ready...");
 
+	D("nthreads %d", g->nthreads);
 	for (i = 0; i < g->nthreads; i++) {
 		t = &targs[i];
-		if (pthread_create(&t->thread, NULL, g->td_body, t) == -1) {
+		if (pthread_create(&t->thread, NULL, &nm_thread, t) == -1) {
 			D("Unable to create thread %d: %s", i, strerror(errno));
 			t->used = 0;
 		}
@@ -406,7 +442,7 @@ nm_main_thread(struct nm_garg *g)
 		if (g->dev_type == DEV_NETMAP) {
 			nm_close(targs[i].nmd);
 			targs[i].nmd = NULL;
-		} else {
+		} else if (targs[i].fd > 2) {
 			close(targs[i].fd);
 		}
 		if (targs[i].completed == 0)
@@ -443,7 +479,7 @@ nm_main_thread(struct nm_garg *g)
 int
 nm_start(struct nm_garg *g)
 {
-	int i, devqueues;
+	int i, devqueues = 0;
 	struct nmreq base_nmd;
 	struct sigaction sa;
 	sigset_t ss;
@@ -460,6 +496,9 @@ nm_start(struct nm_garg *g)
 	D("running on %d cpus (have %d)", g->cpus, i);
 	if (g->cpus == 0)
 		g->cpus = i;
+
+	if (g->dev_type != DEV_NETMAP)
+		goto nonetmap;
 
 	if (g->virt_header != 0 && g->virt_header != VIRT_HDR_1
 			&& g->virt_header != VIRT_HDR_2) {
@@ -561,6 +600,7 @@ nm_start(struct nm_garg *g)
 		}
 	}
 
+nonetmap:
 	/* Print some debug information. */
 	fprintf(stdout,
 		"%s %s: %d queues, %d threads and %d cpus.\n", "Working on",
@@ -570,7 +610,7 @@ nm_start(struct nm_garg *g)
 		g->cpus);
 out:
 	/* return -1 if something went wrong. */
-	if (g->main_fd < 0) {
+	if (g->dev_type == DEV_NETMAP && g->main_fd < 0) {
 		D("aborting");
 		return -1;
 	}

@@ -1,3 +1,28 @@
+/*
+ * Copyright (C) 2016-2017 Michio Honda. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *   1. Redistributions of source code must retain the above copyright
+ *      notice, this list of conditions and the following disclaimer.
+ *   2. Redistributions in binary form must reproduce the above copyright
+ *      notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <inttypes.h>
 #include <sys/poll.h>
@@ -30,6 +55,8 @@
 #ifdef WITH_STACKMAP
 #include <net/netmap.h>
 #include <net/netmap_user.h>
+
+#include<sched.h>
 #include "nmlib.h"
 
 #define container_of(ptr, type, member) ({          \
@@ -40,13 +67,17 @@
 #define STMNAME_MAX	64
 #define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
 //#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
-#define DEFAULT_EXT_MEM_SIZE    100000000 /* approx. 100 MB */
+#define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
 #endif /* WITH_STACKMAP */
 
 #ifndef D
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
+
+#define MAXCONNECTIONS 2048
+#define MAXQUERYLEN 32767
+#define MAXDUMBSIZE	204800
 
 #define MAX_HTTPLEN	65535
 struct dbinfo {
@@ -91,8 +122,8 @@ struct thpriv {
 	uint64_t pst_ent;
 	uint16_t txlen;
 	uint16_t rxlen;
-	int sd;
 	struct nm_ifreq ifreq;
+	struct epoll_event evts[MAXCONNECTIONS];
 };
 
 //static struct timespec ts = {0, 0};
@@ -110,9 +141,6 @@ mfence(void)
 
 #define CACHE_LINE_SIZE	64 /* XXX */
 
-#define MAXCONNECTIONS 2048
-#define MAXQUERYLEN 32767
-#define MAXDUMBSIZE	204800
 #ifdef WITH_STACKMAP
 struct paste_hdr {
 	char ifname[IFNAMSIZ + 64];
@@ -124,7 +152,6 @@ struct paste_hdr {
 enum { DT_NONE=0, DT_DUMB, DT_SQLITE};
 const char *SQLDBTABLE = "tinytable";
 
-static int do_abort = 0;
 #if 0
 static u_int stat_nfds;
 static u_int stat_eps;
@@ -436,6 +463,26 @@ _worker(void *data)
 	/* bring some information down to this thread */
 	tp->ifreq = dbip->ifreq;
 
+	if (g->dev_type == DEV_SOCKET) {
+		struct epoll_event ev;
+
+		targ->fd = epoll_create1(EPOLL_CLOEXEC);
+		if (targ->fd < 0) {
+			perror("epoll_create1");
+			targ->cancel = 1;
+			goto quit;
+		}
+
+		bzero(&ev, sizeof(ev));
+		ev.events = POLLIN;
+		ev.data.fd = dbip->sd;
+		if (epoll_ctl(targ->fd, EPOLL_CTL_ADD, ev.data.fd, &ev)) {
+			perror("epoll_ctl");
+			targ->cancel = 1;
+			goto quit;
+		}
+	}
+
 	while (!targ->cancel) {
 		if (g->dev_type == DEV_NETMAP) {
 			struct netmap_if *nifp = targ->nmd->nifp;
@@ -540,10 +587,30 @@ accepted:
 
 				/* No batch support yet */
 			}
+		} else if (g->dev_type == DEV_SOCKET) {
+			int i, nfd, epfd = targ->fd;
+			int timeo = g->polltimeo;
+			int sd = dbip->sd;
+			struct epoll_event *evts = tp->evts;
+
+			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, timeo);
+			if (nfd < 0) {
+				perror("epoll_wait");
+				goto quit;
+			}
+			for (i = 0; i < nfd; i++) {
+				int fd = evts[i].data.fd;
+
+				if (fd == sd) {
+					if (do_accept(sd, epfd) < 0)
+						goto quit;
+				} else {
+					do_established(fd, msglen, targ);
+				}
+			}
 		}
 	}
 quit:
-	targ->used = 0;
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -552,17 +619,14 @@ int
 main(int argc, char **argv)
 {
 	int ch;
-	int epfd, sd;
+	int sd;
 	struct sockaddr_in sin;
 	const int on = 1;
 	int port = 0;
-	struct epoll_event ev;
-	struct epoll_event evts[MAXCONNECTIONS];
 	struct dbinfo dbi;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
-	int i, nfd = 0; /* XXX initialize only to avoid warning  */
 
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
@@ -571,7 +635,7 @@ main(int argc, char **argv)
 #ifdef WITH_STACKMAP
 	dbi.g.nmr_config = "";
 	dbi.g.nthreads = 1;
-	dbi.g.td_body = _worker;
+	dbi.g.td_privbody = _worker;
 	dbi.g.polltimeo = 2000;
 #endif
 
@@ -736,16 +800,11 @@ error:
 		}
 	}
 #endif /* WITH_SQLITE */
-	epfd = epoll_create1(EPOLL_CLOEXEC);
-	if (epfd == -1) {
-		perror("epoll_create1");
-		goto close;
-	}
 
 	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sd < 0) {
 		perror("socket");
-		goto close_ep;
+		goto close;
 	}
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
@@ -777,7 +836,9 @@ error:
 	if (dbi.ifname[0]) {
 		char *p = dbi.g.ifname;
 		struct nm_ifreq *ifreq = &dbi.ifreq;
+#ifdef WITH_EXTMEM
 		struct netmap_pools_info *pi;
+#endif /* WITH_EXTMEM */
 
 		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
 			D("too long name %s", dbi.ifname);
@@ -790,8 +851,6 @@ error:
 		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
 
 		dbi.g.dev_type = DEV_NETMAP;
-		dbi.g.td_type = TD_TYPE_OTHER;
-		dbi.g.td_private_len = sizeof(struct thpriv);
 #ifdef WITH_EXTMEM
 		dbi.extmem_fd = open(DEFAULT_EXT_MEM, O_RDWR|O_CREAT,
 					S_IRWXU);
@@ -801,73 +860,21 @@ error:
                 }
                 dbi.g.extmem = _do_mmap(dbi.extmem_fd, DEFAULT_EXT_MEM_SIZE);
                 if (dbi.g.extmem == NULL) {
+			D("mmap failed");
                         goto close_socket;
                 }
 		pi = (struct netmap_pools_info *)dbi.g.extmem;
 		pi->memsize = DEFAULT_EXT_MEM_SIZE;
 #endif
-		if (nm_start(&dbi.g) < 0)
-			goto close_socket;
-		ND("nm_open() %s done (offset %u ring_num %u)",
-		    nm_name, IPV4TCP_HDRLEN, dbi.g.nmd->nifp->ni_tx_rings);
-
-		free(targs);
-		if (sd > 0)
-			close(sd);
-		return 0;
-	} else
-#endif /* WITH_STACKMAP */
-	{
-	bzero(&ev, sizeof(ev));
-	ev.events = POLLIN;
-	ev.data.fd = sd;
-	epoll_ctl(epfd, EPOLL_CTL_ADD, sd, &ev);
+	} else {
+		dbi.g.dev_type = DEV_SOCKET;
 	}
-
-#if 0
-	stat_eps = stat_nfds = stat_maxnfds = 0;
-	stat_vnfds = 0;
-	stat_minnfds = ~0;
-#endif /* 0 */
-
-	while (!do_abort) {
-		/* fetch events */
-	       	{
-			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS,
-					dbi.g.polltimeo);
-#if 0
-		if (nfd > 0) {
-			stat_eps++;
-			stat_nfds += nfd;
-			stat_maxnfds = nfd > stat_maxnfds ? nfd : stat_maxnfds;
-			stat_minnfds = nfd < stat_minnfds ? nfd : stat_minnfds;
-			stat_vnfds += (uint64_t)nfd * nfd;
-		}
-		if (stat_eps > 20000 || stat_nfds > 200000) {
-			double mean = (double)stat_nfds / stat_eps;
-			double var = ((double)stat_vnfds / stat_eps) - (mean * mean);
-			fprintf(stderr, "epfds: av %lf max %u min %u var %f, eps %u\n",
-				       	mean, stat_maxnfds, stat_minnfds, var,
-				       	stat_eps);
-			stat_eps = stat_nfds = stat_maxnfds = 0;
-			stat_vnfds = 0;
-			stat_minnfds = ~0;
-		}
-#endif /* 0 */
-		}
-		/* process events */
-		for (i = 0; i < nfd; i++) {
-			if (evts[i].data.fd == sd) {
-				if (do_accept(sd, epfd) < 0)
-					goto close_socket;
-			} else
-				//do_established(evts[i].data.fd, dbi.msglen, &dbi);
-				do_established(evts[i].data.fd, dbi.msglen, NULL);
-		}
-
-	}
-
-#ifdef WITH_STACKMAP
+	dbi.g.td_type = TD_TYPE_OTHER;
+	dbi.g.td_private_len = sizeof(struct thpriv);
+	if (nm_start(&dbi.g) < 0)
+		goto close_socket;
+	ND("nm_open() %s done (offset %u ring_num %u)",
+	    nm_name, IPV4TCP_HDRLEN, dbi.g.nmd->nifp->ni_tx_rings);
 #endif /* WITH_STACKMAP */
 close_socket:
 #ifdef WITH_EXTMEM
@@ -875,15 +882,13 @@ close_socket:
 		if (dbi.g.extmem)
 			munmap(dbi.g.extmem, DEFAULT_EXT_MEM_SIZE);
 		close(dbi.extmem_fd);
+		//free(dbi.g.extmem);
 	}
 #endif /* WITH_EXTMEM */
 
-	close(sd);
-close_ep:
-	if (dbi.ifname[0])
-		close(epfd);
+	if (sd > 0)
+		close(sd);
 close:
 	close_db(&dbi);
 	return (0);
 }
-
