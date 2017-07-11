@@ -504,7 +504,7 @@ _worker(void *data)
 			/*
 			 * check the listen socket
 			 */
-			if ((pfd[1].revents & POLLIN) && (targ->me == 0)) {
+			if (pfd[1].revents & POLLIN) {
 				struct sockaddr_storage tmp;
 				struct nm_ifreq *ifreq = &tp->ifreq;
 				int newfd;

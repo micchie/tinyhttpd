@@ -250,7 +250,8 @@ nm_thread(void *data)
 	struct nm_targ *targ = (struct nm_targ *) data;
 	struct nm_garg *g = targ->g;
 
-	D("start, fd %d main_fd %d affinity %d", targ->fd, targ->g->main_fd, targ->affinity);
+	D("start, fd %d main_fd %d affinity %d",
+			targ->fd, targ->g->main_fd, targ->affinity);
 	if (setaffinity(targ->thread, targ->affinity))
 		goto quit;
 	g->td_privbody(data);
