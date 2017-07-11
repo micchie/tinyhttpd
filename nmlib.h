@@ -250,7 +250,7 @@ nm_thread(void *data)
 	struct nm_targ *targ = (struct nm_targ *) data;
 	struct nm_garg *g = targ->g;
 
-	D("start, fd %d main_fd %d", targ->fd, targ->g->main_fd);
+	D("start, fd %d main_fd %d affinity %d", targ->fd, targ->g->main_fd, targ->affinity);
 	if (setaffinity(targ->thread, targ->affinity))
 		goto quit;
 	g->td_privbody(data);
@@ -538,6 +538,9 @@ nm_start(struct nm_garg *g)
 
 	/* XXX remove unnecessary suffix */
 	if ((p = index(g->ifname, ','))) {
+		*p = '\0';
+	}
+	if ((p = index(g->ifname, '+'))) {
 		*p = '\0';
 	}
 

@@ -504,7 +504,7 @@ _worker(void *data)
 			/*
 			 * check the listen socket
 			 */
-			if (pfd[1].revents & POLLIN) {
+			if ((pfd[1].revents & POLLIN) && (targ->me == 0)) {
 				struct sockaddr_storage tmp;
 				struct nm_ifreq *ifreq = &tp->ifreq;
 				int newfd;
@@ -639,13 +639,13 @@ main(int argc, char **argv)
 	dbi.g.polltimeo = 2000;
 #endif
 
-	while ((ch = getopt(argc, argv, "p:l:b:md:DNi:PBcC:a:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:x:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
 			usage();
 			break;
-		case 'p':	/* server port */
+		case 'P':	/* server port */
 			port = atoi(optarg);
 			break;
 		case 'l': /* HTTP OK content length */
@@ -683,7 +683,7 @@ main(int argc, char **argv)
 		case 'i':
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
 			break;
-		case 'P': /* PASTE */
+		case 'x': /* PASTE */
 			dbi.flags |= DBI_FLAGS_PASTE;
 			break;
 		case 'c':
@@ -692,7 +692,7 @@ main(int argc, char **argv)
 		case 'a':
 			dbi.g.affinity = atoi(optarg);
 			break;
-		case 't':
+		case 'p':
 			dbi.g.nthreads = atoi(optarg);
 			break;
 #ifdef WITH_STACKMAP
@@ -703,10 +703,11 @@ main(int argc, char **argv)
 		}
 
 	}
-	if (dbi.httplen) {
+
+	if (dbi.httplen) { // preallocate HTTP header
 		dbi.http = calloc(1, MAX_HTTPLEN);
 		if (!dbi.http) {
-			perror("malloc");
+			perror("calloc");
 			usage();
 		}
 		dbi.httplen = generate_httphdr(dbi.msglen, dbi.http, NULL);
