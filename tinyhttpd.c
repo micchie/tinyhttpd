@@ -639,7 +639,7 @@ main(int argc, char **argv)
 	dbi.g.polltimeo = 2000;
 #endif
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:x:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:x")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -729,6 +729,11 @@ main(int argc, char **argv)
 			usage();
 		}
 	}
+	if ((dbi.flags & DBI_FLAGS_PASTE) && !dbi.mmap) {
+		D("PASTE must be used with mmap");
+		usage();
+	}
+
 	if (dbi.type == DT_DUMB) {
 		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
 		if (dbi.dumbfd < 0) {
@@ -742,7 +747,7 @@ main(int argc, char **argv)
 				goto close;
 #ifdef WITH_STACKMAP
 			if (dbi.flags & DBI_FLAGS_PASTE) {
-				/* write WAL header */
+				/* initialize WAL header */
 				struct paste_hdr *ph;
 
 				ph = (struct paste_hdr *)dbi.paddr;
@@ -833,6 +838,7 @@ error:
 		goto close_socket;
 	}
 	dbi.sd = sd;
+
 #ifdef WITH_STACKMAP
 	if (dbi.ifname[0]) {
 		char *p = dbi.g.ifname;
@@ -877,6 +883,7 @@ error:
 	ND("nm_open() %s done (offset %u ring_num %u)",
 	    nm_name, IPV4TCP_HDRLEN, dbi.g.nmd->nifp->ni_tx_rings);
 #endif /* WITH_STACKMAP */
+
 close_socket:
 #ifdef WITH_EXTMEM
 	if (dbi.g.extmem) {
