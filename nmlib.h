@@ -537,14 +537,6 @@ nm_start(struct nm_garg *g)
 		goto out;
 	}
 
-	/* XXX remove unnecessary suffix */
-	if ((p = index(g->ifname, ','))) {
-		*p = '\0';
-	}
-	if ((p = index(g->ifname, '+'))) {
-		*p = '\0';
-	}
-
 	if (g->nthreads > 1) {
 		struct nm_desc saved_desc = *g->nmd;
 		saved_desc.self = &saved_desc;
@@ -560,6 +552,15 @@ nm_start(struct nm_garg *g)
 			goto out;
 		}
 	}
+
+	/* XXX remove unnecessary suffix */
+	if ((p = index(g->ifname, ','))) {
+		*p = '\0';
+	}
+	if ((p = index(g->ifname, '+'))) {
+		*p = '\0';
+	}
+
 	g->main_fd = g->nmd->fd;
 	D("mapped %dKB at %p", g->nmd->req.nr_memsize>>10, g->nmd->mem);
 

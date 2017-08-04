@@ -41,12 +41,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stddef.h>	// typeof
-
+#include <x86intrin.h>
 #include <time.h>
 
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <time.h>	// clock_gettime()
 #include <netinet/tcp.h>
 #ifdef WITH_SQLITE
 #include <sqlite3.h>
@@ -92,6 +93,7 @@ struct dbinfo {
 	int mmap;
 	char *paddr;
 	int cur;
+	int fdel;
 	union {
 		int maplen;
 		int maxlen;
@@ -133,6 +135,31 @@ clflush(volatile void *p)
 	//nanosleep(&ts, NULL);
 	asm volatile ("clflush (%0)" :: "r"(p));
 }
+
+/* need ctrs.h */
+static inline void
+clflushx(volatile void *p, long ns)
+{
+	if (unlikely(ns > 10000 || ns < 100)) {
+		RD(1, "ns %ld may not be apprepriate", ns);
+	}
+	if (ns) {
+		struct timespec cur, w;
+
+		clock_gettime(CLOCK_REALTIME, &cur);
+		for (;;) {
+			clock_gettime(CLOCK_REALTIME, &w);
+			w = timespec_sub(w, cur);
+			if (unlikely(w.tv_sec < 0)) // maybe too short interval
+				continue;
+			else if (w.tv_nsec >= ns || w.tv_sec > 0)
+				break;
+		}
+	}
+	clflush(p);
+	return;
+}
+
 static __inline void
 mfence(void)
 {
@@ -345,11 +372,11 @@ direct:
 					tp->cur;
 				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
 					*(uint64_t *)p = tp->pst_ent;
-					clflush(p);
+					clflushx(p, dbi->fdel);
 				}
 				/* also flush data buffer */
 				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
-					clflush(rxbuf + i);
+					clflushx(rxbuf + i, dbi->fdel);
 				}
 				mfence();
 				tp->cur += sizeof(tp->pst_ent);
@@ -387,7 +414,7 @@ direct:
 				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
 					int j;
 				    	for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-					clflush(p + j);
+					clflushx(p + j, dbi->fdel);
 				    	}
 					mfence();
 					//if (msync(p, len, MS_SYNC))
@@ -500,7 +527,6 @@ _worker(void *data)
 				perror("poll");
 				goto quit;
 			}
-
 			/*
 			 * check the listen socket
 			 */
@@ -530,8 +556,9 @@ accepted:
 			/*
 			 * check accepted sockets
 			 */
-			if (!(pfd[0].revents & POLLIN))
+			if (!(pfd[0].revents & POLLIN)) {
 				continue;
+			}
 
 			for (i = first_rx_ring; i <= last_rx_ring; i++) {
 				struct netmap_ring *rxr, *txr;
@@ -632,6 +659,7 @@ main(int argc, char **argv)
 	dbi.type = DT_NONE;
 	dbi.maxlen = MAXDUMBSIZE;
 	dbi.msglen = 0;
+	dbi.fdel = 0;
 #ifdef WITH_STACKMAP
 	dbi.g.nmr_config = "";
 	dbi.g.nthreads = 1;
@@ -639,7 +667,9 @@ main(int argc, char **argv)
 	dbi.g.polltimeo = 2000;
 #endif
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:x")) != -1) {
+	signal(SIGPIPE, SIG_IGN); // XXX
+
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:xF:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -700,6 +730,9 @@ main(int argc, char **argv)
 			dbi.g.nmr_config = strdup(optarg);
 			break;
 #endif
+		case 'F':
+			dbi.fdel = atoi(optarg);
+			break;
 		}
 
 	}
