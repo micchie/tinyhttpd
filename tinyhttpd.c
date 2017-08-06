@@ -259,31 +259,94 @@ print_resp(void *get_prm, int n, char **txts, char **col)
 	return 0;
 }
 
+#define MAX_PAYLOAD	1400
+#define min(a, b) (((a) < (b)) ? (a) : (b)) 
+/* fill rubbish if data is NULL */
+static int
+copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
+		int len, int off0, int off, int fd)
+{
+	int space = nm_ring_space(ring);
+	int copied = 0;
+	u_int const tail = ring->tail;
+	u_int cur = ring->cur;
+
+	if (unlikely(space * MAX_PAYLOAD > len))
+		return -1;
+
+	/* XXX adjust to real offset */
+	off0 += virt_header;
+	off += virt_header;
+
+	for (; likely(cur != tail); cur = nm_ring_next(ring, cur)) {
+		struct netmap_slot *slot = &ring->slot[cur];
+		char *p = NETMAP_BUF(ring, slot->buf_idx) + off0;
+		int l = min(MAX_PAYLOAD, len - copied);
+
+		if (data)
+			nm_pkt_copy(data + copied, p, l);
+		else
+			memset(p, 'A', l);
+		slot->len = off0 + l;
+		slot->offset = off0 - virt_header; // XXX change API...
+		slot->fd = fd;
+		copied += l;
+		if (copied >= len)
+			break;
+		off0 = off;
+	}
+	ring->cur = ring->head = cur;
+	return copied;
+}
+
 ssize_t
-generate_httphdr(ssize_t content_length, char *buf, char *content)
+generate_httphdr(ssize_t content_length, char *buf)
 {
 	char *p = buf;
 	/* From nginx */
 	static char *lines[5] = {"HTTP/1.1 200 OK\r\n",
 	 "Content-Length: ",
 	 "Connection: keep-alive\r\n\r\n"};
-	ssize_t l;
+	ssize_t l, l0, l1, l2;
 
-	memcpy(p, lines[0], strlen(lines[0]));
-	p += strlen(lines[0]);
-	memcpy(p, lines[1], strlen(lines[1]));
-	p += strlen(lines[1]);
+	l0 = strlen(lines[0]);
+	p = mempcpy(p, lines[0], l0);
+	l1 = strlen(lines[1]);
+	p = mempcpy(p, lines[1], l1);
 	l = sprintf(p, "%lu\r\n", content_length);
 	p += l;
-	memcpy(p, lines[2], strlen(lines[2]));
-	p += strlen(lines[2]);
-
-	if (content == NULL)
-		memset(p, 'A', content_length);
-	else
-		memcpy(p, content, content_length);
-	p += content_length;
+	l2 = strlen(lines[2]);
+	p = mempcpy(p, lines[2], l2);
+	p += l2;
 	return p - buf;
+}
+
+int
+generate_http(int content_length, char *buf, char *content)
+{
+	int hlen;
+
+	hlen = generate_httphdr(content_length, buf);
+	if (content == NULL)
+		memset(buf, 'A', content_length);
+	else
+		memcpy(buf, content, content_length);
+	return hlen + content_length;
+
+}
+
+int
+generate_http_nm(int content_length, struct netmap_ring *ring, int virt_header,
+		int off, int fd, char *content)
+{
+	int hlen, len, cur = ring->cur;
+	struct netmap_slot *slot = &ring->slot[cur];
+	char *p = NETMAP_BUF(ring, slot->buf_idx) + virt_header + off;
+
+	hlen = generate_httphdr(content_length, p);
+	len = copy_to_nm(ring, virt_header, content, content_length,
+			off + hlen, off, fd);
+	return len < content_length ? -1 : hlen + len;
 }
 
 static void
@@ -311,6 +374,88 @@ int do_accept(int fd, int epfd)
 		ev.events = POLLIN;
 		ev.data.fd = newfd;
 		epoll_ctl(epfd, EPOLL_CTL_ADD, newfd, &ev);
+	}
+	return 0;
+}
+
+/* We assume GET/POST appears in the beginning of netmap buffer */
+int
+process_nm_ring(struct nm_targ *targ, int ring_nr)
+{
+	struct nm_garg *g = targ->g;
+	struct dbinfo *dbi = container_of(g, struct dbinfo, g);
+	ssize_t msglen = dbi->msglen;
+
+	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
+	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
+	u_int const rxtail = rxr->tail;
+	u_int rxcur = rxr->cur;
+
+	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
+		struct netmap_slot *rxs = &rxr->slot[rxcur];
+		char *rxbuf;
+		int o = IPV4TCP_HDRLEN;
+
+		rxbuf = ((char *)NETMAP_BUF(rxr, rxs->buf_idx))
+			+ g->virt_header + rxs->offset;
+
+		D("get something %c%c%c%c (len %d off %d fd %d)", rxbuf[0], rxbuf[1], rxbuf[2], rxbuf[3], rxs->len, rxs->offset, rxs->fd);
+		if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
+			if (dbi->httplen) { // use cache
+				char *http = dbi->http;
+				int len = dbi->httplen;
+
+				if (copy_to_nm(txr, g->virt_header, http, len,
+						o, o, rxs->fd) < len)
+					continue;
+			} else {
+				D("get GET");
+				if (generate_http_nm(msglen, txr,
+				    g->virt_header, o, rxs->fd, NULL) < 0)
+					continue;
+			}
+		}
+#if 0
+		} else if (!strncmp(rxbuf, "POST ", strlen("POST "))) {
+			if (dbi->type == DT_DUMB) {
+				if (dbi->flags & DBI_FLAGS_PASTE) {
+					char *p;
+					int i;
+					int plen = sizeof(tp->pst_ent);
+					int phdrlen = sizeof(struct paste_hdr);
+
+					if (tp->cur + plen >
+					    dbi->maplen - phdrlen)
+						tp->cur = 0;
+
+					p = dbi->paddr + phdrlen + tp->cur;
+					if (!(dbi->flags & DBI_FLAGS_BATCH)) {
+						*(uint64_t *)p = tp->pst_ent;
+						clflushx(p, dbi->fdel);
+					}
+					/* also flush data buffer */
+					for (i = 0; i < len;
+					    i += CACHE_LINE_SIZE) {
+						clflushx(rxbuf + i, dbi->fdel);
+					}
+					mfence();
+					tp->cur += plen;
+				} else if (dbi->mmap) {
+					int d;
+					char *p;
+
+					d = (len & (dbi->mmap - 1));
+					if (d)
+						len += dbi->mmap - d;
+					if (dbi->cur + len > dbi->maplen)
+						dbi->cur = 0;
+					p = dbi->paddr + dbi->cur;
+					memcpy(p, rxbuf, len);
+
+				}
+			}
+		}
+#endif
 	}
 	return 0;
 }
@@ -351,7 +496,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 
 	if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
 		if (!dbi->httplen) {
-			len = generate_httphdr(msglen, txbuf, NULL);
+			len = generate_http(msglen, txbuf, NULL);
 		} else {
 			len = dbi->httplen;
 			memcpy(txbuf, dbi->http, len);
@@ -457,7 +602,7 @@ direct:
 		}
 #endif /* SQLITE */
 gen_httpok:
-		len = generate_httphdr(msglen, txbuf, NULL);
+		len = generate_http(msglen, txbuf, NULL);
 	} else {
 		len = 0;
 	}
@@ -512,7 +657,6 @@ _worker(void *data)
 
 	while (!targ->cancel) {
 		if (g->dev_type == DEV_NETMAP) {
-			struct netmap_if *nifp = targ->nmd->nifp;
 			u_int first_rx_ring = targ->nmd->first_rx_ring;
 			u_int last_rx_ring = targ->nmd->last_rx_ring;
 			int i;
@@ -561,6 +705,9 @@ accepted:
 			}
 
 			for (i = first_rx_ring; i <= last_rx_ring; i++) {
+
+				process_nm_ring(targ, i);
+#if 0
 				struct netmap_ring *rxr, *txr;
 				struct netmap_slot *rxs;
 				u_int txcur, txlim, rxcur, rx;
@@ -611,6 +758,7 @@ accepted:
 				}
 				txr->head = txr->cur = txcur;
 				rxr->head = rxr->cur = rxcur;
+#endif /* 0 */
 
 				/* No batch support yet */
 			}
@@ -743,7 +891,7 @@ main(int argc, char **argv)
 			perror("calloc");
 			usage();
 		}
-		dbi.httplen = generate_httphdr(dbi.msglen, dbi.http, NULL);
+		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
 	}
 
 	fprintf(stderr, "%s built %s %s db: %s\n",
