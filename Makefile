@@ -7,8 +7,8 @@ CFLAGS += $(EXTRA_CFLAGS)
 PROG = tinyhttpd-s
 OBJS = tinyhttpd-s.o
 #OPT = -DWITH_SQLITE
-#SOPT = -DWITH_STACKMAP -DWITH_EXTMEM
-SOPT = -DWITH_STACKMAP
+SOPT = -DWITH_STACKMAP -DWITH_EXTMEM
+#SOPT = -DWITH_STACKMAP
 SPATH ?= -I../netmap/sys/ -I../netmap/apps/include -DNETMAP_WITH_LIBS
 
 all: $(PROG)

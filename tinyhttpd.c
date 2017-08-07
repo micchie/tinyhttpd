@@ -71,6 +71,9 @@
 #define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
 #endif /* WITH_STACKMAP */
 
+#define MAX_PAYLOAD	1400
+#define min(a, b) (((a) < (b)) ? (a) : (b)) 
+
 #ifndef D
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
@@ -128,6 +131,14 @@ struct thpriv {
 	struct epoll_event evts[MAXCONNECTIONS];
 };
 
+/* overflow some */
+static inline void
+set_rubbish(char *buf, int len)
+{
+	static char *r = "A sample content of the tiny HTTP server. Nothing is meaningful"; // 64 characters
+	memcpy(buf, r, min(len, 64));
+}
+
 //static struct timespec ts = {0, 0};
 static inline void
 clflush(volatile void *p)
@@ -140,12 +151,12 @@ clflush(volatile void *p)
 static inline void
 clflushx(volatile void *p, long ns)
 {
-	if (unlikely(ns > 10000 || ns < 100)) {
-		RD(1, "ns %ld may not be apprepriate", ns);
-	}
 	if (ns) {
 		struct timespec cur, w;
 
+		if (unlikely(ns > 10000 || ns < 100)) {
+			RD(1, "ns %ld may not be apprepriate", ns);
+		}
 		clock_gettime(CLOCK_REALTIME, &cur);
 		for (;;) {
 			clock_gettime(CLOCK_REALTIME, &w);
@@ -259,26 +270,26 @@ print_resp(void *get_prm, int n, char **txts, char **col)
 	return 0;
 }
 
-#define MAX_PAYLOAD	1400
-#define min(a, b) (((a) < (b)) ? (a) : (b)) 
 /* fill rubbish if data is NULL */
 static int
 copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		int len, int off0, int off, int fd)
 {
-	int space = nm_ring_space(ring);
-	int copied = 0;
 	u_int const tail = ring->tail;
 	u_int cur = ring->cur;
+	u_int copied = 0;
+	int space = nm_ring_space(ring);
 
-	if (unlikely(space * MAX_PAYLOAD > len))
+	if (unlikely(space * MAX_PAYLOAD < len)) {
+		RD(1, "no space (%d slots)", space);
 		return -1;
+	}
 
 	/* XXX adjust to real offset */
 	off0 += virt_header;
 	off += virt_header;
 
-	for (; likely(cur != tail); cur = nm_ring_next(ring, cur)) {
+	while (likely(cur != tail) && copied < len) {
 		struct netmap_slot *slot = &ring->slot[cur];
 		char *p = NETMAP_BUF(ring, slot->buf_idx) + off0;
 		int l = min(MAX_PAYLOAD, len - copied);
@@ -286,17 +297,16 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		if (data)
 			nm_pkt_copy(data + copied, p, l);
 		else
-			memset(p, 'A', l);
+			set_rubbish(p, l);
 		slot->len = off0 + l;
-		slot->offset = off0 - virt_header; // XXX change API...
+		slot->offset = off - virt_header; // XXX change API...
 		slot->fd = fd;
 		copied += l;
-		if (copied >= len)
-			break;
 		off0 = off;
+		cur = nm_ring_next(ring, cur);
 	}
 	ring->cur = ring->head = cur;
-	return copied;
+	return len;
 }
 
 ssize_t
@@ -317,7 +327,6 @@ generate_httphdr(ssize_t content_length, char *buf)
 	p += l;
 	l2 = strlen(lines[2]);
 	p = mempcpy(p, lines[2], l2);
-	p += l2;
 	return p - buf;
 }
 
@@ -328,9 +337,9 @@ generate_http(int content_length, char *buf, char *content)
 
 	hlen = generate_httphdr(content_length, buf);
 	if (content == NULL)
-		memset(buf, 'A', content_length);
+		set_rubbish(buf + hlen, content_length);
 	else
-		memcpy(buf, content, content_length);
+		memcpy(buf + hlen, content, content_length);
 	return hlen + content_length;
 
 }
@@ -347,6 +356,26 @@ generate_http_nm(int content_length, struct netmap_ring *ring, int virt_header,
 	len = copy_to_nm(ring, virt_header, content, content_length,
 			off + hlen, off, fd);
 	return len < content_length ? -1 : hlen + len;
+}
+
+static int
+parse_post(char *post, int *coff)
+{
+	int clen;
+	char *pp, *p = strstr(post, "Content-Length: ");
+	
+	if (unlikely(!p))
+		return -1;
+	pp = p + 16; // "Content-Length: "
+	clen = atoi(pp);
+	if (unlikely(!clen))
+		return -1;
+	pp = strstr(pp, "\r\n\r\n");
+	if (unlikely(!pp))
+		return -1;
+	pp += 4;
+	*coff = pp - post;
+	return clen;
 }
 
 static void
@@ -384,6 +413,7 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 {
 	struct nm_garg *g = targ->g;
 	struct dbinfo *dbi = container_of(g, struct dbinfo, g);
+	struct thpriv *tp = targ->td_private;
 	ssize_t msglen = dbi->msglen;
 
 	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
@@ -395,28 +425,16 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		char *rxbuf;
 		int o = IPV4TCP_HDRLEN;
+		int len = rxs->len;
 
-		rxbuf = ((char *)NETMAP_BUF(rxr, rxs->buf_idx))
+		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx)
 			+ g->virt_header + rxs->offset;
 
-		D("get something %c%c%c%c (len %d off %d fd %d)", rxbuf[0], rxbuf[1], rxbuf[2], rxbuf[3], rxs->len, rxs->offset, rxs->fd);
-		if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
-			if (dbi->httplen) { // use cache
-				char *http = dbi->http;
-				int len = dbi->httplen;
+		if (!strncmp(rxbuf, "POST ", strlen("POST "))) {
+			int coff, clen = parse_post(rxbuf, &coff);
 
-				if (copy_to_nm(txr, g->virt_header, http, len,
-						o, o, rxs->fd) < len)
-					continue;
-			} else {
-				D("get GET");
-				if (generate_http_nm(msglen, txr,
-				    g->virt_header, o, rxs->fd, NULL) < 0)
-					continue;
-			}
-		}
-#if 0
-		} else if (!strncmp(rxbuf, "POST ", strlen("POST "))) {
+			if (clen < 0)
+				continue;
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					char *p;
@@ -428,35 +446,63 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					    dbi->maplen - phdrlen)
 						tp->cur = 0;
 
+					/* log position */
 					p = dbi->paddr + phdrlen + tp->cur;
-					if (!(dbi->flags & DBI_FLAGS_BATCH)) {
-						*(uint64_t *)p = tp->pst_ent;
-						clflushx(p, dbi->fdel);
-					}
-					/* also flush data buffer */
+
+					/* begin tx */
+					*(uint64_t *)p = tp->pst_ent;
+					clflushx(p, dbi->fdel);
+
+					/* flush data buffer */
 					for (i = 0; i < len;
 					    i += CACHE_LINE_SIZE) {
 						clflushx(rxbuf + i, dbi->fdel);
 					}
+
+					/* end tx */
+					*(uint64_t *)p = tp->pst_ent;
+					clflushx(p, dbi->fdel);
 					mfence();
+
 					tp->cur += plen;
 				} else if (dbi->mmap) {
-					int d;
+					int d, j = 0;
 					char *p;
 
 					d = (len & (dbi->mmap - 1));
 					if (d)
 						len += dbi->mmap - d;
-					if (dbi->cur + len > dbi->maplen)
-						dbi->cur = 0;
+					if (tp->cur + len > dbi->maplen)
+						tp->cur = 0;
 					p = dbi->paddr + dbi->cur;
 					memcpy(p, rxbuf, len);
 
+					for (; j < len; j += CACHE_LINE_SIZE) {
+						clflushx(p + j, dbi->fdel);
+					}
+					mfence();
+					tp->cur += len;
 				}
 			}
+			goto get;
+		} else if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
+get:
+			if (dbi->httplen) { // use cache
+				char *http = dbi->http;
+				int len = dbi->httplen;
+
+				if (copy_to_nm(txr, g->virt_header, http, len,
+						o, o, rxs->fd) < len) {
+					continue;
+				}
+			} else {
+				if (generate_http_nm(msglen, txr,
+				    g->virt_header, o, rxs->fd, NULL) < 0)
+					continue;
+			}
 		}
-#endif
 	}
+	rxr->head = rxr->cur = rxcur;
 	return 0;
 }
 
@@ -892,6 +938,7 @@ main(int argc, char **argv)
 			usage();
 		}
 		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
+		D("generated http %d", dbi.httplen);
 	}
 
 	fprintf(stderr, "%s built %s %s db: %s\n",
