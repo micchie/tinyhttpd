@@ -105,7 +105,6 @@ struct dbinfo {
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READPMEM	0x2
 #define DBI_FLAGS_PASTE		0x4
-#define DBI_FLAGS_BATCH		0x8
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
@@ -490,11 +489,6 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					/* log position */
 					p = dbi->paddr + phdrlen + tp->cur;
 
-					/* begin tx */
-					*(uint64_t *)p = tp->pst_ent;
-					_mm_clflushopt(p);
-					mfence(dbi->fdel);
-
 					/* flush data buffer */
 					for (i = 0; i < len;
 					    i += CACHE_LINE_SIZE) {
@@ -502,7 +496,7 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					}
 					mfence(dbi->fdel);
 
-					/* end tx */
+					/* flush log */
 					*(uint64_t *)p = tp->pst_ent;
 					_mm_clflushopt(p);
 					mfence(dbi->fdel);
@@ -513,11 +507,10 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					rxs->flags |= NS_BUF_CHANGED;
 					tp->extra[tp->extra_cur] = i;
 					tp->extra_cur++;
-					if (tp->extra_cur == tp->extra_num) {
-						D("overwriting log");
+					if (unlikely(tp->extra_cur ==
+					    tp->extra_num)) {
 						tp->extra_cur = 0;
 					}
-
 					tp->cur += plen;
 				} else if (dbi->mmap) {
 					int d, j = 0;
@@ -615,11 +608,9 @@ direct:
 
 				p = dbi->paddr + sizeof(struct paste_hdr) + 
 					tp->cur;
-				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
-					*(uint64_t *)p = tp->pst_ent;
-					_mm_clflushopt(p);
-					mfence(dbi->fdel);
-				}
+				*(uint64_t *)p = tp->pst_ent;
+				_mm_clflushopt(p);
+				mfence(dbi->fdel);
 				/* also flush data buffer */
 				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
 					_mm_clflushopt(rxbuf + i);
@@ -629,7 +620,7 @@ direct:
 			} else
 #endif /* WITH_STACKMAP */
 			if (dbi->mmap) {
-				int d;
+				int d, j;
 				char *p;
 
 				d = (len & (dbi->mmap-1));
@@ -655,17 +646,13 @@ direct:
 					         strlen("POST ")))
 						return -1; /* next pos stays */
 
-				} else
+				} else {
 					memcpy(p, rxbuf, len);
-				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
-					int j;
-				    	for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-						_mm_clflushopt(p + j);
-				    	}
-					mfence(dbi->fdel);
-					//if (msync(p, len, MS_SYNC))
-					//	perror("msync");
 				}
+				for (j=0;j<len;j+=CACHE_LINE_SIZE) {
+					_mm_clflushopt(p + j);
+				}
+				mfence(dbi->fdel);
 				dbi->cur += len;
 			} else {
 				len = write(dbi->dumbfd, rxbuf, len);
@@ -732,10 +719,10 @@ _worker(void *data)
 	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
 	int msglen = dbip->msglen;
 	struct thpriv *tp = targ->td_private;
-	struct netmap_if *nifp = targ->nmd->nifp;
 
 	/* import extra buffers */
-	if (nifp->ni_bufs_head) {
+	if (g->dev_type == DEV_NETMAP) {
+		struct netmap_if *nifp = targ->nmd->nifp;
 		struct netmap_ring *any_ring = NETMAP_RXRING(nifp, 0);
 		uint32_t i, next = nifp->ni_bufs_head;
 
@@ -743,11 +730,11 @@ _worker(void *data)
 			tp->extra[i] = next;
 			next = *(uint32_t *)NETMAP_BUF(any_ring, next);
 		}
-		D("imported %d extra buffers", i);
 		tp->extra_num = i;
+		D("imported %d extra buffers", i);
+
+		tp->ifreq = dbip->ifreq;
 	}
-	/* bring some information down to this thread */
-	tp->ifreq = dbip->ifreq;
 
 	if (g->dev_type == DEV_SOCKET) {
 		struct epoll_event ev;
@@ -932,7 +919,7 @@ main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PBcC:a:p:xF:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:xF:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -969,9 +956,6 @@ main(int argc, char **argv)
 			break;
 		case 'N':
 			dbi.flags |= DBI_FLAGS_READPMEM;
-			break;
-		case 'B':
-			dbi.flags |= DBI_FLAGS_BATCH;
 			break;
 		case 'i':
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
