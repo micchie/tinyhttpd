@@ -130,6 +130,9 @@ struct thpriv {
 	uint16_t rxlen;
 	struct nm_ifreq ifreq;
 	struct epoll_event evts[MAXCONNECTIONS];
+	uint32_t extra[EXTRA_BUF_NUM];
+	uint32_t extra_cur;
+	uint32_t extra_num;
 };
 
 /* overflow some */
@@ -177,11 +180,12 @@ clflushx(volatile void *p, long ns)
 /* taken from NOVA */
 #define _mm_clflush(addr)\
 		asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
-/*
+#ifndef NO_CLFLUSHOPT
 #define _mm_clflushopt(addr)\
 	asm volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr)))
-	*/
+#else
 #define _mm_clflushopt _mm_clflush
+#endif
 	
 #define _mm_clwb(addr)\
 		asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))
@@ -475,7 +479,7 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					char *p;
-					int i;
+					u_int i;
 					int plen = sizeof(tp->pst_ent);
 					int phdrlen = sizeof(struct paste_hdr);
 
@@ -502,6 +506,17 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					*(uint64_t *)p = tp->pst_ent;
 					_mm_clflushopt(p);
 					mfence(dbi->fdel);
+
+					/* swap out buffer */
+					i = rxs->buf_idx;
+					rxs->buf_idx = tp->extra[tp->extra_cur];
+					rxs->flags |= NS_BUF_CHANGED;
+					tp->extra[tp->extra_cur] = i;
+					tp->extra_cur++;
+					if (tp->extra_cur == tp->extra_num) {
+						D("overwriting log");
+						tp->extra_cur = 0;
+					}
 
 					tp->cur += plen;
 				} else if (dbi->mmap) {
@@ -717,7 +732,20 @@ _worker(void *data)
 	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
 	int msglen = dbip->msglen;
 	struct thpriv *tp = targ->td_private;
+	struct netmap_if *nifp = targ->nmd->nifp;
 
+	/* import extra buffers */
+	if (nifp->ni_bufs_head) {
+		struct netmap_ring *any_ring = NETMAP_RXRING(nifp, 0);
+		uint32_t i, next = nifp->ni_bufs_head;
+
+		for (i = 0; i < EXTRA_BUF_NUM && next; i++) {
+			tp->extra[i] = next;
+			next = *(uint32_t *)NETMAP_BUF(any_ring, next);
+		}
+		D("imported %d extra buffers", i);
+		tp->extra_num = i;
+	}
 	/* bring some information down to this thread */
 	tp->ifreq = dbip->ifreq;
 
