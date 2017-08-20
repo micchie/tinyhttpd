@@ -4,6 +4,10 @@
 #include<net/netmap_user.h>
 #include<ctrs.h>
 
+#define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
+//#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
+#define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
+
 #ifndef D
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
@@ -17,7 +21,7 @@
 #define MAP_HUGETLB	0x40000
 
 enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
-enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER };
+enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER, TD_TYPE_DUMMY };
 
 #define cpuset_t        cpu_set_t
 /* set the thread affinity. */
@@ -519,6 +523,8 @@ nm_start(struct nm_garg *g)
 #ifdef WITH_EXTMEM
 	if (g->extmem) {
 		base_nmd.nr_cmd = NETMAP_POOLS_CREATE;
+		if (g->extra_bufs)
+			base_nmd.nr_arg4 = base_nmd.nr_arg3;
                 memcpy((void *)&base_nmd.nr_arg1, &g->extmem, sizeof(void *));
 	}
 #endif /* WITH_EXTMEM */
@@ -618,6 +624,10 @@ out:
 	if (g->dev_type == DEV_NETMAP && g->main_fd < 0) {
 		D("aborting");
 		return -1;
+	} else if (g->td_type == TD_TYPE_DUMMY) {
+		D("this is dummy, %s and returning",
+				g->main_fd < 0 ? "failed" : "success");
+		return 0;
 	}
 
 	/* Install ^C handler. */

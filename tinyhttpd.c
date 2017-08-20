@@ -67,6 +67,7 @@
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
 #define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
+#define EXTRA_BUF_NUM	1000
 //#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
 #define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
 #endif /* WITH_STACKMAP */
@@ -140,6 +141,7 @@ set_rubbish(char *buf, int len)
 }
 
 //static struct timespec ts = {0, 0};
+#if 0
 static inline void
 clflush(volatile void *p)
 {
@@ -170,11 +172,46 @@ clflushx(volatile void *p, long ns)
 	clflush(p);
 	return;
 }
+#endif /* 0 */
+
+/* taken from NOVA */
+#define _mm_clflush(addr)\
+		asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
+/*
+#define _mm_clflushopt(addr)\
+	asm volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr)))
+	*/
+#define _mm_clflushopt _mm_clflush
+	
+#define _mm_clwb(addr)\
+		asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))
+
+static inline void
+wait_ns(long ns)
+{
+	struct timespec cur, w;
+
+	if (unlikely(ns > 10000 || ns < 100)) {
+		RD(1, "ns %ld may not be apprepriate", ns);
+	}
+	clock_gettime(CLOCK_REALTIME, &cur);
+	for (;;) {
+		clock_gettime(CLOCK_REALTIME, &w);
+		w = timespec_sub(w, cur);
+		if (unlikely(w.tv_sec < 0)) // maybe too short interval
+			continue;
+		else if (w.tv_nsec >= ns || w.tv_sec > 0)
+			break;
+	}
+}
 
 static __inline void
-mfence(void)
+mfence(long delay)
 {
-	__asm __volatile("mfence" : : : "memory");
+	if (delay > 0)
+		wait_ns(delay);
+	//__asm __volatile("mfence" : : : "memory");
+	_mm_mfence();
 }
 
 #define CACHE_LINE_SIZE	64 /* XXX */
@@ -451,18 +488,20 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 
 					/* begin tx */
 					*(uint64_t *)p = tp->pst_ent;
-					clflushx(p, dbi->fdel);
+					_mm_clflushopt(p);
+					mfence(dbi->fdel);
 
 					/* flush data buffer */
 					for (i = 0; i < len;
 					    i += CACHE_LINE_SIZE) {
-						clflushx(rxbuf + i, dbi->fdel);
+						_mm_clflushopt(rxbuf + i);
 					}
+					mfence(dbi->fdel);
 
 					/* end tx */
 					*(uint64_t *)p = tp->pst_ent;
-					clflushx(p, dbi->fdel);
-					mfence();
+					_mm_clflushopt(p);
+					mfence(dbi->fdel);
 
 					tp->cur += plen;
 				} else if (dbi->mmap) {
@@ -478,9 +517,9 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					memcpy(p, rxbuf, len);
 
 					for (; j < len; j += CACHE_LINE_SIZE) {
-						clflushx(p + j, dbi->fdel);
+						_mm_clflushopt(p + j);
 					}
-					mfence();
+					mfence(dbi->fdel);
 					tp->cur += len;
 				}
 			}
@@ -563,13 +602,14 @@ direct:
 					tp->cur;
 				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
 					*(uint64_t *)p = tp->pst_ent;
-					clflushx(p, dbi->fdel);
+					_mm_clflushopt(p);
+					mfence(dbi->fdel);
 				}
 				/* also flush data buffer */
 				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
-					clflushx(rxbuf + i, dbi->fdel);
+					_mm_clflushopt(rxbuf + i);
 				}
-				mfence();
+				mfence(dbi->fdel);
 				tp->cur += sizeof(tp->pst_ent);
 			} else
 #endif /* WITH_STACKMAP */
@@ -605,9 +645,9 @@ direct:
 				if (!(dbi->flags & DBI_FLAGS_BATCH)) {
 					int j;
 				    	for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-					clflushx(p + j, dbi->fdel);
+						_mm_clflushopt(p + j);
 				    	}
-					mfence();
+					mfence(dbi->fdel);
 					//if (msync(p, len, MS_SYNC))
 					//	perror("msync");
 				}
@@ -859,6 +899,7 @@ main(int argc, char **argv)
 	dbi.g.nthreads = 1;
 	dbi.g.td_privbody = _worker;
 	dbi.g.polltimeo = 2000;
+	dbi.g.extra_bufs = EXTRA_BUF_NUM;
 #endif
 
 	signal(SIGPIPE, SIG_IGN); // XXX
