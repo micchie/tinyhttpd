@@ -64,6 +64,8 @@
 		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		(type *)( (char *)__mptr - offsetof(type,member) );})
 
+#define GET_LEN		4
+#define POST_LEN	5
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
 #define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
@@ -79,6 +81,68 @@
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
+
+/* Taken from Linux */
+#define NOP_DS_PREFIX 0x3e
+#define X86_FEATURE_CLFLUSHOPT	( 9*32+23) /* CLFLUSHOPT instruction */
+# define __force
+#define b_replacement(num)	"664"#num
+#define e_replacement(num)	"665"#num
+
+#define alt_end_marker		"663"
+#define alt_slen		"662b-661b"
+#define alt_pad_len		alt_end_marker"b-662b"
+#define alt_total_slen		alt_end_marker"b-661b"
+#define alt_rlen(num)		e_replacement(num)"f-"b_replacement(num)"f"
+
+#define __OLDINSTR(oldinstr, num)					\
+		"661:\n\t" oldinstr "\n662:\n"					\
+	".skip -(((" alt_rlen(num) ")-(" alt_slen ")) > 0) * "		\
+		"((" alt_rlen(num) ")-(" alt_slen ")),0x90\n"
+
+#define OLDINSTR(oldinstr, num)						\
+		__OLDINSTR(oldinstr, num)					\
+	alt_end_marker ":\n"
+
+#define ALTINSTR_ENTRY(feature, num)					      \
+		" .long 661b - .\n"				/* label           */ \
+	" .long " b_replacement(num)"f - .\n"		/* new instruction */ \
+	" .word " __stringify(feature) "\n"		/* feature bit     */ \
+	" .byte " alt_total_slen "\n"			/* source len      */ \
+	" .byte " alt_rlen(num) "\n"			/* replacement len */ \
+	" .byte " alt_pad_len "\n"			/* pad len */
+
+#define ALTINSTR_REPLACEMENT(newinstr, feature, num)	/* replacement */     \
+	b_replacement(num)":\n\t" newinstr "\n" e_replacement(num) ":\n\t"
+
+#define ALTERNATIVE(oldinstr, newinstr, feature)			\
+		OLDINSTR(oldinstr, 1)					\
+	".pushsection .altinstructions,\"a\"\n"				\
+	ALTINSTR_ENTRY(feature, 1)					\
+	".popsection\n"							\
+	".pushsection .altinstr_replacement, \"ax\"\n"			\
+	ALTINSTR_REPLACEMENT(newinstr, feature, 1)			\
+	".popsection"
+
+#define alternative_io(oldinstr, newinstr, feature, output, input...)	\
+		asm volatile (ALTERNATIVE(oldinstr, newinstr, feature)		\
+					: output : "i" (0), ## input)
+
+#define __stringify_1(x...)	#x
+#define __stringify(x...)	__stringify_1(x)
+
+static inline void clflush(volatile void *__p)
+{
+	asm volatile("clflush %0" : "+m" (*(volatile char __force *)__p));
+}
+
+static inline void _mm_clflushopt(volatile void *__p)
+{
+	alternative_io(".byte " __stringify(NOP_DS_PREFIX) "; clflush %P0",
+		       ".byte 0x66; clflush %P0", X86_FEATURE_CLFLUSHOPT,
+			"+m" (*(volatile char __force *)__p));
+}
+/* End - Taken from Linux */
 
 #define MAXCONNECTIONS 2048
 #define MAXQUERYLEN 32767
@@ -98,6 +162,7 @@ struct dbinfo {
 	char *paddr;
 	int cur;
 	int fdel;
+	int pm;
 	union {
 		int maplen;
 		int maxlen;
@@ -177,6 +242,7 @@ clflushx(volatile void *p, long ns)
 #endif /* 0 */
 
 /* taken from NOVA */
+#if 0
 #define _mm_clflush(addr)\
 		asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
 #ifndef NO_CLFLUSHOPT
@@ -188,6 +254,7 @@ clflushx(volatile void *p, long ns)
 	
 #define _mm_clwb(addr)\
 		asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))
+#endif /* 0 */
 
 static inline void
 wait_ns(long ns)
@@ -470,7 +537,7 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx)
 			+ g->virt_header + rxs->offset;
 
-		if (!strncmp(rxbuf, "POST ", strlen("POST "))) {
+		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			int coff, clen = parse_post(rxbuf, &coff);
 
 			if (clen < 0)
@@ -492,13 +559,13 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 					/* flush data buffer */
 					for (i = 0; i < len;
 					    i += CACHE_LINE_SIZE) {
-						_mm_clflushopt(rxbuf + i);
+						_mm_clflush(rxbuf + i);
 					}
 					mfence(dbi->fdel);
 
 					/* flush log */
 					*(uint64_t *)p = tp->pst_ent;
-					_mm_clflushopt(p);
+					_mm_clflush(p);
 					mfence(dbi->fdel);
 
 					/* swap out buffer */
@@ -532,7 +599,7 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 				}
 			}
 			goto get;
-		} else if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
+		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
 get:
 			if (dbi->httplen) { // use cache
 				char *http = dbi->http;
@@ -562,21 +629,13 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	static u_int seq = 0;
 #endif
 	ssize_t len;
-	struct thpriv *tp = targ->td_private;
 
 	rxbuf = txbuf = buf;
 	if (dbi->flags & DBI_FLAGS_READPMEM) {
 		len = dbi->mmap; /* page size */
 		goto direct;
 	}
-#ifdef WITH_STACKMAP
-	if (dbi->g.nmd) {
-		rxbuf = tp->rxbuf;
-		txbuf = tp->txbuf;
-		len = tp->rxlen;
-	} else
-#endif /* WITH_STACKMAP */
-	{
+
 	len = read(fd, rxbuf, sizeof(buf));
 	if (len == 0) {
 		close(fd);
@@ -585,40 +644,12 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		perror("read");
 		return -1;
 	}
-	}
 
-	if (strncmp(rxbuf, "GET ", strlen("GET ")) == 0) {
-		if (!dbi->httplen) {
-			len = generate_http(msglen, txbuf, NULL);
-		} else {
-			len = dbi->httplen;
-			memcpy(txbuf, dbi->http, len);
-		}
-	} else if (strncmp(rxbuf, "POST ", strlen("POST ")) == 0) {
+	if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
+		goto gen_httpok;
+	} else if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
 		if (dbi->type == DT_DUMB) {
 direct:
-#ifdef WITH_STACKMAP
-			if (dbi->flags & DBI_FLAGS_PASTE) {
-				char *p;
-				int i;
-
-				if (tp->cur + sizeof(tp->pst_ent) > 
-				    dbi->maplen - sizeof(struct paste_hdr))
-					tp->cur = 0;
-
-				p = dbi->paddr + sizeof(struct paste_hdr) + 
-					tp->cur;
-				*(uint64_t *)p = tp->pst_ent;
-				_mm_clflushopt(p);
-				mfence(dbi->fdel);
-				/* also flush data buffer */
-				for (i = 0; i < len; i += CACHE_LINE_SIZE) {
-					_mm_clflushopt(rxbuf + i);
-				}
-				mfence(dbi->fdel);
-				tp->cur += sizeof(tp->pst_ent);
-			} else
-#endif /* WITH_STACKMAP */
 			if (dbi->mmap) {
 				int d, j;
 				char *p;
@@ -639,20 +670,23 @@ direct:
 						close(fd);
 						return 0;
 					}
-					if (strncmp(p, "GET ", 
-					    strlen("GET ")) == 0)
+					if (!strncmp(p, "GET ", GET_LEN))
 						goto gen_httpok;
-					else if (strncmp(p, "POST ",
-					         strlen("POST ")))
+					else if (strncmp(p, "POST ", POST_LEN))
 						return -1; /* next pos stays */
 
 				} else {
 					memcpy(p, rxbuf, len);
 				}
-				for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-					_mm_clflushopt(p + j);
+				if (dbi->pm) {
+					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
+						_mm_clflushopt(p + j);
+					}
+					mfence(dbi->fdel);
+				} else {
+					if (msync(p, len, MS_SYNC))
+						perror("msync");
 				}
-				mfence(dbi->fdel);
 				dbi->cur += len;
 			} else {
 				len = write(dbi->dumbfd, rxbuf, len);
@@ -690,18 +724,16 @@ direct:
 		}
 #endif /* SQLITE */
 gen_httpok:
-		len = generate_http(msglen, txbuf, NULL);
+		if (!dbi->httplen) {
+			len = generate_http(msglen, txbuf, NULL);
+		} else {
+			len = dbi->httplen;
+			memcpy(txbuf, dbi->http, len);
+		}
 	} else {
 		len = 0;
 	}
-#ifdef WITH_STACKMAP
-	if (!dbi->g.nmd)
-#endif /* WITH_STACKMAP */
-		write(fd, txbuf, len);
-#ifdef WITH_STACKMAP
-	else
-		tp->txlen = len;
-#endif /* WITH_STACKMAP */
+	write(fd, txbuf, len);
 	return 0;
 }
 
@@ -946,6 +978,7 @@ main(int argc, char **argv)
 			else
 				dbi.type = DT_SQLITE;
 			dbi.path = optarg;
+			dbi.pm = strstr(optarg, "pm") ? 1 : 0;
 			}
 			break;
 		case 'm':
@@ -991,7 +1024,7 @@ main(int argc, char **argv)
 			usage();
 		}
 		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
-		D("generated http %d", dbi.httplen);
+		D("preallocated http %d", dbi.httplen);
 	}
 
 	fprintf(stderr, "%s built %s %s db: %s\n",
