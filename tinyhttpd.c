@@ -68,10 +68,9 @@
 #define POST_LEN	5
 #define STMNAME	"stack:0"
 #define STMNAME_MAX	64
-#define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
-#define EXTRA_BUF_NUM	1000
-//#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
-#define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
+//#define EXTRA_BUF_NUM	160000
+//#define EXTRA_BUF_NUM	3000000
+#define PMEMFILE         "/mnt/pmem/netmap_mem"
 #endif /* WITH_STACKMAP */
 
 #define MAX_PAYLOAD	1400
@@ -146,7 +145,6 @@ static inline void _mm_clflushopt(volatile void *__p)
 
 #define MAXCONNECTIONS 2048
 #define MAXQUERYLEN 32767
-#define MAXDUMBSIZE	204800
 
 #define MAX_HTTPLEN	65535
 struct dbinfo {
@@ -158,24 +156,20 @@ struct dbinfo {
 #endif
 		int	dumbfd;
 	};
-	int mmap;
+	u_int pgsiz;
 	char *paddr;
-	int cur;
 	int fdel;
 	int pm;
-	union {
-		int maplen;
-		int maxlen;
-	};
+	size_t dbsiz;
 #define DBI_FLAGS_FDSYNC	0x1
-#define DBI_FLAGS_READPMEM	0x2
+#define DBI_FLAGS_READMMAP	0x2
 #define DBI_FLAGS_PASTE		0x4
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct nm_garg g;
 	struct nm_ifreq ifreq;
-	int extmem_fd;
+	int extmemfd;
 #endif /* WITH_STACKMAP */
 	int sd;
 	char *http;
@@ -188,13 +182,13 @@ struct thpriv {
 	struct nm_garg *g;
 	char *rxbuf;
 	char *txbuf;
-	int cur;
+	size_t cur;
 	uint64_t pst_ent;
 	uint16_t txlen;
 	uint16_t rxlen;
 	struct nm_ifreq ifreq;
 	struct epoll_event evts[MAXCONNECTIONS];
-	uint32_t extra[EXTRA_BUF_NUM];
+	uint32_t *extra;
 	uint32_t extra_cur;
 	uint32_t extra_num;
 };
@@ -306,7 +300,7 @@ static uint64_t stat_vnfds;
 #endif /* 0 */
 
 static char *
-_do_mmap(int fd, int len)
+_do_mmap(int fd, size_t len)
 {
 	char *p;
 
@@ -337,11 +331,13 @@ close_db(struct dbinfo *dbip)
 
 	/* close reference */
 	if (dbip->type == DT_DUMB) {
-		if (dbip->mmap)
-			if (munmap(dbip->paddr, dbip->maplen))
+		if (dbip->paddr)
+			if (munmap(dbip->paddr, dbip->dbsiz))
 				perror("munmap");
-		D("closing dumbfd");
-		close(dbip->dumbfd);
+		if (dbip->dumbfd > 0) {
+			D("closing dumbfd");
+			close(dbip->dumbfd);
+		}
 	}
 #ifdef WITH_SQLITE
 	else if (dbip->type == DT_SQLITE) {
@@ -514,9 +510,37 @@ int do_accept(int fd, int epfd)
 	return 0;
 }
 
+static int
+writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
+{
+	int error;
+	size_t cur = *pos;
+
+	if (cur + len > space){
+		if (lseek(fd, 0, SEEK_SET) < 0) {
+			perror("lseek");
+			return -1;
+		}
+		cur = 0;
+	}
+	len = write(fd, buf, len);
+	if (len < 0) {
+		perror("write");
+		return -1;
+	}
+	cur += len;
+	error = fdsync ? fdatasync(fd) : fsync(fd);
+	if (error) {
+		fprintf(stderr, "failed in f%ssync\n", fdsync ? "data" : "");
+		return -1;
+	}
+	*pos = cur;
+	return 0;
+}
+
 /* We assume GET/POST appears in the beginning of netmap buffer */
 int
-process_nm_ring(struct nm_targ *targ, int ring_nr)
+do_nm_ring(struct nm_targ *targ, int ring_nr)
 {
 	struct nm_garg *g = targ->g;
 	struct dbinfo *dbi = container_of(g, struct dbinfo, g);
@@ -532,10 +556,12 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		char *rxbuf;
 		int o = IPV4TCP_HDRLEN;
-		int len = rxs->len;
+		int off, len;
 
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx)
 			+ g->virt_header + rxs->offset;
+		off = g->virt_header + rxs->offset;
+	       	len = rxs->len - off;
 
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			int coff, clen = parse_post(rxbuf, &coff);
@@ -544,59 +570,113 @@ process_nm_ring(struct nm_targ *targ, int ring_nr)
 				continue;
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
-					char *p;
-					u_int i;
-					int plen = sizeof(tp->pst_ent);
-					int phdrlen = sizeof(struct paste_hdr);
+					u_int i = 0;
 
-					if (tp->cur + plen >
-					    dbi->maplen - phdrlen)
-						tp->cur = 0;
-
-					/* log position */
-					p = dbi->paddr + phdrlen + tp->cur;
+					if (unlikely(tp->extra_cur ==
+					    tp->extra_num)) {
+						tp->extra_cur = 0;
+						tp->cur = 0; /* clear log too */
+					}
 
 					/* flush data buffer */
-					for (i = 0; i < len;
-					    i += CACHE_LINE_SIZE) {
-						_mm_clflush(rxbuf + i);
+					for (; i < len; i += CACHE_LINE_SIZE) {
+						_mm_clflushopt(rxbuf + i);
 					}
 					mfence(dbi->fdel);
 
-					/* flush log */
-					*(uint64_t *)p = tp->pst_ent;
-					_mm_clflush(p);
-					mfence(dbi->fdel);
+					if (dbi->paddr) {
+						uint64_t pst_ent;
+						int plen = sizeof(pst_ent);
+						int phdrlen =
+						    sizeof(struct paste_hdr);
+						char *p = dbi->paddr;
+
+						/* make log */
+						pst_ent = (uint64_t)
+						    rxs->buf_idx << 32 |
+						    off << 16 | len;
+
+						/* position log */
+						if (unlikely(plen > dbi->dbsiz -
+					      	    phdrlen - tp->cur))
+							tp->cur = 0;
+						p += phdrlen + tp->cur;
+
+						/* flush log */
+						*(uint64_t *)p = pst_ent;
+						//_mm_clflushopt(p);
+						//mfence(dbi->fdel);
+						clflush(p);
+	
+						tp->cur += plen;
+					}
 
 					/* swap out buffer */
 					i = rxs->buf_idx;
 					rxs->buf_idx = tp->extra[tp->extra_cur];
 					rxs->flags |= NS_BUF_CHANGED;
+
 					tp->extra[tp->extra_cur] = i;
 					tp->extra_cur++;
-					if (unlikely(tp->extra_cur ==
-					    tp->extra_num)) {
-						tp->extra_cur = 0;
-					}
-					tp->cur += plen;
-				} else if (dbi->mmap) {
-					int d, j = 0;
+
+				} else if (dbi->paddr && dbi->pm) {
 					char *p;
+					int mlen = sizeof(uint64_t);
+					int phdrlen = sizeof(struct paste_hdr);
+					u_int i = 0;
 
-					d = (len & (dbi->mmap - 1));
-					if (d)
-						len += dbi->mmap - d;
-					if (tp->cur + len > dbi->maplen)
+					/* Do we have a space? */
+					if (unlikely(len + mlen >
+					    dbi->dbsiz - phdrlen - tp->cur)) {
 						tp->cur = 0;
-					p = dbi->paddr + dbi->cur;
-					memcpy(p, rxbuf, len);
+					}
+					p = dbi->paddr + phdrlen + tp->cur;
+					p += mlen; // leave a log space
 
-					for (; j < len; j += CACHE_LINE_SIZE) {
-						_mm_clflushopt(p + j);
+					/* copy data buffer */
+					memcpy(p, rxbuf, len);
+					for (; i < len;
+						i += CACHE_LINE_SIZE) {
+						_mm_clflushopt(p + i);
 					}
 					mfence(dbi->fdel);
-					tp->cur += len;
+
+					p -= mlen; /* the log space */
+					*(uint64_t *)p = len;
+					//_mm_clflushopt(p);
+					//mfence(dbi->fdel);
+					clflush(p);
+					tp->cur += len + mlen;
+				} else if (dbi->paddr) { // nvme
+					char *p;
+					u_long d, aligned = len;
+					int mlen = sizeof(uint64_t);
+					/* XXX omit phdrlen */
+
+					/* one page per item */
+					d = (len & (dbi->pgsiz - 1));
+					if (d)
+						aligned = len + dbi->pgsiz - d;
+					if (tp->cur + aligned > dbi->dbsiz)
+						tp->cur = 0;
+					p = dbi->paddr + tp->cur;
+					p += mlen;
+
+					memcpy(p, rxbuf, len);
+
+					p -= mlen;
+					*(uint64_t *)p = len;
+					if (msync(p, len, MS_SYNC))
+						perror("msync");
+					tp->cur += aligned;
+				} else {
+					if (writesync(rxbuf, len, dbi->dbsiz,
+					    dbi->dumbfd, &tp->cur,
+					    dbi->flags & DBI_FLAGS_FDSYNC)) {
+						return -1;
+					}
 				}
+
 			}
 			goto get;
 		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
@@ -628,11 +708,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
-	ssize_t len;
+	ssize_t len = 0;
+	struct thpriv *tp = targ->td_private;
 
 	rxbuf = txbuf = buf;
-	if (dbi->flags & DBI_FLAGS_READPMEM) {
-		len = dbi->mmap; /* page size */
+	if (dbi->flags & DBI_FLAGS_READMMAP) {
 		goto direct;
 	}
 
@@ -650,23 +730,23 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	} else if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
 		if (dbi->type == DT_DUMB) {
 direct:
-			if (dbi->mmap) {
+			if (dbi->paddr) {
 				int d, j;
 				char *p;
 
-				d = (len & (dbi->mmap-1));
+				d = (len & (dbi->pgsiz-1));
 				if (d)
-					len += dbi->mmap - d;
-				if (dbi->cur + len  > dbi->maplen)
-					dbi->cur = 0;
-				p = dbi->paddr + dbi->cur;
-				if (dbi->flags & DBI_FLAGS_READPMEM) {
-					int alen;
-					alen = read(fd, p, len);
-					if (alen < 0) {
+					len += dbi->pgsiz - d;
+				if (tp->cur + len  > dbi->dbsiz)
+					tp->cur = 0;
+				p = dbi->paddr + tp->cur;
+
+				if (dbi->flags & DBI_FLAGS_READMMAP) {
+					len = read(fd, p, dbi->pgsiz);
+					if (len < 0) {
 						perror("read");
 						return -1;
-					} else if (alen == 0) {
+					} else if (len == 0) {
 						close(fd);
 						return 0;
 					}
@@ -687,19 +767,12 @@ direct:
 					if (msync(p, len, MS_SYNC))
 						perror("msync");
 				}
-				dbi->cur += len;
+				tp->cur += len;
 			} else {
-				len = write(dbi->dumbfd, rxbuf, len);
-				if (len < 0)
-					perror("write");
-				else if ((dbi->flags & DBI_FLAGS_FDSYNC ?
-				    fdatasync(dbi->dumbfd) :
-				    fsync(dbi->dumbfd)) < 0)
-					fprintf(stderr, "failed in f(data)sync\n");
-				dbi->cur += len;
-				if (dbi->cur > dbi->maxlen) {
-					lseek(dbi->dumbfd, 0, SEEK_SET);
-					dbi->cur = 0;
+				if (writesync(rxbuf, len, dbi->dbsiz,
+				    dbi->dumbfd, &tp->cur,
+				    dbi->flags & DBI_FLAGS_FDSYNC)) {
+					return -1;
 				}
 			}
 		}
@@ -754,16 +827,23 @@ _worker(void *data)
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
+		struct nmreq *req = &g->nmd->req;
 		struct netmap_if *nifp = targ->nmd->nifp;
 		struct netmap_ring *any_ring = NETMAP_RXRING(nifp, 0);
 		uint32_t i, next = nifp->ni_bufs_head;
+		int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; /* XXX */
 
-		for (i = 0; i < EXTRA_BUF_NUM && next; i++) {
+		tp->extra = calloc(sizeof(*tp->extra), n);
+		if (!tp->extra) {
+			perror("calloc");
+			goto quit;
+		}
+		for (i = 0; i < n && next; i++) {
 			tp->extra[i] = next;
 			next = *(uint32_t *)NETMAP_BUF(any_ring, next);
 		}
 		tp->extra_num = i;
-		D("imported %d extra buffers", i);
+		D("imported %u extra buffers", i);
 
 		tp->ifreq = dbip->ifreq;
 	}
@@ -839,61 +919,7 @@ accepted:
 
 			for (i = first_rx_ring; i <= last_rx_ring; i++) {
 
-				process_nm_ring(targ, i);
-#if 0
-				struct netmap_ring *rxr, *txr;
-				struct netmap_slot *rxs;
-				u_int txcur, txlim, rxcur, rx;
-
-				rxr = NETMAP_RXRING(nifp, i);
-				txr = NETMAP_TXRING(nifp, i);
-
-				txcur = txr->cur;
-				rxcur = rxr->cur;
-				/* XXX 1 reqequest triggers 1 response */
-				txlim = nm_ring_space(txr);
-				if (txlim > nm_ring_space(rxr)) {
-					txlim = nm_ring_space(rxr);
-				}
-				for (rx = 0; rx < txlim; rx++) {
-					struct netmap_slot *txs;
-					char *p;
-					int txoff;
-				       
-					txoff = g->virt_header + IPV4TCP_HDRLEN;
-
-					rxs = &rxr->slot[rxcur];
-					p = NETMAP_BUF(rxr, rxs->buf_idx);
-					p += g->virt_header;
-					p += rxs->offset;
-
-					tp->rxbuf = p;
-					tp->rxlen = rxs->len;
-					txs = &txr->slot[txcur];
-					tp->txbuf =
-						NETMAP_BUF(txr, txs->buf_idx);
-					tp->txbuf += txoff;
-					tp->txlen = 0; // just initialize
-					tp->pst_ent = (uint64_t)
-					    rxs->buf_idx << 32 |
-					    g->virt_header << 16 | rxs->len;
-					do_established(-1, msglen, targ);
-					if (tp->txlen) {
-						txs->len = tp->txlen + txoff;
-						txs->offset = IPV4TCP_HDRLEN;
-						txs->fd = rxs->fd;
-					} else {
-						txs->len = 0;
-					}
-					txcur = nm_ring_next(txr, txcur);
-					txlim--;
-					rxcur = nm_ring_next(rxr, rxcur);
-				}
-				txr->head = txr->cur = txcur;
-				rxr->head = rxr->cur = rxcur;
-#endif /* 0 */
-
-				/* No batch support yet */
+				do_nm_ring(targ, i);
 			}
 		} else if (g->dev_type == DEV_SOCKET) {
 			int i, nfd, epfd = targ->fd;
@@ -919,6 +945,8 @@ accepted:
 		}
 	}
 quit:
+	if (tp->extra)
+		free(tp->extra);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -932,26 +960,28 @@ main(int argc, char **argv)
 	const int on = 1;
 	int port = 0;
 	struct dbinfo dbi;
+	int do_mmap;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
 
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
-	dbi.maxlen = MAXDUMBSIZE;
+	dbi.dbsiz = 0;
 	dbi.msglen = 0;
 	dbi.fdel = 0;
+	dbi.pgsiz = getpagesize();
 #ifdef WITH_STACKMAP
 	dbi.g.nmr_config = "";
 	dbi.g.nthreads = 1;
 	dbi.g.td_privbody = _worker;
 	dbi.g.polltimeo = 2000;
-	dbi.g.extra_bufs = EXTRA_BUF_NUM;
+	dbi.g.extra_bufs = 0;
 #endif
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:xF:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -981,20 +1011,29 @@ main(int argc, char **argv)
 			dbi.pm = strstr(optarg, "pm") ? 1 : 0;
 			}
 			break;
+		case 'L':
+			//use 7680 for approx 8GB
+			dbi.dbsiz = atol(optarg) * 1000000;
+			break;
 		case 'm':
-			dbi.mmap = getpagesize();
+			do_mmap = 1;
 			break;
 		case 'D':
 			dbi.flags |= DBI_FLAGS_FDSYNC;
 			break;
 		case 'N':
-			dbi.flags |= DBI_FLAGS_READPMEM;
+			dbi.flags |= DBI_FLAGS_READMMAP;
 			break;
 		case 'i':
 			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
 			break;
 		case 'x': /* PASTE */
 			dbi.flags |= DBI_FLAGS_PASTE;
+			// use 7500 to fill up 8 GB mem
+			dbi.g.extmem_siz = atol(optarg) * 1000000;
+			// believe 90 % is available for bufs
+			dbi.g.extra_bufs = (dbi.g.extmem_siz / 2048) / 10 * 9;
+			dbi.dbsiz = dbi.g.extra_bufs * 8 * 2;
 			break;
 		case 'c':
 			dbi.httplen = 1;
@@ -1037,26 +1076,18 @@ main(int argc, char **argv)
 	if (!port || !dbi.msglen)
 		usage();
 
-	if (dbi.flags & DBI_FLAGS_READPMEM) {
-		if (!((dbi.type == DT_DUMB) && dbi.mmap)) {
-			fprintf(stderr, "READPMEM must use dumb db and mmap\n");
-			usage();
-		}
-	}
-	if ((dbi.flags & DBI_FLAGS_PASTE) && !dbi.mmap) {
-		D("PASTE must be used with mmap");
-		usage();
-	}
-
 	if (dbi.type == DT_DUMB) {
 		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
 		if (dbi.dumbfd < 0) {
 			perror("open");
 			goto close;
 		}
-		if (dbi.mmap) {
-			dbi.maplen = MAXDUMBSIZE; /* XXX is size ok? */
-			dbi.paddr = _do_mmap(dbi.dumbfd, dbi.maplen);
+		if (do_mmap) {
+			if (fallocate(dbi.dumbfd, 0, 0, dbi.dbsiz) < 0) {
+				perror("fallocate");
+				goto close;
+			}
+			dbi.paddr = _do_mmap(dbi.dumbfd, dbi.dbsiz);
 			if (dbi.paddr == NULL)
 				goto close;
 #ifdef WITH_STACKMAP
@@ -1173,19 +1204,40 @@ error:
 
 		dbi.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
-		dbi.extmem_fd = open(DEFAULT_EXT_MEM, O_RDWR|O_CREAT,
-					S_IRWXU);
-                if (dbi.extmem_fd < 0) {
-                        perror("open");
-                        goto close_socket;
-                }
-                dbi.g.extmem = _do_mmap(dbi.extmem_fd, DEFAULT_EXT_MEM_SIZE);
-                if (dbi.g.extmem == NULL) {
-			D("mmap failed");
-                        goto close_socket;
-                }
-		pi = (struct netmap_pools_info *)dbi.g.extmem;
-		pi->memsize = DEFAULT_EXT_MEM_SIZE;
+		if (dbi.flags & DBI_FLAGS_PASTE) {
+			int fd;
+
+			fd = dbi.extmemfd = open(PMEMFILE,
+					O_RDWR|O_CREAT, S_IRWXU);
+	                if (fd < 0) {
+	                        perror("open");
+	                        goto close_socket;
+	                }
+			if (fallocate(fd, 0, 0, dbi.g.extmem_siz) < 0) {
+				perror("fallocate");
+				goto close_socket;
+			}
+	                dbi.g.extmem = _do_mmap(fd, dbi.g.extmem_siz);
+	                if (dbi.g.extmem == NULL) {
+				D("mmap failed");
+	                        goto close_socket;
+	                }
+			pi = (struct netmap_pools_info *)dbi.g.extmem;
+			pi->memsize = dbi.g.extmem_siz;
+
+			pi->if_pool_objtotal = 128;
+			pi->ring_pool_objtotal = 512;
+			pi->buf_pool_objtotal = dbi.g.extra_bufs + 800000;
+
+			/*
+			dbi.g.extmem = malloc(2152000000);
+			if (dbi.g.extmem == NULL) {
+				perror("malloc");
+				goto close_socket;
+			}
+			*/
+			D("mmap success");
+		}
 #endif
 	} else {
 		dbi.g.dev_type = DEV_SOCKET;
@@ -1202,8 +1254,9 @@ close_socket:
 #ifdef WITH_EXTMEM
 	if (dbi.g.extmem) {
 		if (dbi.g.extmem)
-			munmap(dbi.g.extmem, DEFAULT_EXT_MEM_SIZE);
-		close(dbi.extmem_fd);
+			munmap(dbi.g.extmem, dbi.g.extmem_siz);
+		close(dbi.extmemfd);
+		remove(PMEMFILE);
 		//free(dbi.g.extmem);
 	}
 #endif /* WITH_EXTMEM */

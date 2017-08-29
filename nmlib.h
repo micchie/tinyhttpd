@@ -4,9 +4,10 @@
 #include<net/netmap_user.h>
 #include<ctrs.h>
 
-#define DEFAULT_EXT_MEM         "/mnt/pmem/netmap_mem"
-//#define DEFAULT_EXT_MEM_SIZE    1000000000 /* approx. 1 GB */
-#define DEFAULT_EXT_MEM_SIZE    400000000 /* approx. 400 MB */
+//#define DEFAULT_EXT_MEM_SIZE    2152000000 /* approx. 2.2 GB (2144 ok 2152M fail)*/
+//#define DEFAULT_EXT_MEM_SIZE    4000000000
+//const uint64_t DEFAULT_EXT_MEM_SIZE = 7000000000UL;
+//#define DEFAULT_EXT_MEM_SIZE    2560000000 /* approx. 2.5 GB */
 
 #ifndef D
 #define D(fmt, ...) \
@@ -91,6 +92,7 @@ struct nm_garg {
 	int cpus;
 	int virt_header;	/* send also the virt_header */
 	int extra_bufs;		/* goes in nr_arg3 */
+	uint64_t extmem_siz;
 	int extra_pipes;	/* goes in nr_arg1 */
 	char *nmr_config;
 	char *extmem;		/* goes to nr_arg1+ */
@@ -568,7 +570,7 @@ nm_start(struct nm_garg *g)
 	}
 
 	g->main_fd = g->nmd->fd;
-	D("mapped %dKB at %p", g->nmd->req.nr_memsize>>10, g->nmd->mem);
+	D("mapped %lu at %p", g->nmd->req.nr_memsize>>10, g->nmd->mem);
 
 	if (g->virt_header) {
 		/* Set the virtio-net header length, since the user asked
