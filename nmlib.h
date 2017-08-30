@@ -494,7 +494,7 @@ nm_start(struct nm_garg *g)
 
 	g->main_fd = -1;
 	g->wait_link = 3;
-	g->report_interval = 1000;
+	g->report_interval = 2000;
 	g->cpus = g->system_cpus = i = system_ncpus();
 	if (g->cpus < 0 || g->cpus > i) {
 		D("%d cpus is too high, have only %d cpus", g->cpus, i);

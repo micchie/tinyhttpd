@@ -81,6 +81,10 @@
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
 
+#define IF_OBJTOTAL	128
+#define RING_OBJTOTAL	512
+#define RING_OBJSIZE	33024
+
 /* Taken from Linux */
 #define NOP_DS_PREFIX 0x3e
 #define X86_FEATURE_CLFLUSHOPT	( 9*32+23) /* CLFLUSHOPT instruction */
@@ -135,12 +139,15 @@ static inline void clflush(volatile void *__p)
 	asm volatile("clflush %0" : "+m" (*(volatile char __force *)__p));
 }
 
+// GCC < 5 doesn't compile _mm_clflushopt() well
+#if 0
 static inline void _mm_clflushopt(volatile void *__p)
 {
 	alternative_io(".byte " __stringify(NOP_DS_PREFIX) "; clflush %P0",
 		       ".byte 0x66; clflush %P0", X86_FEATURE_CLFLUSHOPT,
 			"+m" (*(volatile char __force *)__p));
 }
+#endif
 /* End - Taken from Linux */
 
 #define MAXCONNECTIONS 2048
@@ -278,6 +285,16 @@ mfence(long delay)
 	_mm_mfence();
 }
 
+static __inline void
+sfence(long delay)
+{
+	if (delay > 0)
+		wait_ns(delay);
+	//__asm __volatile("mfence" : : : "memory");
+	_mm_sfence();
+}
+
+
 #define CACHE_LINE_SIZE	64 /* XXX */
 
 #ifdef WITH_STACKMAP
@@ -374,6 +391,58 @@ print_resp(void *get_prm, int n, char **txts, char **col)
 }
 
 /* fill rubbish if data is NULL */
+#if 0
+static int
+copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
+		int len, int off0, int off, int fd)
+{
+	u_int const tail = ring->tail;
+	u_int cur = ring->cur;
+	u_int copied = 0;
+	int space = nm_ring_space(ring);
+	struct netmap_slot *slot = &ring->slot[cur];
+	char *p = NETMAP_BUF(ring, slot->buf_idx) + off0 + virt_header;
+
+	__builtin_prefetch(p);
+
+	if (unlikely(space * MAX_PAYLOAD < len)) {
+		RD(1, "no space (%d slots)", space);
+		return -1;
+	}
+
+	/* XXX adjust to real offset */
+	off0 += virt_header;
+	off += virt_header;
+
+	do {
+		u_int next_cur = nm_ring_next(ring, cur);
+		struct netmap_slot *next_slot = &ring->slot[next_cur];
+		char *next_buf = NETMAP_BUF(ring, next_slot->buf_idx) + off;
+		int l = min(MAX_PAYLOAD, len - copied);
+
+		if (data)
+			nm_pkt_copy(data + copied, p, l);
+		else
+			set_rubbish(p, l);
+		slot->len = off0 + l;
+		slot->offset = off - virt_header; // XXX change API...
+		slot->fd = fd;
+		copied += l;
+		off0 = off;
+		cur = next_cur;
+
+		if (copied >= len || unlikely(next_cur == tail))
+			break;
+
+		__builtin_prefetch(next_buf);
+
+		p = next_buf;
+		slot = next_slot;
+	} while (1);
+	ring->cur = ring->head = cur;
+	return len;
+}
+#endif
 static int
 copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		int len, int off0, int off, int fd)
@@ -566,7 +635,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			int coff, clen = parse_post(rxbuf, &coff);
 
-			if (clen < 0)
+			if (unlikely(clen < 0))
 				continue;
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
@@ -580,10 +649,9 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
-						_mm_clflushopt(rxbuf + i);
+						_mm_clflush(rxbuf + i);
 					}
-					mfence(dbi->fdel);
-
+					//sfence(dbi->fdel);
 					if (dbi->paddr) {
 						uint64_t pst_ent;
 						int plen = sizeof(pst_ent);
@@ -605,7 +673,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 						/* flush log */
 						*(uint64_t *)p = pst_ent;
 						//_mm_clflushopt(p);
-						//mfence(dbi->fdel);
+						//sfence(dbi->fdel);
 						clflush(p);
 	
 						tp->cur += plen;
@@ -635,17 +703,16 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 					/* copy data buffer */
 					memcpy(p, rxbuf, len);
-					for (; i < len;
-						i += CACHE_LINE_SIZE) {
-						_mm_clflushopt(p + i);
+					for (; i < len; i += CACHE_LINE_SIZE) {
+						_mm_clflush(p + i);
 					}
-					mfence(dbi->fdel);
+					//sfence(dbi->fdel);
 
 					p -= mlen; /* the log space */
 					*(uint64_t *)p = len;
 					//_mm_clflushopt(p);
-					//mfence(dbi->fdel);
-					clflush(p);
+					//sfence(dbi->fdel);
+					_mm_clflush(p);
 					tp->cur += len + mlen;
 				} else if (dbi->paddr) { // nvme
 					char *p;
@@ -713,36 +780,44 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 
 	rxbuf = txbuf = buf;
 	if (dbi->flags & DBI_FLAGS_READMMAP) {
-		goto direct;
+		goto readmmap;
+	} else {
+		len = read(fd, rxbuf, sizeof(buf));
+		if (len == 0) {
+			close(fd);
+			return 0;
+		} else if (len < 0) {
+			//perror("read");
+			close(fd);
+			return -1;
+		}
 	}
 
-	len = read(fd, rxbuf, sizeof(buf));
-	if (len == 0) {
-		close(fd);
-		return 0;
-	} else if (len < 0) {
-		perror("read");
-		return -1;
-	}
+	if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
+		int coff, clen = parse_post(rxbuf, &coff);
 
-	if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
-		goto gen_httpok;
-	} else if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
+		if (unlikely(clen < 0))
+			return 0;
+readmmap:
 		if (dbi->type == DT_DUMB) {
-direct:
-			if (dbi->paddr) {
-				int d, j;
-				char *p;
+			uint64_t log_ent[8]; // cache-line align
 
-				d = (len & (dbi->pgsiz-1));
-				if (d)
-					len += dbi->pgsiz - d;
-				if (tp->cur + len  > dbi->dbsiz)
+			if (dbi->paddr) {
+				char *p;
+				int j, space = len ? len : dbi->pgsiz;
+
+				if (!dbi->pm) {
+					int d = (len & (dbi->pgsiz-1));
+					if (d)
+						space = len + dbi->pgsiz - d;
+				}
+				if (tp->cur + space  > dbi->dbsiz)
 					tp->cur = 0;
 				p = dbi->paddr + tp->cur;
+				p += sizeof(log_ent);
 
 				if (dbi->flags & DBI_FLAGS_READMMAP) {
-					len = read(fd, p, dbi->pgsiz);
+					len = read(fd, p, space);
 					if (len < 0) {
 						perror("read");
 						return -1;
@@ -750,24 +825,35 @@ direct:
 						close(fd);
 						return 0;
 					}
-					if (!strncmp(p, "GET ", GET_LEN))
-						goto gen_httpok;
-					else if (strncmp(p, "POST ", POST_LEN))
-						return -1; /* next pos stays */
+					if (!strncmp(p, "POST ", POST_LEN)) {
+						int coff, clen;
 
+					       	clen = parse_post(p, &coff);
+						if (unlikely(clen < 0))
+							return 0;
+					} else if (!strncmp(p, "GET ", GET_LEN))
+						goto gen_httpok;
+					else
+						return -1; /* next pos stays */
 				} else {
 					memcpy(p, rxbuf, len);
 				}
+				log_ent[0] = len;
+
+				p -= sizeof(log_ent);
+				memcpy(p, log_ent, sizeof(log_ent));
+
 				if (dbi->pm) {
 					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-						_mm_clflushopt(p + j);
+						_mm_clflush(p + j);
 					}
-					mfence(dbi->fdel);
+					//mfence(dbi->fdel);
 				} else {
 					if (msync(p, len, MS_SYNC))
 						perror("msync");
+					len = dbi->pgsiz;
 				}
-				tp->cur += len;
+				tp->cur += space;
 			} else {
 				if (writesync(rxbuf, len, dbi->dbsiz,
 				    dbi->dumbfd, &tp->cur,
@@ -803,6 +889,8 @@ gen_httpok:
 			len = dbi->httplen;
 			memcpy(txbuf, dbi->http, len);
 		}
+	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
+		goto gen_httpok;
 	} else {
 		len = 0;
 	}
@@ -960,7 +1048,7 @@ main(int argc, char **argv)
 	const int on = 1;
 	int port = 0;
 	struct dbinfo dbi;
-	int do_mmap;
+	int do_mmap = 0;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
@@ -1225,8 +1313,9 @@ error:
 			pi = (struct netmap_pools_info *)dbi.g.extmem;
 			pi->memsize = dbi.g.extmem_siz;
 
-			pi->if_pool_objtotal = 128;
-			pi->ring_pool_objtotal = 512;
+			pi->if_pool_objtotal = IF_OBJTOTAL;
+			pi->ring_pool_objtotal = RING_OBJTOTAL;
+			pi->ring_pool_objsize = RING_OBJSIZE;
 			pi->buf_pool_objtotal = dbi.g.extra_bufs + 800000;
 
 			/*
