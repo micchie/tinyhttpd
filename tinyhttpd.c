@@ -198,7 +198,10 @@ struct thpriv {
 	uint32_t *extra;
 	uint32_t extra_cur;
 	uint32_t extra_num;
+	int	*fds;
+	int	nfds;
 };
+#define DEFAULT_NFDS	1024
 
 /* overflow some */
 static inline void
@@ -626,17 +629,21 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		char *rxbuf;
 		int o = IPV4TCP_HDRLEN;
 		int off, len;
+		int *fde = &tp->fds[rxs->fd];
 
-		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx)
-			+ g->virt_header + rxs->offset;
 		off = g->virt_header + rxs->offset;
+		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
 	       	len = rxs->len - off;
 
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			int coff, clen = parse_post(rxbuf, &coff);
+			int thisclen = len - coff;
 
 			if (unlikely(clen < 0))
 				continue;
+			else if (clen > thisclen) {
+				*fde = clen - thisclen;
+			}
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
@@ -745,7 +752,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 				}
 
 			}
-			goto get;
+			if (!*fde)
+				goto get;
 		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
 get:
 			if (dbi->httplen) { // use cache
@@ -760,6 +768,16 @@ get:
 				if (generate_http_nm(msglen, txr,
 				    g->virt_header, o, rxs->fd, NULL) < 0)
 					continue;
+			}
+		} else if (*fde > 0) {
+			*fde -= len;
+			if (*fde <= 0) {
+				if (unlikely(*fde < 0)) {
+					RD(1, "negative leftover to %d", *fde);
+					*fde = 0;
+				}
+				goto get;
+
 			}
 		}
 	}
@@ -934,6 +952,14 @@ _worker(void *data)
 		D("imported %u extra buffers", i);
 
 		tp->ifreq = dbip->ifreq;
+
+		/* allocate fd table */
+		tp->fds =calloc(sizeof(*tp->fds), DEFAULT_NFDS);
+		if (!tp->fds){
+			perror("calloc");
+			goto quit;
+		}
+		tp->nfds = DEFAULT_NFDS;
 	}
 
 	if (g->dev_type == DEV_SOCKET) {
@@ -996,6 +1022,22 @@ _worker(void *data)
 					/* be conservative to this error... */
 					goto quit;
 				}
+				if (unlikely(newfd >= tp->nfds)) {
+				       int *newfds, fdsiz = sizeof(*tp->fds);
+				       int curfds = tp->nfds;
+				      
+				       newfds = calloc(fdsiz, tp->nfds * 2);
+				       if (!newfds) {
+					       perror("calloc");
+					       close(newfd);
+					       goto quit;
+				       }
+				       memcpy(newfds, tp->fds, fdsiz * curfds);
+				       free(tp->fds);
+				       _mm_mfence();
+				       tp->fds = newfds;
+				       tp->nfds++;
+				}
 			}
 accepted:
 			/*
@@ -1035,6 +1077,8 @@ accepted:
 quit:
 	if (tp->extra)
 		free(tp->extra);
+	if (tp->fds)
+		free(tp->fds);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
