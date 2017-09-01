@@ -610,6 +610,55 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+static inline size_t
+paste_log(char *paddr, size_t pos, size_t dbsiz, struct netmap_slot *slot,
+		size_t off, size_t len)
+{
+	uint64_t pst_ent;
+	int plen = sizeof(pst_ent);
+	int phdrlen = sizeof(struct paste_hdr);
+	char *p = paddr;
+
+	/* make log */
+	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
+	/* position log */
+	if (unlikely(plen > dbsiz - phdrlen - pos))
+		pos = 0;
+	p += phdrlen + pos;
+	*(uint64_t *)p = pst_ent;
+	//_mm_clflushopt(p);
+	//sfence(dbi->fdel);
+	_mm_clflush(p);
+	return pos + plen;
+}
+
+static inline size_t
+copy_log(char *paddr, size_t pos, size_t dbsiz, char *buf,
+		size_t off, size_t len)
+{
+	char *p;
+	int mlen = sizeof(uint64_t);
+	int phdrlen = sizeof(struct paste_hdr);
+	u_int i = 0;
+
+	/* Do we have a space? */
+	if (unlikely(len + mlen > dbsiz - phdrlen - pos)) {
+		pos = 0;
+	}
+	p = paddr + phdrlen + pos;
+	p += mlen; // leave a log space
+
+	memcpy(p, buf, len);
+	for (; i < len; i += CACHE_LINE_SIZE){
+		_mm_clflush(p + i);
+	}
+	//sfence(dbi->fdel);
+	p -= mlen;
+	*(uint64_t *)p = len;
+	_mm_clflush(p);
+	return pos + len + mlen;
+}
+
 /* We assume GET/POST appears in the beginning of netmap buffer */
 int
 do_nm_ring(struct nm_targ *targ, int ring_nr)
@@ -644,6 +693,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			else if (clen > thisclen) {
 				*fde = clen - thisclen;
 			}
+log:
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
@@ -653,37 +703,15 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 						tp->extra_cur = 0;
 						tp->cur = 0; /* clear log too */
 					}
-
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
 						_mm_clflush(rxbuf + i);
 					}
 					//sfence(dbi->fdel);
 					if (dbi->paddr) {
-						uint64_t pst_ent;
-						int plen = sizeof(pst_ent);
-						int phdrlen =
-						    sizeof(struct paste_hdr);
-						char *p = dbi->paddr;
-
-						/* make log */
-						pst_ent = (uint64_t)
-						    rxs->buf_idx << 32 |
-						    off << 16 | len;
-
-						/* position log */
-						if (unlikely(plen > dbi->dbsiz -
-					      	    phdrlen - tp->cur))
-							tp->cur = 0;
-						p += phdrlen + tp->cur;
-
-						/* flush log */
-						*(uint64_t *)p = pst_ent;
-						//_mm_clflushopt(p);
-						//sfence(dbi->fdel);
-						clflush(p);
-	
-						tp->cur += plen;
+						tp->cur = paste_log(dbi->paddr,
+							tp->cur, dbi->dbsiz,
+							rxs, off, len);
 					}
 
 					/* swap out buffer */
@@ -695,32 +723,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 					tp->extra_cur++;
 
 				} else if (dbi->paddr && dbi->pm) {
-					char *p;
-					int mlen = sizeof(uint64_t);
-					int phdrlen = sizeof(struct paste_hdr);
-					u_int i = 0;
-
-					/* Do we have a space? */
-					if (unlikely(len + mlen >
-					    dbi->dbsiz - phdrlen - tp->cur)) {
-						tp->cur = 0;
-					}
-					p = dbi->paddr + phdrlen + tp->cur;
-					p += mlen; // leave a log space
-
-					/* copy data buffer */
-					memcpy(p, rxbuf, len);
-					for (; i < len; i += CACHE_LINE_SIZE) {
-						_mm_clflush(p + i);
-					}
-					//sfence(dbi->fdel);
-
-					p -= mlen; /* the log space */
-					*(uint64_t *)p = len;
-					//_mm_clflushopt(p);
-					//sfence(dbi->fdel);
-					_mm_clflush(p);
-					tp->cur += len + mlen;
+					tp->cur = copy_log(dbi->paddr, tp->cur,
+						dbi->dbsiz, rxbuf, off, len);
 				} else if (dbi->paddr) { // nvme
 					char *p;
 					u_long d, aligned = len;
@@ -750,10 +754,11 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 						return -1;
 					}
 				}
-
 			}
-			if (!*fde)
+			if (*fde == 0) {
 				goto get;
+			}
+
 		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
 get:
 			if (dbi->httplen) { // use cache
@@ -776,8 +781,7 @@ get:
 					RD(1, "negative leftover to %d", *fde);
 					*fde = 0;
 				}
-				goto get;
-
+				goto log;
 			}
 		}
 	}
