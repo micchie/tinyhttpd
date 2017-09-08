@@ -203,6 +203,20 @@ struct thpriv {
 };
 #define DEFAULT_NFDS	1024
 
+static inline uint32_t
+get_extra(struct thpriv *tp)
+{
+	uint32_t ret;
+
+	ret = tp->extra_cur++;
+
+	if (unlikely(tp->extra_cur == tp->extra_num)) {
+		tp->extra_cur = 0;
+		tp->cur = 0; //clear log too
+	}
+	return ret;
+}
+
 /* overflow some */
 static inline void
 set_rubbish(char *buf, int len)
@@ -633,20 +647,20 @@ paste_log(char *paddr, size_t pos, size_t dbsiz, struct netmap_slot *slot,
 }
 
 static inline size_t
-copy_log(char *paddr, size_t pos, size_t dbsiz, char *buf,
+copy_and_log(char *paddr, size_t pos, size_t dbsiz, char *buf,
 		size_t off, size_t len)
 {
 	char *p;
 	int mlen = sizeof(uint64_t);
-	int phdrlen = sizeof(struct paste_hdr);
+	int phdrlen = sizeof(struct paste_hdr); // dummy common metadata header
 	u_int i = 0;
 
 	/* Do we have a space? */
-	if (unlikely(len + mlen > dbsiz - phdrlen - pos)) {
+	if (unlikely(phdrlen + pos + len + mlen > dbsiz)) {
 		pos = 0;
 	}
 	p = paddr + phdrlen + pos;
-	p += mlen; // leave a log space
+	p += mlen; // leave a log entry space
 
 	memcpy(p, buf, len);
 	for (; i < len; i += CACHE_LINE_SIZE){
@@ -697,12 +711,8 @@ log:
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
+					uint32_t extra_i = get_extra(tp);
 
-					if (unlikely(tp->extra_cur ==
-					    tp->extra_num)) {
-						tp->extra_cur = 0;
-						tp->cur = 0; /* clear log too */
-					}
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
 						_mm_clflush(rxbuf + i);
@@ -716,20 +726,18 @@ log:
 
 					/* swap out buffer */
 					i = rxs->buf_idx;
-					rxs->buf_idx = tp->extra[tp->extra_cur];
+					rxs->buf_idx = tp->extra[extra_i];
 					rxs->flags |= NS_BUF_CHANGED;
-
-					tp->extra[tp->extra_cur] = i;
-					tp->extra_cur++;
+					tp->extra[extra_i] = i;
 
 				} else if (dbi->paddr && dbi->pm) {
-					tp->cur = copy_log(dbi->paddr, tp->cur,
+					tp->cur = copy_and_log(dbi->paddr, tp->cur,
 						dbi->dbsiz, rxbuf, off, len);
 				} else if (dbi->paddr) { // nvme
 					char *p;
 					u_long d, aligned = len;
 					int mlen = sizeof(uint64_t);
-					/* XXX omit phdrlen */
+					/* XXX omit header */
 
 					/* one page per item */
 					d = (len & (dbi->pgsiz - 1));
@@ -860,7 +868,7 @@ readmmap:
 				} else {
 					memcpy(p, rxbuf, len);
 				}
-				log_ent[0] = len;
+				log_ent[0] = len; // log
 
 				p -= sizeof(log_ent);
 				memcpy(p, log_ent, sizeof(log_ent));
