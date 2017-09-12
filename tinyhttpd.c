@@ -60,6 +60,12 @@
 #include<sched.h>
 #include "nmlib.h"
 
+#ifdef WITH_BPLUS
+#include <bplus_support.h>
+#include <bplus_common.h>
+#endif /* WITH_BPLUS */
+
+
 #define container_of(ptr, type, member) ({          \
 		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		(type *)( (char *)__mptr - offsetof(type,member) );})
