@@ -171,12 +171,16 @@ struct dbinfo {
 	};
 	u_int pgsiz;
 	char *paddr;
+#ifdef WITH_BPLUS
+	gfile_t *vp;
+#endif /* WITH_BPLUS */
 	int fdel;
 	int pm;
 	size_t dbsiz;
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READMMAP	0x2
 #define DBI_FLAGS_PASTE		0x4
+#define DBI_FLAGS_BPLUS		0x8
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
@@ -630,6 +634,22 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+#ifdef WITH_BPLUS
+static inline void
+paste_bplus(gfile_t *vp, struct netmap_slot *slot, size_t off, size_t len)
+{
+	//uint64_t pst_ent;
+	static int unique = 0;
+	btree_key key;
+	int rc;
+
+	key = rand() % (1000000);
+	rc = btree_insert(vp, key, slot->buf_idx);
+	if (rc == 0)
+		unique++;
+}
+#endif /* WITH_BPLUS */
+
 static inline size_t
 paste_log(char *paddr, size_t pos, size_t dbsiz, struct netmap_slot *slot,
 		size_t off, size_t len)
@@ -725,7 +745,12 @@ log:
 						_mm_clflush(rxbuf + i);
 					}
 					//sfence(dbi->fdel);
-					if (dbi->paddr) {
+#ifdef WITH_BPLUS
+					if (dbi->vp) {
+						paste_bplus(dbi->vp, rxs, rxs->offset, rxs->len);
+					} else
+#endif
+				       	if (dbi->paddr) {
 						tp->cur = paste_log(dbi->paddr,
 							tp->cur, dbi->dbsiz,
 							rxs, off, len);
@@ -1132,7 +1157,7 @@ main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:B")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1203,6 +1228,11 @@ main(int argc, char **argv)
 		case 'F':
 			dbi.fdel = atoi(optarg);
 			break;
+#ifdef WITH_BPLUS
+		case 'B':
+			dbi.flags |= DBI_FLAGS_BPLUS;
+			break;
+#endif /* WITH_BPLUS */
 		}
 
 	}
@@ -1226,7 +1256,13 @@ main(int argc, char **argv)
 
 	if (!port || !dbi.msglen)
 		usage();
-
+#ifdef WITH_BPLUS
+	if (dbi.type == DT_DUMB && (dbi.flags & DBI_FLAGS_BPLUS)) {
+		int rc;
+		rc = btree_create_btree(dbi.path, &dbi.vp);
+		D("btree_create_btree() done (%d)", rc);
+	} else
+#endif /* WITH_BPLUS */
 	if (dbi.type == DT_DUMB) {
 		unlink(dbi.path);
 		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
