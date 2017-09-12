@@ -524,7 +524,7 @@ nm_start(struct nm_garg *g)
 	}
 #ifdef WITH_EXTMEM
 	if (g->extmem) {
-		base_nmd.nr_cmd = NETMAP_POOLS_CREATE;
+		base_nmd.nr_cmd2 = NETMAP_POOLS_CREATE;
 		if (g->extra_bufs)
 			base_nmd.nr_arg4 = base_nmd.nr_arg3;
                 memcpy((void *)&base_nmd.nr_arg1, &g->extmem, sizeof(void *));

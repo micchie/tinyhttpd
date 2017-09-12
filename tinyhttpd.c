@@ -715,6 +715,7 @@ log:
 
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
+						//__builtin_prefetch(rxbuf + i + CACHE_LINE_SIZE);
 						_mm_clflush(rxbuf + i);
 					}
 					//sfence(dbi->fdel);
@@ -1221,6 +1222,7 @@ main(int argc, char **argv)
 		usage();
 
 	if (dbi.type == DT_DUMB) {
+		unlink(dbi.path);
 		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
 		if (dbi.dumbfd < 0) {
 			perror("open");
