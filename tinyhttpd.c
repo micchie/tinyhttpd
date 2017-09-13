@@ -558,7 +558,7 @@ generate_http_nm(int content_length, struct netmap_ring *ring, int virt_header,
 }
 
 static int
-parse_post(char *post, int *coff)
+parse_post(char *post, int *coff, uint64_t *key)
 {
 	int clen;
 	char *pp, *p = strstr(post, "Content-Length: ");
@@ -573,6 +573,7 @@ parse_post(char *post, int *coff)
 	if (unlikely(!pp))
 		return -1;
 	pp += 4;
+	*key = *(uint64_t *)pp;
 	*coff = pp - post;
 	return clen;
 }
@@ -636,17 +637,17 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 
 #ifdef WITH_BPLUS
 static inline void
-paste_bplus(gfile_t *vp, struct netmap_slot *slot, size_t off, size_t len)
+paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
 {
 	//uint64_t pst_ent;
 	static int unique = 0;
-	btree_key key;
 	int rc;
 
-	key = rand() % (1000000);
+	//key = rand() % (1000000);
 	rc = btree_insert(vp, key, slot->buf_idx);
 	if (rc == 0)
 		unique++;
+	RD(1, "unique %d", unique);
 }
 #endif /* WITH_BPLUS */
 
@@ -725,7 +726,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	       	len = rxs->len - off;
 
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
-			int coff, clen = parse_post(rxbuf, &coff);
+			uint64_t key;
+			int coff, clen = parse_post(rxbuf, &coff, &key);
 			int thisclen = len - coff;
 
 			if (unlikely(clen < 0))
@@ -747,7 +749,7 @@ log:
 					//sfence(dbi->fdel);
 #ifdef WITH_BPLUS
 					if (dbi->vp) {
-						paste_bplus(dbi->vp, rxs, rxs->offset, rxs->len);
+						paste_bplus(dbi->vp, key, rxs, rxs->offset, rxs->len);
 					} else
 #endif
 				       	if (dbi->paddr) {
@@ -803,10 +805,10 @@ log:
 get:
 			if (dbi->httplen) { // use cache
 				char *http = dbi->http;
-				int len = dbi->httplen;
+				int hlen = dbi->httplen;
 
-				if (copy_to_nm(txr, g->virt_header, http, len,
-						o, o, rxs->fd) < len) {
+				if (copy_to_nm(txr, g->virt_header, http, hlen,
+						o, o, rxs->fd) < hlen) {
 					continue;
 				}
 			} else {
@@ -824,6 +826,8 @@ get:
 				goto log;
 			}
 		}
+		targ->ctr.pkts++;
+		targ->ctr.bytes += len;
 	}
 	rxr->head = rxr->cur = rxcur;
 	return 0;
@@ -856,10 +860,13 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	}
 
 	if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
-		int coff, clen = parse_post(rxbuf, &coff);
+		uint64_t key;
+		int coff, clen = parse_post(rxbuf, &coff, &key);
 
-		if (unlikely(clen < 0))
+		if (unlikely(clen < 0)) {
+			D("invalid clen");
 			return 0;
+		}
 readmmap:
 		if (dbi->type == DT_DUMB) {
 			uint64_t log_ent[8]; // cache-line align
@@ -890,7 +897,7 @@ readmmap:
 					if (!strncmp(p, "POST ", POST_LEN)) {
 						int coff, clen;
 
-					       	clen = parse_post(p, &coff);
+					       	clen = parse_post(p, &coff, &key);
 						if (unlikely(clen < 0))
 							return 0;
 					} else if (!strncmp(p, "GET ", GET_LEN))
@@ -907,8 +914,9 @@ readmmap:
 
 				if (dbi->pm) {
 					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-						_mm_clflush(p + j);
+				//		_mm_clflush(p + j);
 					}
+					RD(1, "noclflush");
 					//mfence(dbi->fdel);
 				} else {
 					if (msync(p, len, MS_SYNC))
