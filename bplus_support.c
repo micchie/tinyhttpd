@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <x86intrin.h>
 
 #include <bplus_support.h>
 
@@ -185,6 +186,10 @@ bdwrite (gbuf_t *bp)
 	 *
 	 */
 
+	int i;
+	for (i = 0; i < 4096; i+=64) {
+		_mm_clflush(bp->b_data+i);
+	}
 	brelse (bp);
 }
 
