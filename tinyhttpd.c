@@ -1403,6 +1403,7 @@ error:
 		if (dbi.flags & DBI_FLAGS_PASTE) {
 			int fd;
 
+			unlink(PMEMFILE);
 			fd = dbi.extmemfd = open(PMEMFILE,
 					O_RDWR|O_CREAT, S_IRWXU);
 	                if (fd < 0) {
