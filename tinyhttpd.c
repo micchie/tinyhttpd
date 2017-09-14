@@ -78,6 +78,7 @@
 //#define EXTRA_BUF_NUM	3000000
 #define PMEMFILE         "/mnt/pmem/netmap_mem"
 #endif /* WITH_STACKMAP */
+#define IPV4TCP_HDRLEN	66
 
 #define MAX_PAYLOAD	1400
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
@@ -225,6 +226,13 @@ get_extra(struct thpriv *tp)
 		tp->cur = 0; //clear log too
 	}
 	return ret;
+}
+
+static inline size_t
+get_aligned(size_t len, size_t align)
+{
+	size_t d = len & (align - 1);
+	return d ? len + align - d : len;
 }
 
 /* overflow some */
@@ -651,11 +659,12 @@ paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 }
 #endif /* WITH_BPLUS */
 
-static inline size_t
-paste_log(char *paddr, size_t pos, size_t dbsiz, struct netmap_slot *slot,
+static inline void
+paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 		size_t off, size_t len)
 {
 	uint64_t pst_ent;
+	size_t cur = *pos;
 	int plen = sizeof(pst_ent);
 	int phdrlen = sizeof(struct paste_hdr);
 	char *p = paddr;
@@ -663,41 +672,39 @@ paste_log(char *paddr, size_t pos, size_t dbsiz, struct netmap_slot *slot,
 	/* make log */
 	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
 	/* position log */
-	if (unlikely(plen > dbsiz - phdrlen - pos))
-		pos = 0;
-	p += phdrlen + pos;
+	if (unlikely(plen > dbsiz - phdrlen - cur))
+		cur = 0;
+	p += phdrlen + cur;
 	*(uint64_t *)p = pst_ent;
-	//_mm_clflushopt(p);
-	//sfence(dbi->fdel);
 	_mm_clflush(p);
-	return pos + plen;
+	*pos = cur + plen;
 }
 
-static inline size_t
-copy_and_log(char *paddr, size_t pos, size_t dbsiz, char *buf,
+static inline void
+copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		size_t off, size_t len)
 {
 	char *p;
 	int mlen = sizeof(uint64_t);
+	size_t cur = *pos;
 	int phdrlen = sizeof(struct paste_hdr); // dummy common metadata header
 	u_int i = 0;
 
 	/* Do we have a space? */
-	if (unlikely(phdrlen + pos + len + mlen > dbsiz)) {
-		pos = 0;
+	if (unlikely(phdrlen + cur + len + mlen > dbsiz)) {
+		cur = 0;
 	}
-	p = paddr + phdrlen + pos;
+	p = paddr + phdrlen + cur;
 	p += mlen; // leave a log entry space
 
 	memcpy(p, buf, len);
 	for (; i < len; i += CACHE_LINE_SIZE){
 		_mm_clflush(p + i);
 	}
-	//sfence(dbi->fdel);
 	p -= mlen;
 	*(uint64_t *)p = len;
 	_mm_clflush(p);
-	return pos + len + mlen;
+	*pos = cur + len + mlen;
 }
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
@@ -713,6 +720,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
+	size_t dbsiz = dbi->dbsiz;
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
@@ -727,8 +735,10 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			uint64_t key;
+			int thisclen;
 			int coff, clen = parse_post(rxbuf, &coff, &key);
-			int thisclen = len - coff;
+
+			thisclen = len - coff;
 
 			if (unlikely(clen < 0))
 				continue;
@@ -743,19 +753,17 @@ log:
 
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
-						//__builtin_prefetch(rxbuf + i + CACHE_LINE_SIZE);
 						_mm_clflush(rxbuf + i);
 					}
-					//sfence(dbi->fdel);
 #ifdef WITH_BPLUS
 					if (dbi->vp) {
-						paste_bplus(dbi->vp, key, rxs, rxs->offset, rxs->len);
+						paste_bplus(dbi->vp, key, rxs,
+							rxs->offset, rxs->len);
 					} else
 #endif
 				       	if (dbi->paddr) {
-						tp->cur = paste_log(dbi->paddr,
-							tp->cur, dbi->dbsiz,
-							rxs, off, len);
+						paste_wal(dbi->paddr, &tp->cur,
+						    dbsiz, rxs, off, len);
 					}
 
 					/* swap out buffer */
@@ -765,32 +773,27 @@ log:
 					tp->extra[extra_i] = i;
 
 				} else if (dbi->paddr && dbi->pm) {
-					tp->cur = copy_and_log(dbi->paddr, tp->cur,
-						dbi->dbsiz, rxbuf, off, len);
+					copy_and_log(dbi->paddr, &tp->cur,
+						dbsiz, rxbuf, off, len);
 				} else if (dbi->paddr) { // nvme
 					char *p;
-					u_long d, aligned = len;
+					u_long aligned;
 					int mlen = sizeof(uint64_t);
 					/* XXX omit header */
 
 					/* one page per item */
-					d = (len & (dbi->pgsiz - 1));
-					if (d)
-						aligned = len + dbi->pgsiz - d;
-					if (tp->cur + aligned > dbi->dbsiz)
+					aligned = get_aligned(len, dbi->pgsiz);
+					if (tp->cur + aligned > dbsiz)
 						tp->cur = 0;
-					p = dbi->paddr + tp->cur;
-					p += mlen;
-
+					p = dbi->paddr + tp->cur + mlen;
 					memcpy(p, rxbuf, len);
-
 					p -= mlen;
 					*(uint64_t *)p = len;
 					if (msync(p, len, MS_SYNC))
 						perror("msync");
 					tp->cur += aligned;
 				} else {
-					if (writesync(rxbuf, len, dbi->dbsiz,
+					if (writesync(rxbuf, len, dbsiz,
 					    dbi->dumbfd, &tp->cur,
 					    dbi->flags & DBI_FLAGS_FDSYNC)) {
 						return -1;
@@ -826,8 +829,7 @@ get:
 				goto log;
 			}
 		}
-		targ->ctr.pkts++;
-		targ->ctr.bytes += len;
+		nm_update_ctr(targ, 1, len);
 	}
 	rxr->head = rxr->cur = rxcur;
 	return 0;
@@ -864,7 +866,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		int coff, clen = parse_post(rxbuf, &coff, &key);
 
 		if (unlikely(clen < 0)) {
-			D("invalid clen");
+			RD(1, "invalid clen");
 			return 0;
 		}
 readmmap:
@@ -876,9 +878,7 @@ readmmap:
 				int j, space = len ? len : dbi->pgsiz;
 
 				if (!dbi->pm) {
-					int d = (len & (dbi->pgsiz-1));
-					if (d)
-						space = len + dbi->pgsiz - d;
+					space = get_aligned(len, dbi->pgsiz);
 				}
 				if (tp->cur + space  > dbi->dbsiz)
 					tp->cur = 0;
@@ -887,7 +887,7 @@ readmmap:
 
 				if (dbi->flags & DBI_FLAGS_READMMAP) {
 					len = read(fd, p, space);
-					if (len < 0) {
+					if (unlikely(len < 0)) {
 						perror("read");
 						return -1;
 					} else if (len == 0) {
@@ -897,7 +897,8 @@ readmmap:
 					if (!strncmp(p, "POST ", POST_LEN)) {
 						int coff, clen;
 
-					       	clen = parse_post(p, &coff, &key);
+					       	clen =
+						    parse_post(p, &coff, &key);
 						if (unlikely(clen < 0))
 							return 0;
 					} else if (!strncmp(p, "GET ", GET_LEN))
@@ -916,7 +917,6 @@ readmmap:
 					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
 						_mm_clflush(p + j);
 					}
-					//mfence(dbi->fdel);
 				} else {
 					if (msync(p, len, MS_SYNC))
 						perror("msync");
@@ -1244,16 +1244,6 @@ main(int argc, char **argv)
 
 	}
 
-	if (dbi.httplen) { // preallocate HTTP header
-		dbi.http = calloc(1, MAX_HTTPLEN);
-		if (!dbi.http) {
-			perror("calloc");
-			usage();
-		}
-		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
-		D("preallocated http %d", dbi.httplen);
-	}
-
 	fprintf(stderr, "%s built %s %s db: %s\n",
 		argv[0], __DATE__, __TIME__, dbi.path ? dbi.path : "none");
 	usleep(1000);
@@ -1263,7 +1253,20 @@ main(int argc, char **argv)
 
 	if (!port || !dbi.msglen)
 		usage();
+
+	/* Preallocate HTTP header ? */
+	if (dbi.httplen) {
+		dbi.http = calloc(1, MAX_HTTPLEN);
+		if (!dbi.http) {
+			perror("calloc");
+			usage();
+		}
+		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
+		D("preallocated http %d", dbi.httplen);
+	}
+
 #ifdef WITH_BPLUS
+	/* B+tree ? */
 	if (dbi.type == DT_DUMB && (dbi.flags & DBI_FLAGS_BPLUS)) {
 		int rc;
 		rc = btree_create_btree(dbi.path, &dbi.vp);

@@ -18,7 +18,6 @@
 #define VIRT_HDR_1	10	/* length of a base vnet-hdr */
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
-#define IPV4TCP_HDRLEN	66
 #define MAP_HUGETLB	0x40000
 
 enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
@@ -126,6 +125,13 @@ struct nm_targ {
 	pthread_t thread;
 	void *td_private;
 };
+
+static inline void
+nm_update_ctr(struct nm_targ *targ, int npkts, int nbytes)
+{
+	targ->ctr.pkts += npkts;
+	targ->ctr.bytes += nbytes;
+}
 
 static struct nm_targ *targs;
 static int global_nthreads;
