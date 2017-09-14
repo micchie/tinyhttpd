@@ -24,9 +24,9 @@ function str(x)
 end
 
 init = function(args)
-	plen = 768
+	plen = 1280
 	hlen = 8
-	fillarray(x, 10)
+	fillarray(x, 2000)
 	--[[
 	shufarray(x, #x)
 	local f = io.open("random-1m.txt", "r")
@@ -69,4 +69,3 @@ request = function()
 	return requests[x[counter] ]
 	]]
 end
-

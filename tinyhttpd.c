@@ -914,9 +914,8 @@ readmmap:
 
 				if (dbi->pm) {
 					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-				//		_mm_clflush(p + j);
+						_mm_clflush(p + j);
 					}
-					RD(1, "noclflush");
 					//mfence(dbi->fdel);
 				} else {
 					if (msync(p, len, MS_SYNC))
