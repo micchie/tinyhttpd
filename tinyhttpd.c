@@ -845,20 +845,27 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #endif
 	ssize_t len = 0;
 	struct thpriv *tp = targ->td_private;
+	size_t max;
+	char *paddr = dbi->paddr;
 
 	rxbuf = txbuf = buf;
 	if (dbi->flags & DBI_FLAGS_READMMAP) {
-		goto readmmap;
+		max = dbi->dbsiz - tp->cur;
+		if (max < dbi->pgsiz)
+			tp->cur = 0;
+		rxbuf = paddr + tp->cur + sizeof(uint64_t);
+		max -= sizeof(uint64_t);
 	} else {
-		len = read(fd, rxbuf, sizeof(buf));
-		if (len == 0) {
-			close(fd);
-			return 0;
-		} else if (len < 0) {
-			//perror("read");
-			close(fd);
-			return -1;
-		}
+		max = sizeof(buf);
+	}
+	len = read(fd, rxbuf, max);
+	if (len == 0) {
+		close(fd);
+		return 0;
+	} else if (len < 0) {
+		//perror("read");
+		close(fd);
+		return -1;
 	}
 
 	if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
@@ -869,59 +876,40 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			RD(1, "invalid clen");
 			return 0;
 		}
-readmmap:
 		if (dbi->type == DT_DUMB) {
-			uint64_t log_ent[8]; // cache-line align
-
-			if (dbi->paddr) {
+			if (paddr) {
 				char *p;
-				int j, space = len ? len : dbi->pgsiz;
+				int j, space = len + sizeof(uint64_t);
 
-				if (!dbi->pm) {
-					space = get_aligned(len, dbi->pgsiz);
+				if (!dbi->pm) { // for msync()
+					space = get_aligned(space, dbi->pgsiz);
 				}
-				if (tp->cur + space  > dbi->dbsiz)
-					tp->cur = 0;
-				p = dbi->paddr + tp->cur;
-				p += sizeof(log_ent);
-
-				if (dbi->flags & DBI_FLAGS_READMMAP) {
-					len = read(fd, p, space);
-					if (unlikely(len < 0)) {
-						perror("read");
-						return -1;
-					} else if (len == 0) {
-						close(fd);
-						return 0;
-					}
-					if (!strncmp(p, "POST ", POST_LEN)) {
-						int coff, clen;
-
-					       	clen =
-						    parse_post(p, &coff, &key);
-						if (unlikely(clen < 0))
-							return 0;
-					} else if (!strncmp(p, "GET ", GET_LEN))
-						goto gen_httpok;
-					else
-						return -1; /* next pos stays */
+				if (dbi->flags & DBI_FLAGS_READMMAP){
+					p = rxbuf + sizeof(uint64_t);
 				} else {
+					if (tp->cur + space  > dbi->dbsiz)
+						tp->cur = 0;
+					p = paddr + tp->cur;
+					p += sizeof(uint64_t);
 					memcpy(p, rxbuf, len);
 				}
-				log_ent[0] = len; // log
-
-				p -= sizeof(log_ent);
-				memcpy(p, log_ent, sizeof(log_ent));
-
 				if (dbi->pm) {
 					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
 						_mm_clflush(p + j);
 					}
 				} else {
-					if (msync(p, len, MS_SYNC))
+					if (msync(p - sizeof(uint64_t),
+					    len, MS_SYNC)) {
 						perror("msync");
-					len = dbi->pgsiz;
+					}
 				}
+				p -= sizeof(uint64_t);
+				*(size_t *)p = len;
+				/* comment out below because this experiment
+				 * doesn't need to be proper wal */
+				//if (msync(p, sizeof(uint64_t), MS_SYNC)) {
+				//	perror("msync");
+				//}
 				tp->cur += space;
 			} else {
 				if (writesync(rxbuf, len, dbi->dbsiz,
