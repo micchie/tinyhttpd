@@ -77,8 +77,10 @@
 //#define EXTRA_BUF_NUM	160000
 //#define EXTRA_BUF_NUM	3000000
 #define PMEMFILE         "/mnt/pmem/netmap_mem"
+#define BPLUSFILE	"/mnt/pmem/bplus"
 #endif /* WITH_STACKMAP */
 #define IPV4TCP_HDRLEN	66
+#define NETMAP_BUF_SIZE	2048
 
 #define MAX_PAYLOAD	1400
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
@@ -172,9 +174,7 @@ struct dbinfo {
 	};
 	u_int pgsiz;
 	char *paddr;
-#ifdef WITH_BPLUS
-	gfile_t *vp;
-#endif /* WITH_BPLUS */
+	void *vp; // gfile_t
 	int fdel;
 	int pm;
 	size_t dbsiz;
@@ -647,15 +647,15 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 static inline void
 paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
 {
-	//uint64_t pst_ent;
+	uint64_t pst_ent;
 	static int unique = 0;
 	int rc;
 
 	//key = rand() % (1000000);
-	rc = btree_insert(vp, key, slot->buf_idx);
+	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
+	rc = btree_insert(vp, key, pst_ent);
 	if (rc == 0)
 		unique++;
-	RD(1, "unique %d", unique);
 }
 #endif /* WITH_BPLUS */
 
@@ -682,13 +682,19 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 
 static inline void
 copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
-		size_t off, size_t len)
+		size_t off, size_t len, void *vp, void *key_p)
 {
 	char *p;
-	int mlen = sizeof(uint64_t);
+	int mlen = vp ? 0 : sizeof(uint64_t);
 	size_t cur = *pos;
 	int phdrlen = sizeof(struct paste_hdr); // dummy common metadata header
 	u_int i = 0;
+
+#ifdef WITH_BPLUS
+	if (vp) {
+		len = get_aligned(len, NETMAP_BUF_SIZE);
+	}
+#endif /* WITH_BPLUS */
 
 	/* Do we have a space? */
 	if (unlikely(phdrlen + cur + len + mlen > dbsiz)) {
@@ -702,8 +708,20 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		_mm_clflush(p + i);
 	}
 	p -= mlen;
-	*(uint64_t *)p = len;
-	_mm_clflush(p);
+#ifdef WITH_BPLUS
+	if (vp) {
+		static int unique = 0;
+		int rc;
+
+		rc = btree_insert(vp, *(btree_key *)key_p, cur);
+		if (rc == 0)
+			unique++;
+	} else
+#endif
+	{
+		*(uint64_t *)p = len;
+		_mm_clflush(p);
+	}
 	*pos = cur + len + mlen;
 }
 
@@ -774,7 +792,8 @@ log:
 
 				} else if (dbi->paddr && dbi->pm) {
 					copy_and_log(dbi->paddr, &tp->cur,
-						dbsiz, rxbuf, off, len);
+						dbsiz, rxbuf, off, len,
+						dbi->vp, &key);
 				} else if (dbi->paddr) { // nvme
 					char *p;
 					u_long aligned;
@@ -1257,11 +1276,12 @@ main(int argc, char **argv)
 	/* B+tree ? */
 	if (dbi.type == DT_DUMB && (dbi.flags & DBI_FLAGS_BPLUS)) {
 		int rc;
-		rc = btree_create_btree(dbi.path, &dbi.vp);
+		rc = btree_create_btree(BPLUSFILE, ((gfile_t **)&dbi.vp));
 		D("btree_create_btree() done (%d)", rc);
-	} else
+	}
 #endif /* WITH_BPLUS */
-	if (dbi.type == DT_DUMB) {
+	if (dbi.type == DT_DUMB &&
+	    !(dbi.flags & DBI_FLAGS_BPLUS && dbi.flags & DBI_FLAGS_PASTE)) {
 		unlink(dbi.path);
 		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
 		if (dbi.dumbfd < 0) {

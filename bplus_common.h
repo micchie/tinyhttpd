@@ -9,7 +9,7 @@
 
 #include <bplus_support.h>
 
-#define TREE_TYPE int32_t
+#define TREE_TYPE uint64_t
 
 #define ASSERT assert
 #define VERIFY assert
