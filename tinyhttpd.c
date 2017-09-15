@@ -84,6 +84,7 @@
 
 #define MAX_PAYLOAD	1400
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
+#define max(a, b) (((a) > (b)) ? (a) : (b)) 
 
 #ifndef D
 #define D(fmt, ...) \
@@ -682,30 +683,42 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 
 static inline void
 copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
-		size_t off, size_t len, void *vp, void *key_p)
+		size_t len, int nowrap, int align, int pm, void *vp, void *key_p)
 {
 	char *p;
 	int mlen = vp ? 0 : sizeof(uint64_t);
 	size_t cur = *pos;
 	int phdrlen = sizeof(struct paste_hdr); // dummy common metadata header
 	u_int i = 0;
+	size_t aligned = len;
 
+	RD(1, "pos %lu len %lu vp %p", *pos, len, vp);
 #ifdef WITH_BPLUS
 	if (vp) {
-		len = get_aligned(len, NETMAP_BUF_SIZE);
+		align = NETMAP_BUF_SIZE;
 	}
 #endif /* WITH_BPLUS */
+	if (align) {
+		aligned = get_aligned(len, align);
+	}
 
 	/* Do we have a space? */
-	if (unlikely(phdrlen + cur + len + mlen > dbsiz)) {
+	if (unlikely(phdrlen + cur + max(aligned, nowrap) + mlen > dbsiz)) {
 		cur = 0;
 	}
 	p = paddr + phdrlen + cur;
 	p += mlen; // leave a log entry space
 
-	memcpy(p, buf, len);
-	for (; i < len; i += CACHE_LINE_SIZE){
-		_mm_clflush(p + i);
+	if (buf)
+		memcpy(p, buf, len);
+	if (pm) {
+		for (; i < len; i += CACHE_LINE_SIZE){
+			_mm_clflush(p + i);
+		}
+	} else {
+		int error = msync(p, len, MS_SYNC);
+		if (error)
+			perror("msync");
 	}
 	p -= mlen;
 #ifdef WITH_BPLUS
@@ -713,16 +726,21 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		static int unique = 0;
 		int rc;
 
-		rc = btree_insert(vp, *(btree_key *)key_p, cur);
+		rc = btree_insert(vp, *(btree_key *)key_p,
+				(uint32_t)cur / NETMAP_BUF_SIZE);
 		if (rc == 0)
 			unique++;
 	} else
 #endif
 	{
 		*(uint64_t *)p = len;
-		_mm_clflush(p);
+		if (pm)
+			_mm_clflush(p);
+		//else {
+		//	msync(p, sizeof(size_t), MS_SYNC);
+		//}
 	}
-	*pos = cur + len + mlen;
+	*pos = cur + aligned + mlen;
 }
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
@@ -739,6 +757,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
 	size_t dbsiz = dbi->dbsiz;
+	char *paddr = dbi->paddr;
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
@@ -779,8 +798,8 @@ log:
 							rxs->offset, rxs->len);
 					} else
 #endif
-				       	if (dbi->paddr) {
-						paste_wal(dbi->paddr, &tp->cur,
+				       	if (paddr) {
+						paste_wal(paddr, &tp->cur,
 						    dbsiz, rxs, off, len);
 					}
 
@@ -790,27 +809,11 @@ log:
 					rxs->flags |= NS_BUF_CHANGED;
 					tp->extra[extra_i] = i;
 
-				} else if (dbi->paddr && dbi->pm) {
-					copy_and_log(dbi->paddr, &tp->cur,
-						dbsiz, rxbuf, off, len,
-						dbi->vp, &key);
-				} else if (dbi->paddr) { // nvme
-					char *p;
-					u_long aligned;
-					int mlen = sizeof(uint64_t);
-					/* XXX omit header */
-
-					/* one page per item */
-					aligned = get_aligned(len, dbi->pgsiz);
-					if (tp->cur + aligned > dbsiz)
-						tp->cur = 0;
-					p = dbi->paddr + tp->cur + mlen;
-					memcpy(p, rxbuf, len);
-					p -= mlen;
-					*(uint64_t *)p = len;
-					if (msync(p, len, MS_SYNC))
-						perror("msync");
-					tp->cur += aligned;
+				} else if (paddr) {
+					copy_and_log(paddr, &tp->cur,
+					    dbsiz, rxbuf + off, len,
+					    len, dbi->pm ? 0 : dbi->pgsiz,
+					    dbi->pm, dbi->vp, &key);
 				} else {
 					if (writesync(rxbuf, len, dbsiz,
 					    dbi->dumbfd, &tp->cur,
@@ -866,12 +869,16 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	struct thpriv *tp = targ->td_private;
 	size_t max;
 	char *paddr = dbi->paddr;
+	int readmmap = !!(dbi->flags & DBI_FLAGS_READMMAP);
 
 	rxbuf = txbuf = buf;
-	if (dbi->flags & DBI_FLAGS_READMMAP) {
-		max = dbi->dbsiz - tp->cur;
-		if (max < dbi->pgsiz)
-			tp->cur = 0;
+	if (readmmap) {
+		size_t cur = tp->cur;
+		max = dbi->dbsiz - sizeof(struct paste_hdr) - cur;
+		if (max < dbi->pgsiz) {
+			cur = 0;
+			max = dbi->dbsiz;
+		}
 		rxbuf = paddr + tp->cur + sizeof(uint64_t);
 		max -= sizeof(uint64_t);
 	} else {
@@ -897,39 +904,10 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		}
 		if (dbi->type == DT_DUMB) {
 			if (paddr) {
-				char *p;
-				int j, space = len + sizeof(uint64_t);
-
-				if (!dbi->pm) { // for msync()
-					space = get_aligned(space, dbi->pgsiz);
-				}
-				if (dbi->flags & DBI_FLAGS_READMMAP){
-					p = rxbuf + sizeof(uint64_t);
-				} else {
-					if (tp->cur + space  > dbi->dbsiz)
-						tp->cur = 0;
-					p = paddr + tp->cur;
-					p += sizeof(uint64_t);
-					memcpy(p, rxbuf, len);
-				}
-				if (dbi->pm) {
-					for (j=0;j<len;j+=CACHE_LINE_SIZE) {
-						_mm_clflush(p + j);
-					}
-				} else {
-					if (msync(p - sizeof(uint64_t),
-					    len, MS_SYNC)) {
-						perror("msync");
-					}
-				}
-				p -= sizeof(uint64_t);
-				*(size_t *)p = len;
-				/* comment out below because this experiment
-				 * doesn't need to be proper wal */
-				//if (msync(p, sizeof(uint64_t), MS_SYNC)) {
-				//	perror("msync");
-				//}
-				tp->cur += space;
+				copy_and_log(paddr, &tp->cur, dbi->dbsiz,
+				    readmmap ? NULL : rxbuf, len,
+				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
+				    dbi->pm, dbi->vp, &key);
 			} else {
 				if (writesync(rxbuf, len, dbi->dbsiz,
 				    dbi->dumbfd, &tp->cur,
@@ -1259,6 +1237,8 @@ main(int argc, char **argv)
 	argv += optind;
 
 	if (!port || !dbi.msglen)
+		usage();
+	else if (dbi.flags & DBI_FLAGS_PASTE && strlen(dbi.ifname) == 0)
 		usage();
 
 	/* Preallocate HTTP header ? */
