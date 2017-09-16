@@ -1305,13 +1305,13 @@ btree_insert (gfile_t *vp, btree_key key, TREE_TYPE datum)
 	cookie.bt_vp = vp;
 	cookie.bt_key = key;
 	cookie.bt_data = datum;
-	cookie.bt_intent = BTREE_LFLAG_INSERT;
+	cookie.bt_intent = BTREE_LFLAG_INSERT | BTREE_LFLAG_UPDATE;
 
 	rc = btree_entry (&cookie);
 	if (rc == BTREE_RC_FOUND)
 		return EEXIST;
 
-	if (rc == BTREE_RC_INSERTED)
+	if (rc == BTREE_RC_INSERTED || rc == BTREE_RC_DONE)
 		return 0;
 
 	assert (0);
