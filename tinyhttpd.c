@@ -587,6 +587,12 @@ parse_post(char *post, int *coff, uint64_t *key)
 	return clen;
 }
 
+static inline uint64_t
+parse_get_key(char *get)
+{
+	return *(uint64_t *)(get + GET_LEN + 1); // jump '/'
+}
+
 static void
 usage(void)
 {
@@ -649,14 +655,18 @@ static inline void
 paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
 {
 	uint64_t pst_ent;
+	//uint64_t datam;
 	static int unique = 0;
 	int rc;
 
-	//key = rand() % (1000000);
 	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
 	rc = btree_insert(vp, key, pst_ent);
 	if (rc == 0)
 		unique++;
+	ND("key %lu val %lu idx %u off %lu len %lu", key, pst_ent, slot->buf_idx, off, len);
+	//btree_lookup(vp, key, &datam);
+	//if (datam != pst_ent)
+	//	D("warning: pst_ent %lu but datam %lu",pst_ent, datam);
 }
 #endif /* WITH_BPLUS */
 
@@ -827,6 +837,21 @@ log:
 			}
 
 		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
+#ifdef WITH_BPLUS
+			uint64_t key = parse_get_key(rxbuf);
+
+			if (dbi->vp && dbi->flags & DBI_FLAGS_PASTE) {
+				uint64_t datam = 0;
+				//uint32_t idx;
+				//uint16_t off, len;
+				btree_lookup(dbi->vp, key, &datam);
+
+				//idx = datam >> 32;
+				//off = (datam & 0x00000000ffff0000) >> 16;
+				//len = datam & 0x000000000000ffff;
+				ND("key %lu val %lu idx %u off %u len %u", key, datam, idx, off, len);
+			}
+#endif
 get:
 			if (dbi->httplen) { // use cache
 				char *http = dbi->http;

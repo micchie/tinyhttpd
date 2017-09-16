@@ -3,7 +3,7 @@ local y = ""
 local setlen = 1280
 local hlen = 8
 local t = setlen - hlen
-local p = 1000000
+local p = 8
 local getlen = 64
 local t2 = getlen - hlen
 
