@@ -19,7 +19,6 @@ request = function()
 	if n < p then
 		wrk.method = "POST"
 		wrk.path = "http://www.micchie.net/"
-		wrk.headers["Content-Type"] = "application/x-www-form-urlencoded"
 		wrk.body = string.format("%-08d%s", n, x)
 	else
 		wrk.method = "GET"
