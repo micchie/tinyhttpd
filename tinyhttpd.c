@@ -843,8 +843,8 @@ log:
 
 			if (dbi->vp && dbi->flags & DBI_FLAGS_PASTE) {
 				uint64_t datam = 0;
-				//uint32_t idx;
-				//uint16_t off, len;
+				uint32_t idx;
+				uint16_t off, len;
 				btree_lookup(dbi->vp, key, &datam);
 
 				//idx = datam >> 32;
