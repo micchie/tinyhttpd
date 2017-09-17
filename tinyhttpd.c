@@ -522,19 +522,21 @@ generate_httphdr(ssize_t content_length, char *buf)
 {
 	char *p = buf;
 	/* From nginx */
-	static char *lines[5] = {"HTTP/1.1 200 OK\r\n",
-	 "Content-Length: ",
-	 "Connection: keep-alive\r\n\r\n"};
-	ssize_t l, l0, l1, l2;
+	static char *lines[5] = {
+	 "HTTP/1.1 200 OK\r\n",
+	 "Connection: keep-alive\r\n",
+	 "Content-Length: "};
+	ssize_t l;
+	const size_t l0 = 17, l1 = 24, l2 = 16;
 
-	l0 = strlen(lines[0]);
+	//l0 = strlen(lines[0]);
 	p = mempcpy(p, lines[0], l0);
-	l1 = strlen(lines[1]);
+	//l1 = strlen(lines[1]);
 	p = mempcpy(p, lines[1], l1);
-	l = sprintf(p, "%lu\r\n", content_length);
-	p += l;
-	l2 = strlen(lines[2]);
+	//l2 = strlen(lines[2]);
 	p = mempcpy(p, lines[2], l2);
+	l = sprintf(p, "%lu\r\n\r\n", content_length);
+	p += l;
 	return p - buf;
 }
 
