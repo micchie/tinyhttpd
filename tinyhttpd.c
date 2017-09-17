@@ -702,7 +702,6 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 	u_int i = 0;
 	size_t aligned = len;
 
-	RD(1, "pos %lu len %lu vp %p", *pos, len, vp);
 #ifdef WITH_BPLUS
 	if (vp) {
 		align = NETMAP_BUF_SIZE;
