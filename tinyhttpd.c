@@ -675,6 +675,7 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 	return txs;
 }
 
+enum {SLOT_INVALID=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 static inline int
 is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
 		u_int extra_num, struct netmap_slot *slot)
@@ -954,9 +955,9 @@ log:
 				_off = (datam & 0x00000000ffff0000) >> 16;
 				_len = datam & 0x000000000000ffff;
 				s = kvs_extract_slot(rxr, idx, off);
-				slot_type = is_slot_extra(rxr, tp->extra, tp->extra_num, s);
+				slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
 
-				if (slot_type == 1) { // on extra
+				if (slot_type == 1) { // on extra, swap in
 					struct netmap_slot *txs;
 					u_int hlen;
 					char *_buf;
@@ -972,6 +973,8 @@ log:
 						D("zero copy done!");
 					}
 					kvs_embed_slot(_buf + off, txs);
+					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, txs);
+					D("afterembedded, slot type %d", slot_type);
 				}
 #endif
 			}
