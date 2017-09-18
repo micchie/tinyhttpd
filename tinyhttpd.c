@@ -183,6 +183,7 @@ struct dbinfo {
 #define DBI_FLAGS_READMMAP	0x2
 #define DBI_FLAGS_PASTE		0x4
 #define DBI_FLAGS_BPLUS		0x8
+#define DBI_FLAGS_KVS		0x10
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
@@ -207,7 +208,11 @@ struct thpriv {
 	uint16_t rxlen;
 	struct nm_ifreq ifreq;
 	struct epoll_event evts[MAXCONNECTIONS];
+#ifdef WITH_KVS
+	struct netmap_slot *extra;
+#else
 	uint32_t *extra;
+#endif
 	uint32_t extra_cur;
 	uint32_t extra_num;
 	int	*fds;
@@ -652,6 +657,80 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+#ifdef WITH_KVS
+static struct netmap_slot *
+set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
+{
+	struct netmap_slot *txs, tmp;
+
+	if (unlikely(nm_ring_space(txr) == 0)) {
+		return NULL;
+	}
+	txs = &txr->slot[txr->cur];
+	tmp = *txs;
+	*txs = *any_slot;
+	txs->flags |= NS_BUF_CHANGED;
+	*any_slot = tmp;
+	txr->cur = txr->head = nm_ring_next(txr, txr->cur);
+	return txs;
+}
+
+static inline int
+is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
+		u_int extra_num, struct netmap_slot *slot)
+{
+	if ((uintptr_t)slot > (uintptr_t)ring->slot && 
+	    (uintptr_t)slot < (uintptr_t)(ring->slot + ring->num_slots))
+		return 0;
+	else if ((uintptr_t)slot > (uintptr_t)extra &&
+	    (uintptr_t)slot < (uintptr_t)(extra + extra_num))
+		return 1;
+	return -1;
+}
+
+//POST http://www.micchie.net/ HTTP/1.1\r\nHost: 192.168.11.3:60000\r\nContent-Length: 1280\r\n\r\n2
+//HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
+#define KVS_SLOT_OFF 55
+static inline void
+kvs_embed_slot(char *buf, struct netmap_slot *slot)
+{
+	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
+}
+
+static inline struct netmap_slot*
+kvs_extract_slot(struct netmap_ring *ring, uint32_t buf_idx, size_t off)
+{
+	char *buf = NETMAP_BUF(ring, buf_idx);
+	return *(struct netmap_slot **)(buf + off + KVS_SLOT_OFF);
+}
+
+ssize_t
+kvs_generate_httphdr(ssize_t content_length, char *buf)
+{
+	char *p = buf;
+	/* From nginx */
+	static char *lines[5] = {
+	 "HTTP/1.1 200 OK\r\n",
+	 "Connection: keep-alive\r\n",
+	 "Server: Apache/2.2.800\r\n",
+	 "Content-Length: "};
+	ssize_t l;
+	const size_t l0 = 17, l1 = 24, l2 = 24, l3 = 16;
+
+	//l0 = strlen(lines[0]);
+	p = mempcpy(p, lines[0], l0);
+	//l1 = strlen(lines[1]);
+	p = mempcpy(p, lines[1], l1);
+	//l2 = strlen(lines[2]);
+	p = mempcpy(p, lines[2], l2);
+	p = mempcpy(p, lines[3], l3);
+	l = sprintf(p, "%lu\r\n\r\n", content_length);
+	p += l;
+	return p - buf;
+}
+
+#endif /* WITH_KVS */
+
 #ifdef WITH_BPLUS
 static inline void
 paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
@@ -669,6 +748,7 @@ paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 	//btree_lookup(vp, key, &datam);
 	//if (datam != pst_ent)
 	//	D("warning: pst_ent %lu but datam %lu",pst_ent, datam);
+	//
 }
 #endif /* WITH_BPLUS */
 
@@ -776,6 +856,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		int o = IPV4TCP_HDRLEN;
 		int off, len;
 		int *fde = &tp->fds[rxs->fd];
+		int thisclen = 0;
 
 		off = g->virt_header + rxs->offset;
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
@@ -783,7 +864,6 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			uint64_t key;
-			int thisclen;
 			int coff, clen = parse_post(rxbuf, &coff, &key);
 
 			thisclen = len - coff;
@@ -797,6 +877,9 @@ log:
 			if (dbi->type == DT_DUMB) {
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
+#ifdef WITH_KVS
+					struct netmap_slot tmp;
+#endif
 					uint32_t extra_i = get_extra(tp);
 
 					/* flush data buffer */
@@ -806,19 +889,33 @@ log:
 #ifdef WITH_BPLUS
 					if (dbi->vp) {
 						paste_bplus(dbi->vp, key, rxs,
-							rxs->offset, rxs->len);
+							off + coff, thisclen);
 					} else
 #endif
 				       	if (paddr) {
 						paste_wal(paddr, &tp->cur,
-						    dbsiz, rxs, off, len);
+						    dbsiz, rxs, off + coff,
+						    thisclen);
 					}
 
 					/* swap out buffer */
+#ifdef WITH_KVS
+					tmp = *rxs;
+					rxs->buf_idx = tp->extra[extra_i].buf_idx;
+					rxs->flags |= NS_BUF_CHANGED;
+					tp->extra[extra_i] = tmp;
+
+					/* record current slot */
+					if (dbi->flags & DBI_FLAGS_KVS) {
+						kvs_embed_slot(rxbuf,
+							&tp->extra[extra_i]);
+					}
+#else
 					i = rxs->buf_idx;
 					rxs->buf_idx = tp->extra[extra_i];
 					rxs->flags |= NS_BUF_CHANGED;
 					tp->extra[extra_i] = i;
+#endif
 
 				} else if (paddr) {
 					copy_and_log(paddr, &tp->cur,
@@ -843,14 +940,40 @@ log:
 
 			if (dbi->vp && dbi->flags & DBI_FLAGS_PASTE) {
 				uint64_t datam = 0;
-				//uint32_t idx;
-				//uint16_t off, len;
+#ifdef WITH_KVS
+				uint32_t idx;
+				uint16_t _off, _len;
+				struct netmap_slot *s;
+				int slot_type;
+#endif
+
 				btree_lookup(dbi->vp, key, &datam);
 
-				//idx = datam >> 32;
-				//off = (datam & 0x00000000ffff0000) >> 16;
-				//len = datam & 0x000000000000ffff;
-				ND("key %lu val %lu idx %u off %u len %u", key, datam, idx, off, len);
+#ifdef WITH_KVS
+				idx = datam >> 32;
+				_off = (datam & 0x00000000ffff0000) >> 16;
+				_len = datam & 0x000000000000ffff;
+				s = kvs_extract_slot(rxr, idx, off);
+				slot_type = is_slot_extra(rxr, tp->extra, tp->extra_num, s);
+
+				if (slot_type == 1) { // on extra
+					struct netmap_slot *txs;
+					u_int hlen;
+					char *_buf;
+
+					ND("key %lu val %lu idx %u off %u len %u slot_type %d", key, datam, idx, _off, _len, slot_type);
+					txs = set_to_nm(txr, s);
+					_buf = NETMAP_BUF(txr, txs->buf_idx);
+					hlen = kvs_generate_httphdr(_len, _buf + off);
+					if (unlikely(hlen != _off - off)) {
+						D("hlen %u _off %u off %u",
+							hlen, _off, off);
+					} else {
+						D("zero copy done!");
+					}
+					kvs_embed_slot(_buf + off, txs);
+				}
+#endif
 			}
 #endif
 get:
@@ -874,6 +997,7 @@ get:
 					RD(1, "negative leftover to %d", *fde);
 					*fde = 0;
 				}
+				thisclen = len;
 				goto log;
 			}
 		}
@@ -1007,7 +1131,11 @@ _worker(void *data)
 			goto quit;
 		}
 		for (i = 0; i < n && next; i++) {
+#ifdef WITH_KVS
+			tp->extra[i].buf_idx = next;
+#else
 			tp->extra[i] = next;
+#endif
 			next = *(uint32_t *)NETMAP_BUF(any_ring, next);
 		}
 		tp->extra_num = i;
@@ -1175,7 +1303,7 @@ main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:B")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:Bk")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1251,6 +1379,11 @@ main(int argc, char **argv)
 			dbi.flags |= DBI_FLAGS_BPLUS;
 			break;
 #endif /* WITH_BPLUS */
+#ifdef WITH_KVS
+		case 'k':
+			dbi.flags |= DBI_FLAGS_KVS;
+			break;
+#endif /* WITH_KVS */
 		}
 
 	}
