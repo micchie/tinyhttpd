@@ -522,6 +522,32 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 	return len;
 }
 
+#ifdef WITH_KVS
+ssize_t
+generate_httphdr(ssize_t content_length, char *buf)
+{
+	char *p = buf;
+	/* From nginx */
+	static char *lines[5] = {
+	 "HTTP/1.1 200 OK\r\n",
+	 "Connection: keep-alive\r\n",
+	 "Server: Apache/2.2.800\r\n",
+	 "Content-Length: "};
+	ssize_t l;
+	const size_t l0 = 17, l1 = 24, l2 = 24, l3 = 16;
+
+	//l0 = strlen(lines[0]);
+	p = mempcpy(p, lines[0], l0);
+	//l1 = strlen(lines[1]);
+	p = mempcpy(p, lines[1], l1);
+	//l2 = strlen(lines[2]);
+	p = mempcpy(p, lines[2], l2);
+	p = mempcpy(p, lines[3], l3);
+	l = sprintf(p, "%lu\r\n\r\n", content_length);
+	p += l;
+	return p - buf;
+}
+#else
 ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
 {
@@ -544,6 +570,7 @@ generate_httphdr(ssize_t content_length, char *buf)
 	p += l;
 	return p - buf;
 }
+#endif /* WITH_KVS */
 
 int
 generate_http(int content_length, char *buf, char *content)
@@ -657,6 +684,22 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+static inline void
+from_paste(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
+{
+	*idx = p >> 32;
+	*off = (p & 0x00000000ffff0000) >> 16;
+	*len = p & 0x000000000000ffff;
+}
+
+static inline uint64_t
+to_paste(uint32_t idx, uint16_t off, uint16_t len)
+{
+	return (uint64_t)idx << 32 | off<< 16 | len;
+
+}
+
+
 #ifdef WITH_KVS
 static struct netmap_slot *
 set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
@@ -677,16 +720,36 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 
 enum {SLOT_INVALID=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 static inline int
+_between(u_int x, u_int a, u_int b, u_int lim)
+{
+	if (a < b) {
+		if (x >= a && x < b) {
+			return SLOT_USER;
+		} else {
+			return SLOT_KERNEL;
+		}
+	} else if (a > b) {
+		if (x >= b && x < a) {
+			return SLOT_KERNEL;
+		} else {
+			return SLOT_USER;
+		}
+	}
+	return SLOT_KERNEL; // a == b
+}
+
+static inline int
 is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
 		u_int extra_num, struct netmap_slot *slot)
 {
 	if ((uintptr_t)slot > (uintptr_t)ring->slot && 
-	    (uintptr_t)slot < (uintptr_t)(ring->slot + ring->num_slots))
-		return 0;
-	else if ((uintptr_t)slot > (uintptr_t)extra &&
+	    (uintptr_t)slot < (uintptr_t)(ring->slot + ring->num_slots)) {
+		u_int i = slot - ring->slot;
+		return _between(i, ring->head, ring->tail, ring->num_slots - 1);
+	} else if ((uintptr_t)slot > (uintptr_t)extra &&
 	    (uintptr_t)slot < (uintptr_t)(extra + extra_num))
-		return 1;
-	return -1;
+		return SLOT_EXTRA;
+	return SLOT_INVALID;
 }
 
 //POST http://www.micchie.net/ HTTP/1.1\r\nHost: 192.168.11.3:60000\r\nContent-Length: 1280\r\n\r\n2
@@ -705,30 +768,6 @@ kvs_extract_slot(struct netmap_ring *ring, uint32_t buf_idx, size_t off)
 	return *(struct netmap_slot **)(buf + off + KVS_SLOT_OFF);
 }
 
-ssize_t
-kvs_generate_httphdr(ssize_t content_length, char *buf)
-{
-	char *p = buf;
-	/* From nginx */
-	static char *lines[5] = {
-	 "HTTP/1.1 200 OK\r\n",
-	 "Connection: keep-alive\r\n",
-	 "Server: Apache/2.2.800\r\n",
-	 "Content-Length: "};
-	ssize_t l;
-	const size_t l0 = 17, l1 = 24, l2 = 24, l3 = 16;
-
-	//l0 = strlen(lines[0]);
-	p = mempcpy(p, lines[0], l0);
-	//l1 = strlen(lines[1]);
-	p = mempcpy(p, lines[1], l1);
-	//l2 = strlen(lines[2]);
-	p = mempcpy(p, lines[2], l2);
-	p = mempcpy(p, lines[3], l3);
-	l = sprintf(p, "%lu\r\n\r\n", content_length);
-	p += l;
-	return p - buf;
-}
 
 #endif /* WITH_KVS */
 
@@ -741,7 +780,7 @@ paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 	static int unique = 0;
 	int rc;
 
-	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
+	pst_ent = to_paste(slot->buf_idx, off, len);
 	rc = btree_insert(vp, key, pst_ent);
 	if (rc == 0)
 		unique++;
@@ -764,7 +803,7 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 	char *p = paddr;
 
 	/* make log */
-	pst_ent = (uint64_t)slot->buf_idx << 32 | off<< 16 | len;
+	pst_ent = to_paste(slot->buf_idx, off, len);
 	/* position log */
 	if (unlikely(plen > dbsiz - phdrlen - cur))
 		cur = 0;
@@ -776,12 +815,12 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 
 static inline void
 copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
-		size_t len, int nowrap, int align, int pm, void *vp, void *key_p)
+		size_t len, int nowrap, int align, int pm, void *vp, uint64_t key)
 {
 	char *p;
 	int mlen = vp ? 0 : sizeof(uint64_t);
 	size_t cur = *pos;
-	int phdrlen = sizeof(struct paste_hdr); // dummy common metadata header
+	int phdrlen = vp || !pm ? 0 : sizeof(struct paste_hdr); // dummy header
 	u_int i = 0;
 	size_t aligned = len;
 
@@ -804,22 +843,24 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 	if (buf)
 		memcpy(p, buf, len);
 	if (pm) {
-		for (; i < len; i += CACHE_LINE_SIZE){
+		for (; i < len; i += CACHE_LINE_SIZE) {
 			_mm_clflush(p + i);
 		}
-	} else {
-		int error = msync(p, len, MS_SYNC);
+	}
+	p -= mlen;
+       	if (!pm) {
+		int error = msync(p, len + mlen, MS_SYNC);
 		if (error)
 			perror("msync");
 	}
-	p -= mlen;
 #ifdef WITH_BPLUS
 	if (vp) {
 		static int unique = 0;
 		int rc;
+		uint64_t pst_ent = to_paste(cur/NETMAP_BUF_SIZE, 0, len);
 
-		rc = btree_insert(vp, *(btree_key *)key_p,
-				(uint32_t)cur / NETMAP_BUF_SIZE);
+		D("inserting key %lu %lu len %lu", key, cur/NETMAP_BUF_SIZE, len);
+		rc = btree_insert(vp, key, pst_ent);
 		if (rc == 0)
 			unique++;
 	} else
@@ -832,7 +873,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		//	msync(p, sizeof(size_t), MS_SYNC);
 		//}
 	}
-	*pos = cur + aligned + mlen;
+	*pos = cur + aligned + (align ? 0 : mlen);
 }
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
@@ -858,6 +899,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		int off, len;
 		int *fde = &tp->fds[rxs->fd];
 		int thisclen = 0;
+		char *content = NULL;
 
 		off = g->virt_header + rxs->offset;
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
@@ -920,11 +962,11 @@ log:
 
 				} else if (paddr) {
 					copy_and_log(paddr, &tp->cur,
-					    dbsiz, rxbuf + off, len,
-					    len, dbi->pm ? 0 : dbi->pgsiz,
-					    dbi->pm, dbi->vp, &key);
+					    dbsiz, rxbuf + coff, thisclen,
+					    thisclen, dbi->pm ? 0 : dbi->pgsiz,
+					    dbi->pm, dbi->vp, key);
 				} else {
-					if (writesync(rxbuf, len, dbsiz,
+					if (writesync(rxbuf + coff, len, dbsiz,
 					    dbi->dumbfd, &tp->cur,
 					    dbi->flags & DBI_FLAGS_FDSYNC)) {
 						return -1;
@@ -936,51 +978,60 @@ log:
 			}
 
 		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
-#ifdef WITH_BPLUS
+#ifdef WITH_KVS
 			uint64_t key = parse_get_key(rxbuf);
 
-			if (dbi->vp && dbi->flags & DBI_FLAGS_PASTE) {
+			if (dbi->vp) {
 				uint64_t datam = 0;
-#ifdef WITH_KVS
+				int rc;
 				uint32_t idx;
 				uint16_t _off, _len;
 				struct netmap_slot *s;
 				int slot_type;
-#endif
 
-				btree_lookup(dbi->vp, key, &datam);
-
-#ifdef WITH_KVS
-				idx = datam >> 32;
-				_off = (datam & 0x00000000ffff0000) >> 16;
-				_len = datam & 0x000000000000ffff;
-				s = kvs_extract_slot(rxr, idx, off);
-				slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
-
-				if (slot_type == 1) { // on extra, swap in
-					struct netmap_slot *txs;
-					u_int hlen;
-					char *_buf;
-
-					ND("key %lu val %lu idx %u off %u len %u slot_type %d", key, datam, idx, _off, _len, slot_type);
-					txs = set_to_nm(txr, s);
-					_buf = NETMAP_BUF(txr, txs->buf_idx);
-					hlen = kvs_generate_httphdr(_len, _buf + off);
-					if (unlikely(hlen != _off - off)) {
-						D("hlen %u _off %u off %u",
-							hlen, _off, off);
-					} else {
-						D("zero copy done!");
-					}
-					kvs_embed_slot(_buf + off, txs);
-					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, txs);
-					D("afterembedded, slot type %d", slot_type);
+				D("key %lu", key);
+				rc = btree_lookup(dbi->vp, key, &datam);
+				if (rc == ENOENT) {
+					D("no ent");
+					goto get;
 				}
-#endif
+			       	if (dbi->flags & DBI_FLAGS_PASTE) {
+					from_paste(datam, &idx, &_off, &_len);
+					s = kvs_extract_slot(rxr, idx, off);
+					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
+
+					if (slot_type == SLOT_EXTRA ||
+					    slot_type == SLOT_USER) {
+						struct netmap_slot *txs;
+						u_int hlen;
+						char *_buf;
+
+						txs = set_to_nm(txr, s);
+						txs->fd = rxs->fd;
+						if (slot_type == SLOT_USER)
+							txs->len = _off + _len;
+						_buf = NETMAP_BUF(txr,
+								txs->buf_idx);
+						hlen = generate_httphdr(_len,
+								_buf + off);
+						if (unlikely(hlen !=
+						    _off - off)) {
+							RD(1, "hlen %u _off %u off %u",
+								hlen, _off, off);
+						}
+						kvs_embed_slot(_buf + off, txs);
+						goto update_ctr;
+					}
+				} else {
+					from_paste(datam, &idx, &_off, &_len);
+					content = dbi->paddr + 2048 * idx;
+					msglen = _len;
+				}
 			}
-#endif
+#endif /* WITH_KVS */
+
 get:
-			if (dbi->httplen) { // use cache
+			if (dbi->httplen && content == NULL) { // use cache
 				char *http = dbi->http;
 				int hlen = dbi->httplen;
 
@@ -990,7 +1041,7 @@ get:
 				}
 			} else {
 				if (generate_http_nm(msglen, txr,
-				    g->virt_header, o, rxs->fd, NULL) < 0)
+				    g->virt_header, o, rxs->fd, content) < 0)
 					continue;
 			}
 		} else if (*fde > 0) {
@@ -1004,6 +1055,9 @@ get:
 				goto log;
 			}
 		}
+#ifdef WITH_KVS
+update_ctr:
+#endif /* WITH_KVS */
 		nm_update_ctr(targ, 1, len);
 	}
 	rxr->head = rxr->cur = rxcur;
@@ -1058,11 +1112,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		if (dbi->type == DT_DUMB) {
 			if (paddr) {
 				copy_and_log(paddr, &tp->cur, dbi->dbsiz,
-				    readmmap ? NULL : rxbuf, len,
+				    readmmap ? NULL : rxbuf + coff, len,
 				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
-				    dbi->pm, dbi->vp, &key);
+				    dbi->pm, dbi->vp, key);
 			} else {
-				if (writesync(rxbuf, len, dbi->dbsiz,
+				if (writesync(rxbuf + coff, len, dbi->dbsiz,
 				    dbi->dumbfd, &tp->cur,
 				    dbi->flags & DBI_FLAGS_FDSYNC)) {
 					return -1;
