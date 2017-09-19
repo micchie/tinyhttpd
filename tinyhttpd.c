@@ -543,8 +543,9 @@ generate_httphdr(ssize_t content_length, char *buf)
 	//l2 = strlen(lines[2]);
 	p = mempcpy(p, lines[2], l2);
 	p = mempcpy(p, lines[3], l3);
-	l = sprintf(p, "%lu\r\n\r\n", content_length);
+	l = sprintf(p, "%lu\r\n\r", content_length);
 	p += l;
+	*p++ = '\n';
 	return p - buf;
 }
 #else
@@ -566,8 +567,9 @@ generate_httphdr(ssize_t content_length, char *buf)
 	p = mempcpy(p, lines[1], l1);
 	//l2 = strlen(lines[2]);
 	p = mempcpy(p, lines[2], l2);
-	l = sprintf(p, "%lu\r\n\r\n", content_length);
+	l = sprintf(p, "%lu\r\n\r", content_length);
 	p += l;
+	*p++ = '\n';
 	return p - buf;
 }
 #endif /* WITH_KVS */
@@ -605,12 +607,15 @@ parse_post(char *post, int *coff, uint64_t *key)
 {
 	int clen;
 	char *pp, *p = strstr(post, "Content-Length: ");
+	char *end;
 	
+	*key = 0;
+	*coff = 0;
 	if (unlikely(!p))
 		return -1;
 	pp = p + 16; // "Content-Length: "
-	clen = atoi(pp);
-	if (unlikely(!clen))
+	clen = strtol(pp, &end, 10);
+	if (end == pp)
 		return -1;
 	pp = strstr(pp, "\r\n\r\n");
 	if (unlikely(!pp))
@@ -710,10 +715,15 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 		return NULL;
 	}
 	txs = &txr->slot[txr->cur];
+	if (unlikely(any_slot == txs)) {
+		goto done;
+	}
 	tmp = *txs;
 	*txs = *any_slot;
 	txs->flags |= NS_BUF_CHANGED;
 	*any_slot = tmp;
+	any_slot->flags |= NS_BUF_CHANGED; // this might sit on the ring
+done:
 	txr->cur = txr->head = nm_ring_next(txr, txr->cur);
 	return txs;
 }
@@ -746,7 +756,7 @@ is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
 	    (uintptr_t)slot < (uintptr_t)(ring->slot + ring->num_slots)) {
 		u_int i = slot - ring->slot;
 		return _between(i, ring->head, ring->tail, ring->num_slots - 1);
-	} else if ((uintptr_t)slot > (uintptr_t)extra &&
+	} else if ((uintptr_t)slot >= (uintptr_t)extra &&
 	    (uintptr_t)slot < (uintptr_t)(extra + extra_num))
 		return SLOT_EXTRA;
 	return SLOT_INVALID;
@@ -754,22 +764,38 @@ is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
 
 //POST http://www.micchie.net/ HTTP/1.1\r\nHost: 192.168.11.3:60000\r\nContent-Length: 1280\r\n\r\n2
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
-#define KVS_SLOT_OFF 55
+#define KVS_SLOT_OFF 8
 static inline void
-kvs_embed_slot(char *buf, struct netmap_slot *slot)
+kvs_embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
 {
-	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
+	*(struct netmap_slot **)(buf + coff + KVS_SLOT_OFF) = slot;
 }
 
 static inline struct netmap_slot*
-kvs_extract_slot(struct netmap_ring *ring, uint32_t buf_idx, size_t off)
+kvs_extract_slot(struct netmap_ring *ring, uint32_t buf_idx, u_int coff)
 {
 	char *buf = NETMAP_BUF(ring, buf_idx);
-	return *(struct netmap_slot **)(buf + off + KVS_SLOT_OFF);
+	return *(struct netmap_slot **)(buf + coff + KVS_SLOT_OFF);
+}
+#endif /* WITH_KVS */
+
+static inline int
+str_to_key(uint64_t *k)
+{
+	char c[8];
+	strncpy(c, (char *)k, sizeof(c));
+	return atoi(c);
 }
 
-
-#endif /* WITH_KVS */
+static inline void
+print_force(char *p, int len)
+{
+	int i;
+	for (i = 0; i <len; i++) {
+		printf("%c", p[i]);
+	}
+	printf("\n");
+}
 
 #ifdef WITH_BPLUS
 static inline void
@@ -858,6 +884,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		static int unique = 0;
 		uint64_t pst_ent = to_paste(cur/NETMAP_BUF_SIZE, 0, len);
 		int rc = btree_insert(vp, key, pst_ent);
+		D("inserted key %u", str_to_key(&key));
 		if (rc == 0)
 			unique++;
 	} else
@@ -952,7 +979,8 @@ log:
 					/* record current slot */
 					if (dbi->flags & DBI_FLAGS_KVS) {
 						kvs_embed_slot(rxbuf,
-							&tp->extra[extra_i]);
+						    coff,
+						    &tp->extra[extra_i]);
 					}
 #else
 					i = rxs->buf_idx;
@@ -993,23 +1021,56 @@ log:
 				rc = btree_lookup(dbi->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
-				} else if (dbi->flags & DBI_FLAGS_PASTE) {
+				}
+				if (dbi->flags & DBI_FLAGS_PASTE) {
+					char *_buf;
+
 					from_paste(datam, &idx, &_off, &_len);
-					s = kvs_extract_slot(rxr, idx, off);
+					s = kvs_extract_slot(rxr, idx, _off);
 					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
 
 					if (slot_type == SLOT_EXTRA ||
 					    slot_type == SLOT_USER) {
 						struct netmap_slot *txs;
 						u_int hlen;
-						char *_buf;
 
+						if (slot_type == SLOT_USER) {
+							int ret, _coff;
+							uint64_t _key;
+							char *p;
+
+							p = NETMAP_BUF(txr, idx);
+							ret = parse_post(p + off, &_coff, &_key);
+							if (ret < 0) {
+								D("we have garbage");
+							} else {
+								D("we have fine data (idx %u buf %p)", s->buf_idx, p);
+							}
+#if 0
+							content = p + _off;
+							goto get;
+#endif
+						}
 						txs = set_to_nm(txr, s);
 						txs->fd = rxs->fd;
-						if (slot_type == SLOT_USER)
+						if (slot_type == SLOT_USER) {
 							txs->len = _off + _len;
+						}
 						_buf = NETMAP_BUF(txr,
 								txs->buf_idx);
+						if (slot_type == SLOT_USER) {
+							int ret, _coff;
+							uint64_t _key;
+							D("before parse_post: buf %p for idx %u", NETMAP_BUF(txr, idx), idx);
+							ret = parse_post(_buf + off, &_coff, &_key);
+							if (ret < 0) {
+								D("2 we have garbage (idx %u buf %p)", txs->buf_idx, _buf);
+							} else {
+								D("2 we have fine data");
+							}
+						}
+						kvs_embed_slot(_buf, _off, txs);
+						D("generating HTTP header at off %u clen %u starting with %c", off, _len, _buf[_off]);
 						hlen = generate_httphdr(_len,
 								_buf + off);
 						if (unlikely(hlen !=
@@ -1017,8 +1078,17 @@ log:
 							RD(1, "hlen %u _off %u off %u",
 								hlen, _off, off);
 						}
-						kvs_embed_slot(_buf + off, txs);
+						D("after, starting with %c", _buf[_off]);
 						goto update_ctr;
+					} else if (slot_type == SLOT_KERNEL) {
+						char *buf;
+					       
+						buf =
+						    NETMAP_BUF(txr, s->buf_idx);
+						content = buf + off;
+					} else { // SLOT_INVALID
+						D("SLOT_INVALID");
+						msglen = _len;
 					}
 				} else {
 					from_paste(datam, &idx, &_off, &_len);
