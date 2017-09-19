@@ -523,6 +523,7 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 }
 
 #ifdef WITH_KVS
+#if 0
 ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
 {
@@ -547,6 +548,37 @@ generate_httphdr(ssize_t content_length, char *buf)
 	p += l;
 	*p++ = '\n';
 	return p - buf;
+}
+#endif /* 0 */
+
+static char *HTTPHDR = "HTTP/1.1 200 OK\r\n"
+		 "Connection: keep-alive\r\n"
+		 "Server: Apache/2.2.800\r\n"
+		 "Content-Length: ";
+#define HTTPHDR_LEN 81
+
+ssize_t
+generate_httphdr(size_t content_length, char *buf)
+{
+	uint64_t *h = (uint64_t *)HTTPHDR;
+	uint64_t *p = (uint64_t *)buf;
+	char *c;
+
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	*p++ = *h++;
+	c = (char *)p;
+	*c++ = *(char *)h;
+	c += sprintf(c, "%lu\r\n\r", content_length);
+	*c++ = '\n';
+	return c - buf;
 }
 #else
 ssize_t
@@ -602,11 +634,12 @@ generate_http_nm(int content_length, struct netmap_ring *ring, int virt_header,
 	return len < content_length ? -1 : hlen + len;
 }
 
+#define SKIP_POST	48
 static int
 parse_post(char *post, int *coff, uint64_t *key)
 {
 	int clen;
-	char *pp, *p = strstr(post, "Content-Length: ");
+	char *pp, *p = strstr(post + SKIP_POST, "Content-Length: ");
 	char *end;
 	
 	*key = 0;
@@ -934,8 +967,9 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			int coff, clen = parse_post(rxbuf, &coff, &key);
 
 			thisclen = len - coff;
-			if (thisclen < 0)
+			if (thisclen < 0) {
 				D("thisclen %d len %d coff %d", thisclen, len, coff);
+			}
 
 			if (unlikely(clen < 0))
 				continue;
@@ -1026,7 +1060,6 @@ log:
 					char *_buf;
 
 					_buf = NETMAP_BUF(rxr, _idx);
-					__builtin_prefetch(_buf);
 					s = kvs_extract_slot(_buf, _off);
 					t = is_slot_extra(txr, tp->extra, tp->extra_num, s);
 					if (t != SLOT_INVALID) {
