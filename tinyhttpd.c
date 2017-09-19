@@ -815,7 +815,7 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 
 static inline void
 copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
-		size_t len, int nowrap, int align, int pm, void *vp, uint64_t key)
+		size_t len, u_int nowrap, size_t align, int pm, void *vp, uint64_t key)
 {
 	char *p;
 	int mlen = vp ? 0 : sizeof(uint64_t);
@@ -856,11 +856,8 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 #ifdef WITH_BPLUS
 	if (vp) {
 		static int unique = 0;
-		int rc;
 		uint64_t pst_ent = to_paste(cur/NETMAP_BUF_SIZE, 0, len);
-
-		D("inserting key %lu %lu len %lu", key, cur/NETMAP_BUF_SIZE, len);
-		rc = btree_insert(vp, key, pst_ent);
+		int rc = btree_insert(vp, key, pst_ent);
 		if (rc == 0)
 			unique++;
 	} else
@@ -904,12 +901,16 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		off = g->virt_header + rxs->offset;
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
 	       	len = rxs->len - off;
-
+		if (unlikely(len == 0)) {
+			continue;
+		}
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
 			uint64_t key;
 			int coff, clen = parse_post(rxbuf, &coff, &key);
 
 			thisclen = len - coff;
+			if (thisclen < 0)
+				D("thisclen %d len %d coff %d", thisclen, len, coff);
 
 			if (unlikely(clen < 0))
 				continue;
@@ -989,13 +990,10 @@ log:
 				struct netmap_slot *s;
 				int slot_type;
 
-				D("key %lu", key);
 				rc = btree_lookup(dbi->vp, key, &datam);
 				if (rc == ENOENT) {
-					D("no ent");
 					goto get;
-				}
-			       	if (dbi->flags & DBI_FLAGS_PASTE) {
+				} else if (dbi->flags & DBI_FLAGS_PASTE) {
 					from_paste(datam, &idx, &_off, &_len);
 					s = kvs_extract_slot(rxr, idx, off);
 					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
