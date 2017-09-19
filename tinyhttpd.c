@@ -772,10 +772,9 @@ kvs_embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
 }
 
 static inline struct netmap_slot*
-kvs_extract_slot(struct netmap_ring *ring, uint32_t buf_idx, u_int coff)
+kvs_extract_slot(char *nmb, u_int coff)
 {
-	char *buf = NETMAP_BUF(ring, buf_idx);
-	return *(struct netmap_slot **)(buf + coff + KVS_SLOT_OFF);
+	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
 }
 #endif /* WITH_KVS */
 
@@ -884,7 +883,6 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
 		static int unique = 0;
 		uint64_t pst_ent = to_paste(cur/NETMAP_BUF_SIZE, 0, len);
 		int rc = btree_insert(vp, key, pst_ent);
-		D("inserted key %u", str_to_key(&key));
 		if (rc == 0)
 			unique++;
 	} else
@@ -949,7 +947,7 @@ log:
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
 #ifdef WITH_KVS
-					struct netmap_slot tmp;
+					struct netmap_slot tmp, *extra;
 #endif
 					uint32_t extra_i = get_extra(tp);
 
@@ -971,16 +969,17 @@ log:
 
 					/* swap out buffer */
 #ifdef WITH_KVS
+					extra = &tp->extra[extra_i];
 					tmp = *rxs;
-					rxs->buf_idx = tp->extra[extra_i].buf_idx;
+					rxs->buf_idx = extra->buf_idx;
 					rxs->flags |= NS_BUF_CHANGED;
-					tp->extra[extra_i] = tmp;
+					*extra = tmp;
+					extra->flags &= ~NS_BUF_CHANGED;
 
 					/* record current slot */
 					if (dbi->flags & DBI_FLAGS_KVS) {
 						kvs_embed_slot(rxbuf,
-						    coff,
-						    &tp->extra[extra_i]);
+						    coff, extra);
 					}
 #else
 					i = rxs->buf_idx;
@@ -1013,86 +1012,51 @@ log:
 			if (dbi->vp) {
 				uint64_t datam = 0;
 				int rc;
-				uint32_t idx;
+				uint32_t _idx;
 				uint16_t _off, _len;
 				struct netmap_slot *s;
-				int slot_type;
+				int t;
 
 				rc = btree_lookup(dbi->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
 				}
+				from_paste(datam, &_idx, &_off, &_len);
 				if (dbi->flags & DBI_FLAGS_PASTE) {
 					char *_buf;
 
-					from_paste(datam, &idx, &_off, &_len);
-					s = kvs_extract_slot(rxr, idx, _off);
-					slot_type = is_slot_extra(txr, tp->extra, tp->extra_num, s);
-
-					if (slot_type == SLOT_EXTRA ||
-					    slot_type == SLOT_USER) {
+					_buf = NETMAP_BUF(rxr, _idx);
+					__builtin_prefetch(_buf);
+					s = kvs_extract_slot(_buf, _off);
+					t = is_slot_extra(txr, tp->extra, tp->extra_num, s);
+					if (t != SLOT_INVALID) {
+						if (s->flags & NS_BUF_CHANGED) {
+							content = _buf + _off;
+							goto get;
+						}
+					}
+					if (t == SLOT_EXTRA || t == SLOT_USER) {
 						struct netmap_slot *txs;
 						u_int hlen;
 
-						if (slot_type == SLOT_USER) {
-							int ret, _coff;
-							uint64_t _key;
-							char *p;
-
-							p = NETMAP_BUF(txr, idx);
-							ret = parse_post(p + off, &_coff, &_key);
-							if (ret < 0) {
-								D("we have garbage");
-							} else {
-								D("we have fine data (idx %u buf %p)", s->buf_idx, p);
-							}
-#if 0
-							content = p + _off;
-							goto get;
-#endif
-						}
 						txs = set_to_nm(txr, s);
 						txs->fd = rxs->fd;
-						if (slot_type == SLOT_USER) {
-							txs->len = _off + _len;
-						}
-						_buf = NETMAP_BUF(txr,
-								txs->buf_idx);
-						if (slot_type == SLOT_USER) {
-							int ret, _coff;
-							uint64_t _key;
-							D("before parse_post: buf %p for idx %u", NETMAP_BUF(txr, idx), idx);
-							ret = parse_post(_buf + off, &_coff, &_key);
-							if (ret < 0) {
-								D("2 we have garbage (idx %u buf %p)", txs->buf_idx, _buf);
-							} else {
-								D("2 we have fine data");
-							}
-						}
+						txs->len = _off + _len; // XXX
 						kvs_embed_slot(_buf, _off, txs);
-						D("generating HTTP header at off %u clen %u starting with %c", off, _len, _buf[_off]);
 						hlen = generate_httphdr(_len,
 								_buf + off);
-						if (unlikely(hlen !=
-						    _off - off)) {
-							RD(1, "hlen %u _off %u off %u",
-								hlen, _off, off);
+						if (unlikely(
+						    hlen != _off - off)) {
+							RD(1, "mismatch");
 						}
-						D("after, starting with %c", _buf[_off]);
 						goto update_ctr;
-					} else if (slot_type == SLOT_KERNEL) {
-						char *buf;
-					       
-						buf =
-						    NETMAP_BUF(txr, s->buf_idx);
-						content = buf + off;
+					} else if (t == SLOT_KERNEL) {
+						content = _buf + off;
 					} else { // SLOT_INVALID
-						D("SLOT_INVALID");
 						msglen = _len;
 					}
 				} else {
-					from_paste(datam, &idx, &_off, &_len);
-					content = dbi->paddr + 2048 * idx;
+					content = paddr + NETMAP_BUF_SIZE*_idx;
 					msglen = _len;
 				}
 			}
