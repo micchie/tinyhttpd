@@ -606,7 +606,7 @@ generate_httphdr(ssize_t content_length, char *buf)
 }
 #endif /* WITH_KVS */
 
-int
+static int
 generate_http(int content_length, char *buf, char *content)
 {
 	int hlen;
@@ -872,8 +872,8 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 }
 
 static inline void
-copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf,
-		size_t len, u_int nowrap, size_t align, int pm, void *vp, uint64_t key)
+copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
+		u_int nowrap, size_t align, int pm, void *vp, uint64_t key)
 {
 	char *p;
 	int mlen = vp ? 0 : sizeof(uint64_t);
@@ -1142,6 +1142,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	size_t max;
 	char *paddr = dbi->paddr;
 	int readmmap = !!(dbi->flags & DBI_FLAGS_READMMAP);
+	char *content = NULL;
 
 	rxbuf = txbuf = buf;
 	if (readmmap) {
@@ -1177,7 +1178,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		if (dbi->type == DT_DUMB) {
 			if (paddr) {
 				copy_and_log(paddr, &tp->cur, dbi->dbsiz,
-				    readmmap ? NULL : rxbuf + coff, len,
+				    readmmap ? NULL : rxbuf + coff, clen,
 				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
 				    dbi->pm, dbi->vp, key);
 			} else {
@@ -1208,15 +1209,32 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			}
 		}
 #endif /* SQLITE */
-gen_httpok:
-		if (!dbi->httplen) {
-			len = generate_http(msglen, txbuf, NULL);
-		} else {
+	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
+#ifdef WITH_KVS
+		uint64_t key = parse_get_key(rxbuf);
+
+		if (dbi->vp) {
+			uint64_t datam = 0;
+			int rc;
+			uint32_t _idx;
+			uint16_t _off, _len;
+
+			rc = btree_lookup(dbi->vp, key, &datam);
+			if (rc == ENOENT) {
+				goto get;
+			}
+			from_paste(datam, &_idx, &_off, &_len);
+			content = paddr + NETMAP_BUF_SIZE * _idx;
+			msglen = _len;
+		}
+get:
+#endif
+		if (dbi->httplen && content == NULL) {
 			len = dbi->httplen;
 			memcpy(txbuf, dbi->http, len);
+		} else {
+			len = generate_http(msglen, txbuf, content);
 		}
-	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
-		goto gen_httpok;
 	} else {
 		len = 0;
 	}
