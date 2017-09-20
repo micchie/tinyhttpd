@@ -70,6 +70,29 @@
 		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		(type *)( (char *)__mptr - offsetof(type,member) );})
 
+//#define MYHZ	2400000000
+#ifdef MYHZ
+static __inline unsigned long long int rdtsc(void)
+{
+   //unsigned long long int x;
+   unsigned a, d;
+
+   __asm__ volatile("rdtsc" : "=a" (a), "=d" (d));
+
+   return ((unsigned long long)a) | (((unsigned long long)d) << 32);;
+}
+
+static inline void
+user_clock_gettime(struct timespec *ts)
+{
+        unsigned long long now;
+
+        now = rdtsc();
+        ts->tv_sec = now/MYHZ;
+        ts->tv_nsec = (now%MYHZ)*1000000000/MYHZ;
+}
+#endif /* MYHZ */
+
 #define GET_LEN		4
 #define POST_LEN	5
 #define STMNAME	"stack:0"
@@ -723,7 +746,7 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 }
 
 static inline void
-from_paste(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
+_to_tuple(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 {
 	*idx = p >> 32;
 	*off = (p & 0x00000000ffff0000) >> 16;
@@ -731,10 +754,9 @@ from_paste(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 }
 
 static inline uint64_t
-to_paste(uint32_t idx, uint16_t off, uint16_t len)
+_from_tuple(uint32_t idx, uint16_t off, uint16_t len)
 {
 	return (uint64_t)idx << 32 | off<< 16 | len;
-
 }
 
 
@@ -782,7 +804,7 @@ _between(u_int x, u_int a, u_int b, u_int lim)
 }
 
 static inline int
-is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
+nm_where(struct netmap_ring *ring, struct netmap_slot *extra,
 		u_int extra_num, struct netmap_slot *slot)
 {
 	if ((uintptr_t)slot > (uintptr_t)ring->slot && 
@@ -799,13 +821,13 @@ is_slot_extra(struct netmap_ring *ring, struct netmap_slot *extra,
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
 #define KVS_SLOT_OFF 8
 static inline void
-kvs_embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
+_embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
 {
 	*(struct netmap_slot **)(buf + coff + KVS_SLOT_OFF) = slot;
 }
 
 static inline struct netmap_slot*
-kvs_extract_slot(char *nmb, u_int coff)
+_digout_slot(char *nmb, u_int coff)
 {
 	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
 }
@@ -838,7 +860,7 @@ paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 	static int unique = 0;
 	int rc;
 
-	pst_ent = to_paste(slot->buf_idx, off, len);
+	pst_ent = _from_tuple(slot->buf_idx, off, len);
 	rc = btree_insert(vp, key, pst_ent);
 	if (rc == 0)
 		unique++;
@@ -861,7 +883,7 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 	char *p = paddr;
 
 	/* make log */
-	pst_ent = to_paste(slot->buf_idx, off, len);
+	pst_ent = _from_tuple(slot->buf_idx, off, len);
 	/* position log */
 	if (unlikely(plen > dbsiz - phdrlen - cur))
 		cur = 0;
@@ -915,7 +937,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 #ifdef WITH_BPLUS
 	if (vp) {
 		static int unique = 0;
-		uint64_t pst_ent = to_paste(cur/NETMAP_BUF_SIZE, 0, len);
+		uint64_t pst_ent = _from_tuple(cur/NETMAP_BUF_SIZE, 0, len);
 		int rc = btree_insert(vp, key, pst_ent);
 		if (rc == 0)
 			unique++;
@@ -956,7 +978,10 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		int *fde = &tp->fds[rxs->fd];
 		int thisclen = 0;
 		char *content = NULL;
-
+#ifdef MYHZ
+		struct timespec ts1, ts2, ts3;
+		user_clock_gettime(&ts1);
+#endif
 		off = g->virt_header + rxs->offset;
 		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
 	       	len = rxs->len - off;
@@ -968,7 +993,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			int coff, clen = parse_post(rxbuf, &coff, &key);
 
 			thisclen = len - coff;
-			if (thisclen < 0) {
+			if (unlikely(thisclen < 0)) {
 				D("thisclen %d len %d coff %d", thisclen, len, coff);
 			}
 
@@ -1013,8 +1038,7 @@ log:
 
 					/* record current slot */
 					if (dbi->flags & DBI_FLAGS_KVS) {
-						kvs_embed_slot(rxbuf,
-						    coff, extra);
+						_embed_slot(rxbuf, coff, extra);
 					}
 #else
 					i = rxs->buf_idx;
@@ -1056,13 +1080,12 @@ log:
 				if (rc == ENOENT) {
 					goto get;
 				}
-				from_paste(datam, &_idx, &_off, &_len);
+				_to_tuple(datam, &_idx, &_off, &_len);
 				if (dbi->flags & DBI_FLAGS_PASTE) {
-					char *_buf;
+					char *_buf = NETMAP_BUF(rxr, _idx);
 
-					_buf = NETMAP_BUF(rxr, _idx);
-					s = kvs_extract_slot(_buf, _off);
-					t = is_slot_extra(txr, tp->extra, tp->extra_num, s);
+					s = _digout_slot(_buf, _off);
+					t = nm_where(txr, tp->extra, tp->extra_num, s);
 					if (t != SLOT_INVALID) {
 						if (s->flags & NS_BUF_CHANGED) {
 							content = _buf + _off;
@@ -1071,16 +1094,15 @@ log:
 					}
 					if (t == SLOT_EXTRA || t == SLOT_USER) {
 						struct netmap_slot *txs;
-						u_int hlen;
+						u_int hl;
 
 						txs = set_to_nm(txr, s);
 						txs->fd = rxs->fd;
 						txs->len = _off + _len; // XXX
-						kvs_embed_slot(_buf, _off, txs);
-						hlen = generate_httphdr(_len,
+						_embed_slot(_buf, _off, txs);
+						hl = generate_httphdr(_len,
 								_buf + off);
-						if (unlikely(
-						    hlen != _off - off)) {
+						if (unlikely(hl != _off - off)) {
 							RD(1, "mismatch");
 						}
 						goto update_ctr;
@@ -1125,6 +1147,11 @@ get:
 update_ctr:
 #endif /* WITH_KVS */
 		nm_update_ctr(targ, 1, len);
+#ifdef MYHZ
+		user_clock_gettime(&ts2);
+		ts3 = timespec_sub(ts2, ts1);
+		RD(1, "loop %lu.%lu", ts3.tv_sec, ts3.tv_nsec);
+#endif /* MYHZ */
 	}
 	rxr->head = rxr->cur = rxcur;
 	return 0;
@@ -1149,11 +1176,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	if (readmmap) {
 		size_t cur = tp->cur;
 		max = dbi->dbsiz - sizeof(struct paste_hdr) - cur;
-		if (max < dbi->pgsiz) {
+		if (unlikely(max < dbi->pgsiz)) {
 			cur = 0;
 			max = dbi->dbsiz;
 		}
-		rxbuf = paddr + tp->cur + sizeof(uint64_t);
+		rxbuf = paddr + tp->cur + sizeof(uint64_t); // metadata space
 		max -= sizeof(uint64_t);
 	} else {
 		max = sizeof(buf);
@@ -1162,7 +1189,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	if (len == 0) {
 		close(fd);
 		return 0;
-	} else if (len < 0) {
+	} else if (unlikely(len < 0)) {
 		//perror("read");
 		close(fd);
 		return -1;
@@ -1210,7 +1237,6 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			}
 		}
 #endif /* SQLITE */
-		goto get;
 	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
 #ifdef WITH_KVS
 		uint64_t key = parse_get_key(rxbuf);
@@ -1222,25 +1248,29 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			uint16_t _off, _len;
 
 			rc = btree_lookup(dbi->vp, key, &datam);
-			if (rc == ENOENT) {
-				goto get;
+			if (rc != ENOENT) {
+				_to_tuple(datam, &_idx, &_off, &_len);
+				content = paddr + NETMAP_BUF_SIZE * _idx;
+				msglen = _len;
 			}
-			from_paste(datam, &_idx, &_off, &_len);
-			content = paddr + NETMAP_BUF_SIZE * _idx;
-			msglen = _len;
 		}
 #endif
-get:
+	} else {
+		len = 0;
+	}
+
+	if (len) {
 		if (dbi->httplen && content == NULL) {
 			len = dbi->httplen;
 			memcpy(txbuf, dbi->http, len);
 		} else {
 			len = generate_http(msglen, txbuf, content);
 		}
-	} else {
-		len = 0;
 	}
-	write(fd, txbuf, len);
+	len = write(fd, txbuf, len);
+	if (unlikely(len < 0)) {
+		perror("write");
+	}
 	return 0;
 }
 
