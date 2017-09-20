@@ -882,6 +882,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	u_int i = 0;
 	size_t aligned = len;
 
+	ND("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
 #ifdef WITH_BPLUS
 	if (vp) {
 		align = NETMAP_BUF_SIZE;
@@ -1209,6 +1210,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			}
 		}
 #endif /* SQLITE */
+		goto get;
 	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
 #ifdef WITH_KVS
 		uint64_t key = parse_get_key(rxbuf);
@@ -1227,8 +1229,8 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			content = paddr + NETMAP_BUF_SIZE * _idx;
 			msglen = _len;
 		}
-get:
 #endif
+get:
 		if (dbi->httplen && content == NULL) {
 			len = dbi->httplen;
 			memcpy(txbuf, dbi->http, len);
