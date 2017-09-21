@@ -189,24 +189,16 @@ static inline void _mm_clflushopt(volatile void *__p)
 #define MAX_HTTPLEN	65535
 struct dbinfo {
 	int	type;
-	char 	*path;
-	union {
-#ifdef WITH_SQLITE
-		sqlite3 *sql_conn;
-#endif
-		int	dumbfd;
-	};
+	char 	*prefix;
 	u_int pgsiz;
-	char *paddr;
-	void *vp; // gfile_t
 	int fdel;
 	int pm;
-	size_t dbsiz;
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READMMAP	0x2
 #define DBI_FLAGS_PASTE		0x4
 #define DBI_FLAGS_BPLUS		0x8
 #define DBI_FLAGS_KVS		0x10
+#define DBI_FLAGS_MMAP		0x20
 	int flags;
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
@@ -218,6 +210,8 @@ struct dbinfo {
 	char *http;
 	int httplen;
 	int msglen;
+	/* propagated to thread */
+	size_t _dbsiz;
 };
 
 /* XXX DB-related info should also be moved here */
@@ -240,6 +234,18 @@ struct thpriv {
 	uint32_t extra_num;
 	int	*fds;
 	int	nfds;
+
+	char 	*path;
+	union {
+#ifdef WITH_SQLITE
+		sqlite3 *sql_conn;
+#endif
+		int	dumbfd;
+	};
+	char *paddr;
+	void *vp; // gfile_t
+	size_t dbsiz;
+
 };
 #define DEFAULT_NFDS	1024
 
@@ -962,13 +968,15 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	struct dbinfo *dbi = container_of(g, struct dbinfo, g);
 	struct thpriv *tp = targ->td_private;
 	ssize_t msglen = dbi->msglen;
+	int type = dbi->type;
+	int flags = dbi->flags;
 
 	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
 	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
-	size_t dbsiz = dbi->dbsiz;
-	char *paddr = dbi->paddr;
+	size_t dbsiz = tp->dbsiz;
+	char *paddr = tp->paddr;
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
@@ -1003,8 +1011,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 				*fde = clen - thisclen;
 			}
 log:
-			if (dbi->type == DT_DUMB) {
-				if (dbi->flags & DBI_FLAGS_PASTE) {
+			if (type == DT_DUMB) {
+				if (flags & DBI_FLAGS_PASTE) {
 					u_int i = 0;
 #ifdef WITH_KVS
 					struct netmap_slot tmp, *extra;
@@ -1016,8 +1024,8 @@ log:
 						_mm_clflush(rxbuf + i);
 					}
 #ifdef WITH_BPLUS
-					if (dbi->vp) {
-						paste_bplus(dbi->vp, key, rxs,
+					if (tp->vp) {
+						paste_bplus(tp->vp, key, rxs,
 							off + coff, thisclen);
 					} else
 #endif
@@ -1051,11 +1059,11 @@ log:
 					copy_and_log(paddr, &tp->cur,
 					    dbsiz, rxbuf + coff, thisclen,
 					    thisclen, dbi->pm ? 0 : dbi->pgsiz,
-					    dbi->pm, dbi->vp, key);
+					    dbi->pm, tp->vp, key);
 				} else {
 					if (writesync(rxbuf + coff, len, dbsiz,
-					    dbi->dumbfd, &tp->cur,
-					    dbi->flags & DBI_FLAGS_FDSYNC)) {
+					    tp->dumbfd, &tp->cur,
+					    flags & DBI_FLAGS_FDSYNC)) {
 						return -1;
 					}
 				}
@@ -1068,7 +1076,7 @@ log:
 #ifdef WITH_KVS
 			uint64_t key = parse_get_key(rxbuf);
 
-			if (dbi->vp) {
+			if (tp->vp) {
 				uint64_t datam = 0;
 				int rc;
 				uint32_t _idx;
@@ -1076,7 +1084,7 @@ log:
 				struct netmap_slot *s;
 				int t;
 
-				rc = btree_lookup(dbi->vp, key, &datam);
+				rc = btree_lookup(tp->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
 				}
@@ -1168,17 +1176,17 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	ssize_t len = 0;
 	struct thpriv *tp = targ->td_private;
 	size_t max;
-	char *paddr = dbi->paddr;
+	char *paddr = tp->paddr;
 	int readmmap = !!(dbi->flags & DBI_FLAGS_READMMAP);
 	char *content = NULL;
 
 	rxbuf = txbuf = buf;
 	if (readmmap) {
 		size_t cur = tp->cur;
-		max = dbi->dbsiz - sizeof(struct paste_hdr) - cur;
+		max = tp->dbsiz - sizeof(struct paste_hdr) - cur;
 		if (unlikely(max < dbi->pgsiz)) {
 			cur = 0;
-			max = dbi->dbsiz;
+			max = tp->dbsiz;
 		}
 		rxbuf = paddr + tp->cur + sizeof(uint64_t); // metadata space
 		max -= sizeof(uint64_t);
@@ -1205,13 +1213,13 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		}
 		if (dbi->type == DT_DUMB) {
 			if (paddr) {
-				copy_and_log(paddr, &tp->cur, dbi->dbsiz,
+				copy_and_log(paddr, &tp->cur, tp->dbsiz,
 				    readmmap ? NULL : rxbuf + coff, clen,
 				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
-				    dbi->pm, dbi->vp, key);
+				    dbi->pm, tp->vp, key);
 			} else {
-				if (writesync(rxbuf + coff, len, dbi->dbsiz,
-				    dbi->dumbfd, &tp->cur,
+				if (writesync(rxbuf + coff, len, tp->dbsiz,
+				    tp->dumbfd, &tp->cur,
 				    dbi->flags & DBI_FLAGS_FDSYNC)) {
 					return -1;
 				}
@@ -1226,11 +1234,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			snprintf(query, sizeof(query),
 				"BEGIN TRANSACTION; insert into %s values (%d, '%s'); COMMIT;",
 			       	SQLDBTABLE, seq++, rxbuf);
-			ret = sqlite3_exec(dbi->sql_conn, query, print_resp, 
+			ret = sqlite3_exec(tp->sql_conn, query, print_resp, 
 					NULL, &err_msg);
 			if (ret != SQLITE_OK) {
 				D("%s", err_msg);
-				sqlite3_close(dbi->sql_conn);
+				sqlite3_close(tp->sql_conn);
 				sqlite3_free(err_msg);
 				err_msg = NULL;
 				return -1;
@@ -1241,13 +1249,13 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #ifdef WITH_KVS
 		uint64_t key = parse_get_key(rxbuf);
 
-		if (dbi->vp) {
+		if (tp->vp) {
 			uint64_t datam = 0;
 			int rc;
 			uint32_t _idx;
 			uint16_t _off, _len;
 
-			rc = btree_lookup(dbi->vp, key, &datam);
+			rc = btree_lookup(tp->vp, key, &datam);
 			if (rc != ENOENT) {
 				_to_tuple(datam, &_idx, &_off, &_len);
 				content = paddr + NETMAP_BUF_SIZE * _idx;
@@ -1284,7 +1292,7 @@ create_db(u_int type, u_int flags, void **vp, char *path, void *fd_or_sql, char 
 	char *paddr = NULL;
 
 #ifdef WITH_SQLITE
-       	if (dbi.type == DT_SQLITE) {
+       	if (type == DT_SQLITE) {
 	    do {
 		char *err_msg;
 		char create_tbl_stmt[128];
@@ -1355,7 +1363,7 @@ error:
 			perror("open");
 			break;
 		}
-		if (map) {
+		if (flags & DBI_FLAGS_MMAP) {
 			if (fallocate(fd, 0, 0, dbsiz) < 0) {
 				perror("fallocate");
 				break;
@@ -1396,6 +1404,21 @@ _worker(void *data)
 	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
 	int msglen = dbip->msglen;
 	struct thpriv *tp = targ->td_private;
+	char dbpath[64];
+
+	/* create db */
+	tp->dbsiz = dbip->_dbsiz / g->nthreads;
+	snprintf(dbpath, sizeof(dbpath), "%s%d", dbip->prefix, targ->me);
+	if (dbip->prefix && create_db(dbip->type, dbip->flags, &tp->vp, dbpath,
+				&tp->dumbfd, &tp->paddr, tp->dbsiz,
+				g->dev_type == DEV_NETMAP ?
+			 	    targ->nmd->req.nr_name : NULL,
+				g->dev_type == DEV_NETMAP ?
+				    strlen(targ->nmd->req.nr_name) : 0))
+	{
+		D("error on create_db");
+		goto quit;
+	}
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
@@ -1549,6 +1572,7 @@ quit:
 		free(tp->extra);
 	if (tp->fds)
 		free(tp->fds);
+	close_db(tp->path, dbip->type, tp->paddr, tp->dbsiz, &tp->dumbfd);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -1562,23 +1586,18 @@ main(int argc, char **argv)
 	const int on = 1;
 	int port = 0;
 	struct dbinfo dbi;
-	int do_mmap = 0;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
 
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
-	dbi.dbsiz = 0;
-	dbi.msglen = 0;
-	dbi.fdel = 0;
 	dbi.pgsiz = getpagesize();
 #ifdef WITH_STACKMAP
 	dbi.g.nmr_config = "";
 	dbi.g.nthreads = 1;
 	dbi.g.td_privbody = _worker;
 	dbi.g.polltimeo = 2000;
-	dbi.g.extra_bufs = 0;
 #endif
 
 	signal(SIGPIPE, SIG_IGN); // XXX
@@ -1609,16 +1628,16 @@ main(int argc, char **argv)
 				dbi.type = DT_DUMB;
 			else
 				dbi.type = DT_SQLITE;
-			dbi.path = optarg;
+			dbi.prefix = optarg;
 			dbi.pm = strstr(optarg, "pm") ? 1 : 0;
 			}
 			break;
 		case 'L':
 			//use 7680 for approx 8GB
-			dbi.dbsiz = atol(optarg) * 1000000;
+			dbi._dbsiz = atol(optarg) * 1000000;
 			break;
 		case 'm':
-			do_mmap = 1;
+			dbi.flags |= DBI_FLAGS_MMAP;
 			break;
 		case 'D':
 			dbi.flags |= DBI_FLAGS_FDSYNC;
@@ -1635,7 +1654,7 @@ main(int argc, char **argv)
 			dbi.g.extmem_siz = atol(optarg) * 1000000;
 			// believe 90 % is available for bufs
 			dbi.g.extra_bufs = (dbi.g.extmem_siz / 2048) / 10 * 9;
-			dbi.dbsiz = dbi.g.extra_bufs * 8 * 2;
+			dbi._dbsiz = dbi.g.extra_bufs * 8 * 2;
 			break;
 		case 'c':
 			dbi.httplen = 1;
@@ -1669,7 +1688,7 @@ main(int argc, char **argv)
 	}
 
 	fprintf(stderr, "%s built %s %s db: %s\n",
-		argv[0], __DATE__, __TIME__, dbi.path ? dbi.path : "none");
+		argv[0], __DATE__, __TIME__, dbi.prefix ? dbi.prefix : "none");
 	usleep(1000);
 
 	argc -= optind;
@@ -1691,16 +1710,10 @@ main(int argc, char **argv)
 		D("preallocated http %d", dbi.httplen);
 	}
 
-	if (dbi.path && create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path, &dbi.dumbfd,
-			do_mmap ? &dbi.paddr : NULL, dbi.dbsiz,
-			dbi.ifname, strlen(dbi.ifname))) {
-		goto close;
-	}
-
 	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sd < 0) {
 		perror("socket");
-		goto close;
+		return 0;
 	}
 	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
@@ -1810,7 +1823,4 @@ close_socket:
 
 	if (sd > 0)
 		close(sd);
-close:
-	close_db(dbi.path, dbi.type, dbi.paddr, dbi.dbsiz, &dbi.dumbfd);
-	return (0);
 }
