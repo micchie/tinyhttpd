@@ -1691,7 +1691,7 @@ main(int argc, char **argv)
 		D("preallocated http %d", dbi.httplen);
 	}
 
-	if (create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path, &dbi.dumbfd,
+	if (dbi.path && create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path, &dbi.dumbfd,
 			do_mmap ? &dbi.paddr : NULL, dbi.dbsiz,
 			dbi.ifname, strlen(dbi.ifname))) {
 		goto close;
