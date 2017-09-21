@@ -402,28 +402,28 @@ _do_mmap(int fd, size_t len)
 }
 
 void
-close_db(struct dbinfo *dbip)
+close_db(const char *path, int type, char *map, size_t dbsiz, void *fd_or_sql)
 {
 	struct stat st;
-	const char *path = dbip->path;
 #ifdef WITH_SQLITE
 	char path_wal[64], path_shm[64];
 #endif
 
 	/* close reference */
-	if (dbip->type == DT_DUMB) {
-		if (dbip->paddr)
-			if (munmap(dbip->paddr, dbip->dbsiz))
+	if (type == DT_DUMB) {
+		int fd = *(int *)fd_or_sql;
+		if (map)
+			if (munmap(map, dbsiz))
 				perror("munmap");
-		if (dbip->dumbfd > 0) {
+		if (fd > 0) {
 			D("closing dumbfd");
-			close(dbip->dumbfd);
+			close(fd);
 		}
 	}
 #ifdef WITH_SQLITE
-	else if (dbip->type == DT_SQLITE) {
+	else if (type == DT_SQLITE) {
 		D("closing sqlite3 obj");
-		sqlite3_close_v2(dbip->sql_conn);
+		sqlite3_close_v2(*(sqlite3 *)fd_or_sql);
 	}
 #endif
 	/* remove file */
@@ -1277,6 +1277,61 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #define container_of(ptr, type, member) ({                      \
 		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		      (type *)( (char *)__mptr - offsetof(type,member) );})
+static int
+create_db(u_int type, u_int flags, void **vp, char *path, char **map, size_t dbsiz, char *ifname, int ifnamelen)
+{
+	int fd = 0;
+	char *paddr = NULL;
+
+#ifdef WITH_BPLUS
+	/* B+tree ? */
+	if (type == DT_DUMB && (flags & DBI_FLAGS_BPLUS)) {
+		int rc;
+		rc = btree_create_btree(path, ((gfile_t **)vp));
+		D("btree_create_btree() done (%d)", rc);
+		return rc != 0 ? -1 : 0;
+	} else
+#endif /* WITH_BPLUS */
+	if (type == DT_DUMB &&
+	    !(flags & DBI_FLAGS_BPLUS && flags & DBI_FLAGS_PASTE)) {
+	    do {
+		int fd;
+
+		unlink(path);
+		fd = open(path, O_RDWR | O_CREAT, S_IRWXU);
+		if (fd < 0) {
+			perror("open");
+			break;
+		}
+		if (map) {
+			if (fallocate(fd, 0, 0, dbsiz) < 0) {
+				perror("fallocate");
+				break;
+			}
+			paddr = _do_mmap(fd, dbsiz);
+			if (paddr == NULL)
+				break;
+			*map = paddr;
+#ifdef WITH_STACKMAP
+			if (flags & DBI_FLAGS_PASTE) {
+				/* initialize WAL header */
+				struct paste_hdr *ph;
+
+				ph = (struct paste_hdr *)paddr;
+				strncpy(ph->ifname, ifname, sizeof(ifnamelen));
+				strncpy(ph->path, ifname, strlen(path));
+			}
+#endif /* WITH_STACKMAP */
+		}
+		return 0;
+	    } while (0);
+	}
+	if (paddr != NULL)
+		munmap(paddr, dbsiz);
+	if (fd > 0)
+		close(fd);
+	return -1;
+}
 
 #ifdef WITH_STACKMAP
 static void *
@@ -1583,45 +1638,8 @@ main(int argc, char **argv)
 		D("preallocated http %d", dbi.httplen);
 	}
 
-#ifdef WITH_BPLUS
-	/* B+tree ? */
-	if (dbi.type == DT_DUMB && (dbi.flags & DBI_FLAGS_BPLUS)) {
-		int rc;
-		rc = btree_create_btree(BPLUSFILE, ((gfile_t **)&dbi.vp));
-		D("btree_create_btree() done (%d)", rc);
-	}
-#endif /* WITH_BPLUS */
-	if (dbi.type == DT_DUMB &&
-	    !(dbi.flags & DBI_FLAGS_BPLUS && dbi.flags & DBI_FLAGS_PASTE)) {
-		unlink(dbi.path);
-		dbi.dumbfd = open(dbi.path, O_RDWR | O_CREAT, S_IRWXU);
-		if (dbi.dumbfd < 0) {
-			perror("open");
-			goto close;
-		}
-		if (do_mmap) {
-			if (fallocate(dbi.dumbfd, 0, 0, dbi.dbsiz) < 0) {
-				perror("fallocate");
-				goto close;
-			}
-			dbi.paddr = _do_mmap(dbi.dumbfd, dbi.dbsiz);
-			if (dbi.paddr == NULL)
-				goto close;
-#ifdef WITH_STACKMAP
-			if (dbi.flags & DBI_FLAGS_PASTE) {
-				/* initialize WAL header */
-				struct paste_hdr *ph;
-
-				ph = (struct paste_hdr *)dbi.paddr;
-				strncpy(ph->ifname, dbi.ifname,
-						sizeof(dbi.ifname));
-				strncpy(ph->path, dbi.ifname, strlen(dbi.path));
-			}
-#endif /* WITH_STACKMAP */
-		}
-	}
 #ifdef WITH_SQLITE
-       	else if (dbi.type == DT_SQLITE) {
+       	if (dbi.type == DT_SQLITE) {
 		char *err_msg;
 		char create_tbl_stmt[128];
 		char *journal_wal_stmt = "PRAGMA journal_mode = WAL";
@@ -1666,8 +1684,13 @@ error:
 			err_msg = NULL;
 			goto close;
 		}
-	}
+	} else
 #endif /* WITH_SQLITE */
+	if (create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path,
+			do_mmap ? &dbi.paddr : NULL,
+			dbi.dbsiz, dbi.ifname, strlen(dbi.ifname))) {
+		goto close;
+	}
 
 	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sd < 0) {
@@ -1783,6 +1806,6 @@ close_socket:
 	if (sd > 0)
 		close(sd);
 close:
-	close_db(&dbi);
+	close_db(dbi.path, dbi.type, dbi.paddr, dbi.dbsiz, &dbi.dumbfd);
 	return (0);
 }
