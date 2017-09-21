@@ -1278,11 +1278,63 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		      (type *)( (char *)__mptr - offsetof(type,member) );})
 static int
-create_db(u_int type, u_int flags, void **vp, char *path, char **map, size_t dbsiz, char *ifname, int ifnamelen)
+create_db(u_int type, u_int flags, void **vp, char *path, void *fd_or_sql, char **map, size_t dbsiz, char *ifname, int ifnamelen)
 {
 	int fd = 0;
 	char *paddr = NULL;
 
+#ifdef WITH_SQLITE
+       	if (dbi.type == DT_SQLITE) {
+	    do {
+		char *err_msg;
+		char create_tbl_stmt[128];
+		char *journal_wal_stmt = "PRAGMA journal_mode = WAL";
+		char *excl_lock_stmt = "PRAGMA locking_mode = EXCLUSIVE";
+		char *synchronous_stmt = "PRAGMA synchronous = FULL";
+		sqlite3 *sql_conn = NULL;
+
+		/* open db file and get handle */
+		ret = sqlite3_open_v2(path, &sql_conn,
+			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 
+			SQLITE_OPEN_WAL, NULL);
+		if (SQLITE_OK != ret) {
+			D("sqlite3_open_v2 failed");
+			break;
+		}
+		/* enable wal */
+		ret = sqlite3_exec(sql_conn, journal_wal_stmt,
+			       	NULL, NULL, &err_msg);
+		if (SQLITE_OK != ret)
+			goto error;
+		/* avoiding shared memory cuts 4 us */
+		ret = sqlite3_exec(sql_conn, excl_lock_stmt,
+			       	NULL, NULL, &err_msg);
+		if (SQLITE_OK != ret)
+			goto error;
+		/* flush every commit onto the disk */
+		ret = sqlite3_exec(sql_conn, synchronous_stmt,
+			       	NULL, NULL, &err_msg);
+		if (SQLITE_OK != ret)
+			goto error;
+
+		/* create a table */
+		snprintf(create_tbl_stmt, sizeof(create_tbl_stmt),
+			       	"CREATE TABLE IF NOT EXISTS %s "
+			       	"(id INTEGER, "
+				"name BINARY(2048))", SQLDBTABLE);
+		ret = sqlite3_exec(sql_conn, create_tbl_stmt,
+				NULL, NULL, &err_msg);
+		if (SQLITE_OK != ret ) {
+error:
+			D("%s", err_msg);
+			sqlite3_free(err_msg);
+			err_msg = NULL;
+			break;
+		}
+		*(sqlite3 *)fd_or_sql = sql_conn;
+	    } while (0);
+	} else
+#endif /* WITH_SQLITE */
 #ifdef WITH_BPLUS
 	/* B+tree ? */
 	if (type == DT_DUMB && (flags & DBI_FLAGS_BPLUS)) {
@@ -1323,6 +1375,7 @@ create_db(u_int type, u_int flags, void **vp, char *path, char **map, size_t dbs
 			}
 #endif /* WITH_STACKMAP */
 		}
+		*(int *)fd_or_sql = fd;
 		return 0;
 	    } while (0);
 	}
@@ -1638,57 +1691,9 @@ main(int argc, char **argv)
 		D("preallocated http %d", dbi.httplen);
 	}
 
-#ifdef WITH_SQLITE
-       	if (dbi.type == DT_SQLITE) {
-		char *err_msg;
-		char create_tbl_stmt[128];
-		char *journal_wal_stmt = "PRAGMA journal_mode = WAL";
-		char *excl_lock_stmt = "PRAGMA locking_mode = EXCLUSIVE";
-		char *synchronous_stmt = "PRAGMA synchronous = FULL";
-
-		/* open db file and get handle */
-		ret = sqlite3_open_v2(dbi.path, &dbi.sql_conn,
-			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 
-			SQLITE_OPEN_WAL, NULL);
-		if (SQLITE_OK != ret) {
-			D("sqlite3_open_v2 failed");
-			goto close;
-		}
-		/* enable wal */
-		ret = sqlite3_exec(dbi.sql_conn, journal_wal_stmt,
-			       	NULL, NULL, &err_msg);
-		if (SQLITE_OK != ret)
-			goto error;
-		/* avoiding shared memory cuts 4 us */
-		ret = sqlite3_exec(dbi.sql_conn, excl_lock_stmt,
-			       	NULL, NULL, &err_msg);
-		if (SQLITE_OK != ret)
-			goto error;
-		/* flush every commit onto the disk */
-		ret = sqlite3_exec(dbi.sql_conn, synchronous_stmt,
-			       	NULL, NULL, &err_msg);
-		if (SQLITE_OK != ret)
-			goto error;
-
-		/* create a table */
-		snprintf(create_tbl_stmt, sizeof(create_tbl_stmt),
-			       	"CREATE TABLE IF NOT EXISTS %s "
-			       	"(id INTEGER, "
-				"name BINARY(2048))", SQLDBTABLE);
-		ret = sqlite3_exec(dbi.sql_conn, create_tbl_stmt,
-				NULL, NULL, &err_msg);
-		if (SQLITE_OK != ret ) {
-error:
-			D("%s", err_msg);
-			sqlite3_free(err_msg);
-			err_msg = NULL;
-			goto close;
-		}
-	} else
-#endif /* WITH_SQLITE */
-	if (create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path,
-			do_mmap ? &dbi.paddr : NULL,
-			dbi.dbsiz, dbi.ifname, strlen(dbi.ifname))) {
+	if (create_db(dbi.type, dbi.flags, &dbi.vp, dbi.path, &dbi.dumbfd,
+			do_mmap ? &dbi.paddr : NULL, dbi.dbsiz,
+			dbi.ifname, strlen(dbi.ifname))) {
 		goto close;
 	}
 
