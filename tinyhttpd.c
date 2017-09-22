@@ -1423,24 +1423,28 @@ _worker(void *data)
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
-		struct nmreq *req = &g->nmd->req;
+		struct nmreq *req = &targ->nmd->req;
 		struct netmap_if *nifp = targ->nmd->nifp;
 		struct netmap_ring *any_ring = NETMAP_RXRING(nifp, 0);
 		uint32_t i, next = nifp->ni_bufs_head;
 		int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; /* XXX */
 
+		D("have %u extra buffers from %u ring %p", n, next, any_ring);
 		tp->extra = calloc(sizeof(*tp->extra), n);
 		if (!tp->extra) {
 			perror("calloc");
 			goto quit;
 		}
 		for (i = 0; i < n && next; i++) {
+			char *p;
 #ifdef WITH_KVS
 			tp->extra[i].buf_idx = next;
 #else
 			tp->extra[i] = next;
 #endif
-			next = *(uint32_t *)NETMAP_BUF(any_ring, next);
+			p = NETMAP_BUF(any_ring, next);
+			//next = *(uint32_t *)NETMAP_BUF(any_ring, next);
+			next = *(uint32_t *)p;
 		}
 		tp->extra_num = i;
 		D("imported %u extra buffers", i);
@@ -1573,7 +1577,7 @@ quit:
 		free(tp->extra);
 	if (tp->fds)
 		free(tp->fds);
-	close_db(tp->path, dbip->type, tp->paddr, tp->dbsiz, &tp->dumbfd);
+	close_db(dbpath, dbip->type, tp->paddr, tp->dbsiz, &tp->dumbfd);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -1657,6 +1661,7 @@ main(int argc, char **argv)
 			// believe 90 % is available for bufs
 			dbi.g.extra_bufs = (dbi.g.extmem_siz / 2048) / 10 * 9;
 			dbi._dbsiz = dbi.g.extra_bufs * 8 * 2;
+			D("extra_bufs request %u", dbi.g.extra_bufs);
 			break;
 		case 'c':
 			dbi.httplen = 1;
@@ -1798,7 +1803,7 @@ main(int argc, char **argv)
 				goto close_socket;
 			}
 			*/
-			D("mmap success");
+			D("mmap success %p", dbi.g.extmem);
 		}
 #endif
 	} else {

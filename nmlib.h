@@ -326,6 +326,11 @@ nm_start_threads(struct nm_garg *g)
 						       	strerror(errno));
 					continue;
 				}
+				D("got %u extra bufs at %u",
+				    t->nmd->req.nr_arg3 ?
+				    t->nmd->req.nr_arg3 :
+				    t->nmd->req.nr_arg4,
+				    t->nmd->nifp->ni_bufs_head);
 			} else {
 				t->nmd = g->nmd;
 			}
@@ -488,7 +493,6 @@ nm_main_thread(struct nm_garg *g)
 		tx_output(&cur, delta_t, "Received");
 }
 
-
 int
 nm_start(struct nm_garg *g)
 {
@@ -500,11 +504,15 @@ nm_start(struct nm_garg *g)
 
 	char errmsg[MAXERRMSG];
 	u_int flags;
+	struct nmreq req; // only for suffix and extmem
 
+	bzero(&req, sizeof(req));
 	g->main_fd = -1;
 	g->wait_link = 3;
 	g->report_interval = 2000;
 	g->cpus = g->system_cpus = i = system_ncpus();
+	if (g->nthreads == 0)
+		g->nthreads = 1;
 	if (g->cpus < 0 || g->cpus > i) {
 		D("%d cpus is too high, have only %d cpus", g->cpus, i);
 		return -EINVAL;
@@ -526,17 +534,17 @@ nm_start(struct nm_garg *g)
 
 	nm_parse_nmr_config(g->nmr_config, &base_nmd.req);
 	if (g->extra_bufs) {
-		base_nmd.req.nr_arg3 = g->extra_bufs;
+		base_nmd.req.nr_arg3 = g->extra_bufs / g->nthreads;
 	}
 	if (g->extra_pipes) {
 		base_nmd.req.nr_arg1 = g->extra_pipes;
 	}
 #ifdef WITH_EXTMEM
 	if (g->extmem) {
-		base_nmd.req.nr_cmd2 = NETMAP_POOLS_CREATE;
+		req.nr_cmd2 = NETMAP_POOLS_CREATE;
 		if (g->extra_bufs)
 			base_nmd.req.nr_arg4 = base_nmd.req.nr_arg3;
-                memcpy((void *)&base_nmd.req.nr_arg1, &g->extmem, sizeof(void *));
+                memcpy((void *)&req.nr_arg1, &g->extmem, sizeof(void *));
 	}
 #endif /* WITH_EXTMEM */
 	base_nmd.req.nr_flags |= NR_ACCEPT_VNET_HDR;
@@ -544,6 +552,11 @@ nm_start(struct nm_garg *g)
 	if (nm_parse(g->ifname, &base_nmd, errmsg) < 0) {
 		D("Invalid name '%s': %s", g->ifname, errmsg);
 		return -EINVAL;
+	}
+	if (strlen(base_nmd.req.nr_suffix) > 0) {
+		strncpy(req.nr_suffix, base_nmd.req.nr_suffix,
+				sizeof(req.nr_suffix));
+		bzero(base_nmd.req.nr_suffix, sizeof(base_nmd.req.nr_suffix));
 	}
 
 	/*
@@ -554,18 +567,20 @@ nm_start(struct nm_garg *g)
 	 * reconfigure. We do the open here to have time to reset.
 	 */
 	flags = NM_OPEN_IFNAME | NM_OPEN_RING_CFG;
-	if (base_nmd.req.nr_cmd2 != NETMAP_POOLS_CREATE)
+	if (req.nr_cmd2 != NETMAP_POOLS_CREATE)
 		flags |= NM_OPEN_ARG1 | NM_OPEN_ARG2 | NM_OPEN_ARG3;
 	if (g->nthreads > 1) {
 		base_nmd.req.nr_flags &= ~NR_REG_MASK;
 		base_nmd.req.nr_flags |= NR_REG_ONE_NIC;
 		base_nmd.req.nr_ringid = 0;
 	}
-	g->nmd = nm_open(g->ifname, NULL, flags, &base_nmd);
+	g->nmd = nm_open(g->ifname, &req, flags, &base_nmd);
 	if (g->nmd == NULL) {
 		D("Unable to open %s: %s", g->ifname, strerror(errno));
 		goto out;
 	}
+	ND("got %u extra bufs at %u", g->nmd->req.nr_arg3 ?  g->nmd->req.nr_arg3
+			: g->nmd->req.nr_arg4, g->nmd->nifp->ni_bufs_head);
 
 	/* XXX remove unnecessary suffix */
 	if ((p = index(g->ifname, ','))) {
