@@ -1585,7 +1585,7 @@ main(int argc, char **argv)
 	int sd;
 	struct sockaddr_in sin;
 	const int on = 1;
-	int port = 0;
+	int port = 60000;
 	struct dbinfo dbi;
 #ifdef WITH_SQLITE
 	int ret = 0;
@@ -1594,6 +1594,7 @@ main(int argc, char **argv)
 	bzero(&dbi, sizeof(dbi));
 	dbi.type = DT_NONE;
 	dbi.pgsiz = getpagesize();
+	dbi.msglen = 64;
 #ifdef WITH_STACKMAP
 	dbi.g.nmr_config = "";
 	dbi.g.nthreads = 1;
