@@ -187,6 +187,7 @@ static inline void _mm_clflushopt(volatile void *__p)
 #define MAXQUERYLEN 32767
 
 #define MAX_HTTPLEN	65535
+
 struct dbinfo {
 	int	type;
 	char 	*prefix;
@@ -1817,10 +1818,10 @@ close_socket:
 			munmap(dbi.g.extmem, dbi.g.extmem_siz);
 		close(dbi.extmemfd);
 		remove(PMEMFILE);
-		//free(dbi.g.extmem);
 	}
 #endif /* WITH_EXTMEM */
 
 	if (sd > 0)
 		close(sd);
+	return 0;
 }
