@@ -493,10 +493,13 @@ int
 nm_start(struct nm_garg *g)
 {
 	int i, devqueues = 0;
-	struct nmreq base_nmd;
+	struct nm_desc base_nmd;
 	struct sigaction sa;
 	sigset_t ss;
 	char *p;
+
+	char errmsg[MAXERRMSG];
+	u_int flags;
 
 	g->main_fd = -1;
 	g->wait_link = 3;
@@ -521,22 +524,27 @@ nm_start(struct nm_garg *g)
 
 	bzero(&base_nmd, sizeof(base_nmd));
 
-	nm_parse_nmr_config(g->nmr_config, &base_nmd);
+	nm_parse_nmr_config(g->nmr_config, &base_nmd.req);
 	if (g->extra_bufs) {
-		base_nmd.nr_arg3 = g->extra_bufs;
+		base_nmd.req.nr_arg3 = g->extra_bufs;
 	}
 	if (g->extra_pipes) {
-		base_nmd.nr_arg1 = g->extra_pipes;
+		base_nmd.req.nr_arg1 = g->extra_pipes;
 	}
 #ifdef WITH_EXTMEM
 	if (g->extmem) {
-		base_nmd.nr_cmd2 = NETMAP_POOLS_CREATE;
+		base_nmd.req.nr_cmd2 = NETMAP_POOLS_CREATE;
 		if (g->extra_bufs)
-			base_nmd.nr_arg4 = base_nmd.nr_arg3;
-                memcpy((void *)&base_nmd.nr_arg1, &g->extmem, sizeof(void *));
+			base_nmd.req.nr_arg4 = base_nmd.req.nr_arg3;
+                memcpy((void *)&base_nmd.req.nr_arg1, &g->extmem, sizeof(void *));
 	}
 #endif /* WITH_EXTMEM */
-	base_nmd.nr_flags |= NR_ACCEPT_VNET_HDR;
+	base_nmd.req.nr_flags |= NR_ACCEPT_VNET_HDR;
+
+	if (nm_parse(g->ifname, &base_nmd, errmsg) < 0) {
+		D("Invalid name '%s': %s", g->ifname, errmsg);
+		return -EINVAL;
+	}
 
 	/*
 	 * Open the netmap device using nm_open().
@@ -545,26 +553,18 @@ nm_start(struct nm_garg *g)
 	 * which in turn may take some time for the PHY to
 	 * reconfigure. We do the open here to have time to reset.
 	 */
-	g->nmd = nm_open(g->ifname, &base_nmd, 0, NULL);
+	flags = NM_OPEN_IFNAME | NM_OPEN_RING_CFG;
+	if (base_nmd.req.nr_cmd2 != NETMAP_POOLS_CREATE)
+		flags |= NM_OPEN_ARG1 | NM_OPEN_ARG2 | NM_OPEN_ARG3;
+	if (g->nthreads > 1) {
+		base_nmd.req.nr_flags &= ~NR_REG_MASK;
+		base_nmd.req.nr_flags |= NR_REG_ONE_NIC;
+		base_nmd.req.nr_ringid = 0;
+	}
+	g->nmd = nm_open(g->ifname, NULL, flags, &base_nmd);
 	if (g->nmd == NULL) {
 		D("Unable to open %s: %s", g->ifname, strerror(errno));
 		goto out;
-	}
-
-	if (g->nthreads > 1) {
-		struct nm_desc saved_desc = *g->nmd;
-		saved_desc.self = &saved_desc;
-		saved_desc.mem = NULL;
-		nm_close(g->nmd);
-		saved_desc.req.nr_flags &= ~NR_REG_MASK;
-		saved_desc.req.nr_flags |= NR_REG_ONE_NIC;
-		saved_desc.req.nr_ringid = 0;
-		g->nmd = nm_open(g->ifname, &base_nmd, NM_OPEN_IFNAME,
-				&saved_desc);
-		if (g->nmd == NULL) {
-			D("Unable to open %s: %s", g->ifname, strerror(errno));
-			goto out;
-		}
 	}
 
 	/* XXX remove unnecessary suffix */
