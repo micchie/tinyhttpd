@@ -1425,7 +1425,7 @@ _worker(void *data)
 	if (g->dev_type == DEV_NETMAP) {
 		struct nmreq *req = &targ->nmd->req;
 		struct netmap_if *nifp = targ->nmd->nifp;
-		struct netmap_ring *any_ring = NETMAP_RXRING(nifp, 0);
+		struct netmap_ring *any_ring = targ->nmd->some_ring;
 		uint32_t i, next = nifp->ni_bufs_head;
 		int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; /* XXX */
 
