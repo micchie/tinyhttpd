@@ -1056,7 +1056,7 @@ log:
 					tp->extra[extra_i] = i;
 #endif
 
-				} else if (paddr) {
+				} else if (paddr || tp->vp) {
 					copy_and_log(paddr, &tp->cur,
 					    dbsiz, rxbuf + coff, thisclen,
 					    thisclen, dbi->pm ? 0 : dbi->pgsiz,
@@ -1213,7 +1213,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			return 0;
 		}
 		if (dbi->type == DT_DUMB) {
-			if (paddr) {
+			if (paddr || tp->vp) {
 				copy_and_log(paddr, &tp->cur, tp->dbsiz,
 				    readmmap ? NULL : rxbuf + coff, clen,
 				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
@@ -1294,6 +1294,7 @@ create_db(u_int type, u_int flags, void **vp, char *path, void *fd_or_sql, char 
 	int fd = 0;
 	char *paddr = NULL;
 
+	D("map %p", map);
 #ifdef WITH_SQLITE
        	if (type == DT_SQLITE) {
 	    do {
