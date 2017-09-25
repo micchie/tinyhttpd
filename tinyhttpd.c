@@ -248,7 +248,7 @@ struct thpriv {
 	size_t dbsiz;
 
 };
-#define DEFAULT_NFDS	1024
+#define DEFAULT_NFDS	65535
 
 static inline uint32_t
 get_extra(struct thpriv *tp)
@@ -1174,7 +1174,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
-	ssize_t len = 0;
+	ssize_t len = 0, written;
 	struct thpriv *tp = targ->td_private;
 	size_t max;
 	char *paddr = tp->paddr;
@@ -1276,9 +1276,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			len = generate_http(msglen, txbuf, content);
 		}
 	}
-	len = write(fd, txbuf, len);
-	if (unlikely(len < 0)) {
+	written = write(fd, txbuf, len);
+	if (unlikely(written < 0)) {
 		perror("write");
+	} else if (unlikely(written < len)) {
+		RD(1, "written %ld len %ld", written, len);
 	}
 	return 0;
 }
@@ -1365,6 +1367,7 @@ error:
 			break;
 		}
 		if (flags & DBI_FLAGS_MMAP) {
+			D("error %s", path);
 			if (fallocate(fd, 0, 0, dbsiz) < 0) {
 				perror("fallocate");
 				break;
@@ -1508,7 +1511,7 @@ _worker(void *data)
 				newfd = accept(pfd[1].fd, (struct sockaddr *)
 					    &tmp, &len);
 				if (newfd < 0) {
-					perror("accept");
+					RD(1, "accept error");
 					/* ignore this socket */
 					goto accepted;
 				}
@@ -1726,6 +1729,10 @@ main(int argc, char **argv)
 		perror("setsockopt");
 		goto close_socket;
 	}
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+		perror("setsockopt");
+		goto close_socket;
+	}
 	if (setsockopt(sd, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
@@ -1780,6 +1787,7 @@ main(int argc, char **argv)
 	                        goto close_socket;
 	                }
 			if (fallocate(fd, 0, 0, dbi.g.extmem_siz) < 0) {
+				D("error %s", PMEMFILE);
 				perror("fallocate");
 				goto close_socket;
 			}
