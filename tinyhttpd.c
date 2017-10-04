@@ -1289,12 +1289,12 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		      (type *)( (char *)__mptr - offsetof(type,member) );})
 static int
-create_db(u_int type, u_int flags, void **vp, char *path, void *fd_or_sql, char **map, size_t dbsiz, char *ifname, int ifnamelen)
+create_db(u_int type, u_int flags, char *path, void *fd_or_sql, char **map, size_t dbsiz, void **vp, char *bppath, int i, char *ifname, int ifnamelen)
 {
 	int fd = 0;
 	char *paddr = NULL;
 
-	D("map %p", map);
+	ND("map %p", map);
 #ifdef WITH_SQLITE
        	if (type == DT_SQLITE) {
 	    do {
@@ -1345,23 +1345,29 @@ error:
 		}
 		*(sqlite3 *)fd_or_sql = sql_conn;
 	    } while (0);
-	} else
+	}
 #endif /* WITH_SQLITE */
 #ifdef WITH_BPLUS
 	/* B+tree ? */
 	if (type == DT_DUMB && (flags & DBI_FLAGS_BPLUS)) {
 		int rc;
-		rc = btree_create_btree(path, ((gfile_t **)vp));
+		char bp[64];
+
+		snprintf(bp, sizeof(bp), "%s%d", bppath, i);
+		rc = btree_create_btree(bp, ((gfile_t **)vp));
 		D("btree_create_btree() done (%d)", rc);
-		return rc != 0 ? -1 : 0;
-	} else
+		if (rc != 0)
+			return -1;
+	}
 #endif /* WITH_BPLUS */
 	if (type == DT_DUMB &&
 	    !(flags & DBI_FLAGS_BPLUS && flags & DBI_FLAGS_PASTE)) {
 	    do {
 		int fd;
+		char db[64];
 
-		unlink(path);
+		snprintf(db, sizeof(db), "%s%d", path, i);
+		unlink(db);
 		fd = open(path, O_RDWR | O_CREAT, S_IRWXU);
 		if (fd < 0) {
 			perror("open");
@@ -1409,13 +1415,15 @@ _worker(void *data)
 	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
 	int msglen = dbip->msglen;
 	struct thpriv *tp = targ->td_private;
-	char dbpath[64];
+	char dbpath[64], bpluspath[64];
 
 	/* create db */
 	tp->dbsiz = dbip->_dbsiz / g->nthreads;
 	snprintf(dbpath, sizeof(dbpath), "%s%d", dbip->prefix, targ->me);
-	if (dbip->prefix && create_db(dbip->type, dbip->flags, &tp->vp, dbpath,
-				&tp->dumbfd, &tp->paddr, tp->dbsiz,
+	snprintf(bpluspath, sizeof(bpluspath), "%s%d", BPLUSFILE, targ->me);
+	if (dbip->prefix && create_db(dbip->type, dbip->flags, dbip->prefix,
+				&tp->dumbfd, &tp->paddr, tp->dbsiz, &tp->vp,
+				BPLUSFILE, targ->me,
 				g->dev_type == DEV_NETMAP ?
 			 	    targ->nmd->req.nr_name : NULL,
 				g->dev_type == DEV_NETMAP ?
