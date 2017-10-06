@@ -190,9 +190,9 @@ static inline void _mm_clflushopt(volatile void *__p)
 
 struct dbinfo {
 	int	type;
-	char 	*prefix;
+	char path[64];
+	char metapath[64];
 	u_int pgsiz;
-	int fdel;
 	int pm;
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READMMAP	0x2
@@ -201,6 +201,32 @@ struct dbinfo {
 #define DBI_FLAGS_KVS		0x10
 #define DBI_FLAGS_MMAP		0x20
 	int flags;
+
+	union {
+#ifdef WITH_SQLITE
+		sqlite3 *sql_conn;
+#endif
+		int	dumbfd;
+	};
+	char *paddr;
+	void *vp; // gfile_t
+	size_t size;
+	int i;
+	size_t cur;
+};
+
+struct dbargs {
+	int type;
+	size_t size;
+	size_t pgsiz;
+	int flags;
+	int pm;
+	int i;
+	char *prefix;
+	char *metaprefix;
+};
+
+struct glpriv {
 	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
 #ifdef WITH_STACKMAP
 	struct nm_garg g;
@@ -212,7 +238,7 @@ struct dbinfo {
 	int httplen;
 	int msglen;
 	/* propagated to thread */
-	size_t _dbsiz;
+	struct dbargs dbargs;
 };
 
 /* XXX DB-related info should also be moved here */
@@ -220,12 +246,13 @@ struct thpriv {
 	struct nm_garg *g;
 	char *rxbuf;
 	char *txbuf;
-	size_t cur;
 	uint64_t pst_ent;
 	uint16_t txlen;
 	uint16_t rxlen;
 	struct nm_ifreq ifreq;
 	struct epoll_event evts[MAXCONNECTIONS];
+	int	*fds;
+	int	nfds;
 #ifdef WITH_KVS
 	struct netmap_slot *extra;
 #else
@@ -233,25 +260,12 @@ struct thpriv {
 #endif
 	uint32_t extra_cur;
 	uint32_t extra_num;
-	int	*fds;
-	int	nfds;
-
-	char 	*path;
-	union {
-#ifdef WITH_SQLITE
-		sqlite3 *sql_conn;
-#endif
-		int	dumbfd;
-	};
-	char *paddr;
-	void *vp; // gfile_t
-	size_t dbsiz;
-
+	struct dbinfo *db;
 };
 #define DEFAULT_NFDS	65535
 
 static inline uint32_t
-get_extra(struct thpriv *tp)
+get_extra(struct thpriv *tp, size_t *dbcur)
 {
 	uint32_t ret;
 
@@ -259,7 +273,7 @@ get_extra(struct thpriv *tp)
 
 	if (unlikely(tp->extra_cur == tp->extra_num)) {
 		tp->extra_cur = 0;
-		tp->cur = 0; //clear log too
+		*dbcur = 0; //clear log too
 	}
 	return ret;
 }
@@ -409,7 +423,7 @@ _do_mmap(int fd, size_t len)
 }
 
 void
-close_db(const char *path, int type, char *map, size_t dbsiz, void *fd_or_sql)
+close_db(struct dbinfo *db)
 {
 	struct stat st;
 #ifdef WITH_SQLITE
@@ -417,30 +431,29 @@ close_db(const char *path, int type, char *map, size_t dbsiz, void *fd_or_sql)
 #endif
 
 	/* close reference */
-	if (type == DT_DUMB) {
-		int fd = *(int *)fd_or_sql;
-		if (map)
-			if (munmap(map, dbsiz))
+	if (db->type == DT_DUMB) {
+		if (db->paddr)
+			if (munmap(db->paddr, db->size))
 				perror("munmap");
-		if (fd > 0) {
+		if (db->dumbfd > 0) {
 			D("closing dumbfd");
-			close(fd);
+			close(db->dumbfd);
 		}
 	}
 #ifdef WITH_SQLITE
-	else if (type == DT_SQLITE) {
+	else if (db->type == DT_SQLITE) {
 		D("closing sqlite3 obj");
-		sqlite3_close_v2(*(sqlite3 *)fd_or_sql);
+		sqlite3_close_v2(dbi->sql_conn);
 	}
 #endif
 	/* remove file */
-	if (!path || !strncmp(path, ":memory:", 8)) {
+	if (!db->path || !strncmp(db->path, ":memory:", 8)) {
 		D("No dbfile to remove");
 		return;
 	}
 	bzero(&st, sizeof(st));
-	stat(path, &st);
-	D("removing %s (%ld bytes)", path, st.st_size);
+	stat(db->path, &st);
+	D("removing %s (%ld bytes)", db->path, st.st_size);
 #ifdef WITH_SQLITE
 	if (dbip->type == DT_SQLITE) {
 		strncpy(path_wal, path, sizeof(path_wal));
@@ -451,7 +464,7 @@ close_db(const char *path, int type, char *map, size_t dbsiz, void *fd_or_sql)
 		remove(path_shm);
 	}
 #endif
-	remove(path);
+	remove(db->path);
 }
 
 int
@@ -730,6 +743,7 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	int error;
 	size_t cur = *pos;
 
+	D("len %lu  space %lu fd %d pos %lu, fdsync %d", len, space, fd, *pos, fdsync);
 	if (cur + len > space){
 		if (lseek(fd, 0, SEEK_SET) < 0) {
 			perror("lseek");
@@ -872,10 +886,6 @@ paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 	if (rc == 0)
 		unique++;
 	ND("key %lu val %lu idx %u off %lu len %lu", key, pst_ent, slot->buf_idx, off, len);
-	//btree_lookup(vp, key, &datam);
-	//if (datam != pst_ent)
-	//	D("warning: pst_ent %lu but datam %lu",pst_ent, datam);
-	//
 }
 #endif /* WITH_BPLUS */
 
@@ -911,7 +921,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	u_int i = 0;
 	size_t aligned = len;
 
-	ND("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
+	D("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
 #ifdef WITH_BPLUS
 	if (vp) {
 		align = NETMAP_BUF_SIZE;
@@ -966,18 +976,19 @@ int
 do_nm_ring(struct nm_targ *targ, int ring_nr)
 {
 	struct nm_garg *g = targ->g;
-	struct dbinfo *dbi = container_of(g, struct dbinfo, g);
+	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct thpriv *tp = targ->td_private;
-	ssize_t msglen = dbi->msglen;
-	int type = dbi->type;
-	int flags = dbi->flags;
+	struct dbinfo *dbi = tp->db;
 
 	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
 	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
-	size_t dbsiz = tp->dbsiz;
-	char *paddr = tp->paddr;
+	ssize_t msglen = gp->msglen;
+
+	const int type = dbi->type;
+	const int flags = dbi->flags;
+	const size_t dbsiz = dbi->size;
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
@@ -1018,20 +1029,20 @@ log:
 #ifdef WITH_KVS
 					struct netmap_slot tmp, *extra;
 #endif
-					uint32_t extra_i = get_extra(tp);
+					uint32_t extra_i = get_extra(tp, &dbi->cur);
 
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
 						_mm_clflush(rxbuf + i);
 					}
 #ifdef WITH_BPLUS
-					if (tp->vp) {
-						paste_bplus(tp->vp, key, rxs,
+					if (dbi->vp) {
+						paste_bplus(dbi->vp, key, rxs,
 							off + coff, thisclen);
 					} else
 #endif
-				       	if (paddr) {
-						paste_wal(paddr, &tp->cur,
+				       	if (dbi->paddr) {
+						paste_wal(dbi->paddr, &dbi->cur,
 						    dbsiz, rxs, off + coff,
 						    thisclen);
 					}
@@ -1056,14 +1067,14 @@ log:
 					tp->extra[extra_i] = i;
 #endif
 
-				} else if (paddr || tp->vp) {
-					copy_and_log(paddr, &tp->cur,
+				} else if (dbi->paddr) {
+					copy_and_log(dbi->paddr, &dbi->cur,
 					    dbsiz, rxbuf + coff, thisclen,
 					    thisclen, dbi->pm ? 0 : dbi->pgsiz,
-					    dbi->pm, tp->vp, key);
+					    dbi->pm, dbi->vp, key);
 				} else {
 					if (writesync(rxbuf + coff, len, dbsiz,
-					    tp->dumbfd, &tp->cur,
+					    dbi->dumbfd, &dbi->cur,
 					    flags & DBI_FLAGS_FDSYNC)) {
 						return -1;
 					}
@@ -1077,7 +1088,7 @@ log:
 #ifdef WITH_KVS
 			uint64_t key = parse_get_key(rxbuf);
 
-			if (tp->vp) {
+			if (dbi->vp) {
 				uint64_t datam = 0;
 				int rc;
 				uint32_t _idx;
@@ -1085,12 +1096,12 @@ log:
 				struct netmap_slot *s;
 				int t;
 
-				rc = btree_lookup(tp->vp, key, &datam);
+				rc = btree_lookup(dbi->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
 				}
 				_to_tuple(datam, &_idx, &_off, &_len);
-				if (dbi->flags & DBI_FLAGS_PASTE) {
+				if (flags & DBI_FLAGS_PASTE) {
 					char *_buf = NETMAP_BUF(rxr, _idx);
 
 					s = _digout_slot(_buf, _off);
@@ -1121,19 +1132,17 @@ log:
 						msglen = _len;
 					}
 				} else {
-					content = paddr + NETMAP_BUF_SIZE*_idx;
+					content = dbi->paddr +
+						NETMAP_BUF_SIZE * _idx;
 					msglen = _len;
 				}
 			}
 #endif /* WITH_KVS */
 
 get:
-			if (dbi->httplen && content == NULL) { // use cache
-				char *http = dbi->http;
-				int hlen = dbi->httplen;
-
-				if (copy_to_nm(txr, g->virt_header, http, hlen,
-						o, o, rxs->fd) < hlen) {
+			if (gp->httplen && content == NULL) { // use cache
+				if (copy_to_nm(txr, g->virt_header, gp->http,
+				    gp->httplen, o, o, rxs->fd) < gp->httplen) {
 					continue;
 				}
 			} else {
@@ -1168,28 +1177,29 @@ update_ctr:
 
 int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 {
-	struct dbinfo *dbi = container_of(targ->g, struct dbinfo, g);
 	char buf[MAXQUERYLEN];
 	char *rxbuf, *txbuf;
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
 	ssize_t len = 0, written;
+	struct nm_garg *g = targ->g;
 	struct thpriv *tp = targ->td_private;
+	struct glpriv *gp = container_of(g, struct glpriv, g);
+	struct dbinfo *dbi = tp->db;
 	size_t max;
-	char *paddr = tp->paddr;
 	int readmmap = !!(dbi->flags & DBI_FLAGS_READMMAP);
 	char *content = NULL;
 
 	rxbuf = txbuf = buf;
 	if (readmmap) {
-		size_t cur = tp->cur;
-		max = tp->dbsiz - sizeof(struct paste_hdr) - cur;
+		size_t cur = dbi->cur;
+		max = dbi->size - sizeof(struct paste_hdr) - cur;
 		if (unlikely(max < dbi->pgsiz)) {
 			cur = 0;
-			max = tp->dbsiz;
+			max = dbi->size;
 		}
-		rxbuf = paddr + tp->cur + sizeof(uint64_t); // metadata space
+		rxbuf = dbi->paddr + dbi->cur + sizeof(uint64_t);// metadata space
 		max -= sizeof(uint64_t);
 	} else {
 		max = sizeof(buf);
@@ -1213,14 +1223,14 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			return 0;
 		}
 		if (dbi->type == DT_DUMB) {
-			if (paddr || tp->vp) {
-				copy_and_log(paddr, &tp->cur, tp->dbsiz,
+			if (dbi->paddr) {
+				copy_and_log(dbi->paddr, &dbi->cur, dbi->size,
 				    readmmap ? NULL : rxbuf + coff, clen,
 				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
-				    dbi->pm, tp->vp, key);
+				    dbi->pm, dbi->vp, key);
 			} else {
-				if (writesync(rxbuf + coff, len, tp->dbsiz,
-				    tp->dumbfd, &tp->cur,
+				if (writesync(rxbuf + coff, len, dbi->size,
+				    dbi->dumbfd, &dbi->cur,
 				    dbi->flags & DBI_FLAGS_FDSYNC)) {
 					return -1;
 				}
@@ -1250,16 +1260,16 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #ifdef WITH_KVS
 		uint64_t key = parse_get_key(rxbuf);
 
-		if (tp->vp) {
+		if (dbi->vp) {
 			uint64_t datam = 0;
 			int rc;
 			uint32_t _idx;
 			uint16_t _off, _len;
 
-			rc = btree_lookup(tp->vp, key, &datam);
+			rc = btree_lookup(dbi->vp, key, &datam);
 			if (rc != ENOENT) {
 				_to_tuple(datam, &_idx, &_off, &_len);
-				content = paddr + NETMAP_BUF_SIZE * _idx;
+				content = dbi->paddr + NETMAP_BUF_SIZE * _idx;
 				msglen = _len;
 			}
 		}
@@ -1269,9 +1279,9 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	}
 
 	if (len) {
-		if (dbi->httplen && content == NULL) {
-			len = dbi->httplen;
-			memcpy(txbuf, dbi->http, len);
+		if (gp->httplen && content == NULL) {
+			len = gp->httplen;
+			memcpy(txbuf, gp->http, len);
 		} else {
 			len = generate_http(msglen, txbuf, content);
 		}
@@ -1289,14 +1299,24 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		      (type *)( (char *)__mptr - offsetof(type,member) );})
 static int
-create_db(u_int type, u_int flags, char *path, void *fd_or_sql, char **map, size_t dbsiz, void **vp, char *bppath, int i, char *ifname, int ifnamelen)
+create_db(struct dbargs *args, struct dbinfo *db)
 {
 	int fd = 0;
-	char *paddr = NULL;
+
+	bzero(db, sizeof(*db));
+
+	db->type = args->type;
+	db->flags = args->flags;
+	db->size = args->size;
+	db->pgsiz = args->pgsiz;
+	db->pm = args->pm;
 
 	ND("map %p", map);
+
+	if (db->type == DT_NONE)
+		return 0;
 #ifdef WITH_SQLITE
-       	if (type == DT_SQLITE) {
+       	if (db->type == DT_SQLITE) {
 	    do {
 		char *err_msg;
 		char create_tbl_stmt[128];
@@ -1306,7 +1326,7 @@ create_db(u_int type, u_int flags, char *path, void *fd_or_sql, char **map, size
 		sqlite3 *sql_conn = NULL;
 
 		/* open db file and get handle */
-		ret = sqlite3_open_v2(path, &sql_conn,
+		ret = sqlite3_open_v2(db->path, &sql_conn,
 			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 
 			SQLITE_OPEN_WAL, NULL);
 		if (SQLITE_OK != ret) {
@@ -1343,65 +1363,51 @@ error:
 			err_msg = NULL;
 			break;
 		}
-		*(sqlite3 *)fd_or_sql = sql_conn;
+		db->sql_conn = sql_conn;
 	    } while (0);
+	    return 0;
 	}
 #endif /* WITH_SQLITE */
 #ifdef WITH_BPLUS
-	/* B+tree ? */
-	if (type == DT_DUMB && (flags & DBI_FLAGS_BPLUS)) {
+	/* need B+tree ? */
+	if (db->flags & DBI_FLAGS_BPLUS) {
 		int rc;
-		char bp[64];
 
-		snprintf(bp, sizeof(bp), "%s%d", bppath, i);
-		rc = btree_create_btree(bp, ((gfile_t **)vp));
+		snprintf(db->metapath, sizeof(db->metapath), "%s%d",
+				args->metaprefix, args->i);
+		rc = btree_create_btree(db->metapath, ((gfile_t **)&db->vp));
 		D("btree_create_btree() done (%d)", rc);
 		if (rc != 0)
 			return -1;
 	}
 #endif /* WITH_BPLUS */
-	if (type == DT_DUMB &&
-	    !(flags & DBI_FLAGS_BPLUS && flags & DBI_FLAGS_PASTE)) {
+	if (db->flags & DBI_FLAGS_BPLUS && db->flags & DBI_FLAGS_PASTE) {
+		return 0;
+	} else {
 	    do {
-		int fd;
-		char db[64];
-
-		snprintf(db, sizeof(db), "%s%d", path, i);
-		unlink(db);
-		fd = open(path, O_RDWR | O_CREAT, S_IRWXU);
+		snprintf(db->path, sizeof(db->path), "%s%d",
+				args->prefix, args->i);
+		unlink(db->path);
+		fd = open(db->path, O_RDWR | O_CREAT, S_IRWXU);
 		if (fd < 0) {
 			perror("open");
 			break;
 		}
-		if (flags & DBI_FLAGS_MMAP) {
-			D("error %s", path);
-			if (fallocate(fd, 0, 0, dbsiz) < 0) {
+		if (db->flags & DBI_FLAGS_MMAP) {
+			if (fallocate(fd, 0, 0, db->size) < 0) {
 				perror("fallocate");
 				break;
 			}
-			paddr = _do_mmap(fd, dbsiz);
-			if (paddr == NULL)
+			db->paddr = _do_mmap(fd, db->size);
+			if (db->paddr == NULL)
 				break;
-			*map = paddr;
-#ifdef WITH_STACKMAP
-			if (flags & DBI_FLAGS_PASTE) {
-				/* initialize WAL header */
-				struct paste_hdr *ph;
-
-				ph = (struct paste_hdr *)paddr;
-				strncpy(ph->ifname, ifname, sizeof(ifnamelen));
-				strncpy(ph->path, ifname, strlen(path));
-			}
-#endif /* WITH_STACKMAP */
 		}
-		*(int *)fd_or_sql = fd;
+		db->dumbfd = fd;
 		return 0;
 	    } while (0);
-	}
-	if (paddr != NULL)
-		munmap(paddr, dbsiz);
-	if (fd > 0)
+	    if (fd > 0)
 		close(fd);
+	}
 	return -1;
 }
 
@@ -1412,26 +1418,20 @@ _worker(void *data)
 	struct nm_targ *targ = (struct nm_targ *) data;
 	struct nm_garg *g = targ->g;
 	struct pollfd pfd[2] = {{ .fd = targ->fd }};
-	struct dbinfo *dbip = container_of(g, struct dbinfo, g);
-	int msglen = dbip->msglen;
+	struct glpriv *gp = container_of(g, struct glpriv, g);
+	struct dbargs *dbargs = &gp->dbargs;
+	int msglen = gp->msglen;
 	struct thpriv *tp = targ->td_private;
-	char dbpath[64], bpluspath[64];
+	struct dbinfo dbi;
 
 	/* create db */
-	tp->dbsiz = dbip->_dbsiz / g->nthreads;
-	snprintf(dbpath, sizeof(dbpath), "%s%d", dbip->prefix, targ->me);
-	snprintf(bpluspath, sizeof(bpluspath), "%s%d", BPLUSFILE, targ->me);
-	if (dbip->prefix && create_db(dbip->type, dbip->flags, dbip->prefix,
-				&tp->dumbfd, &tp->paddr, tp->dbsiz, &tp->vp,
-				BPLUSFILE, targ->me,
-				g->dev_type == DEV_NETMAP ?
-			 	    targ->nmd->req.nr_name : NULL,
-				g->dev_type == DEV_NETMAP ?
-				    strlen(targ->nmd->req.nr_name) : 0))
-	{
+	dbargs->size = dbargs->size / g->nthreads;
+	dbargs->i = targ->me;
+	if (create_db(dbargs, &dbi)) {
 		D("error on create_db");
 		goto quit;
 	}
+	tp->db = &dbi;
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
@@ -1461,7 +1461,7 @@ _worker(void *data)
 		tp->extra_num = i;
 		D("imported %u extra buffers", i);
 
-		tp->ifreq = dbip->ifreq;
+		tp->ifreq = gp->ifreq;
 
 		/* allocate fd table */
 		tp->fds =calloc(sizeof(*tp->fds), DEFAULT_NFDS);
@@ -1484,7 +1484,7 @@ _worker(void *data)
 
 		bzero(&ev, sizeof(ev));
 		ev.events = POLLIN;
-		ev.data.fd = dbip->sd;
+		ev.data.fd = gp->sd;
 		if (epoll_ctl(targ->fd, EPOLL_CTL_ADD, ev.data.fd, &ev)) {
 			perror("epoll_ctl");
 			targ->cancel = 1;
@@ -1500,7 +1500,7 @@ _worker(void *data)
 
 			pfd[0].fd = targ->fd;
 			pfd[0].events = POLLIN;
-			pfd[1].fd = dbip->sd;
+			pfd[1].fd = gp->sd;
 			pfd[1].events = POLLIN;
 
 			i = poll(pfd, 2, g->polltimeo);
@@ -1564,7 +1564,7 @@ accepted:
 		} else if (g->dev_type == DEV_SOCKET) {
 			int i, nfd, epfd = targ->fd;
 			int timeo = g->polltimeo;
-			int sd = dbip->sd;
+			int sd = gp->sd;
 			struct epoll_event *evts = tp->evts;
 
 			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, timeo);
@@ -1589,7 +1589,7 @@ quit:
 		free(tp->extra);
 	if (tp->fds)
 		free(tp->fds);
-	close_db(dbpath, dbip->type, tp->paddr, tp->dbsiz, &tp->dumbfd);
+	close_db(&dbi);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -1602,25 +1602,26 @@ main(int argc, char **argv)
 	struct sockaddr_in sin;
 	const int on = 1;
 	int port = 60000;
-	struct dbinfo dbi;
+	struct glpriv gp;
+	struct dbargs *dbargs = &gp.dbargs;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
 
-	bzero(&dbi, sizeof(dbi));
-	dbi.type = DT_NONE;
-	dbi.pgsiz = getpagesize();
-	dbi.msglen = 64;
+	bzero(&gp, sizeof(gp));
+	dbargs->type = DT_NONE;
+	dbargs->pgsiz = getpagesize();
+	gp.msglen = 64;
 #ifdef WITH_STACKMAP
-	dbi.g.nmr_config = "";
-	dbi.g.nthreads = 1;
-	dbi.g.td_privbody = _worker;
-	dbi.g.polltimeo = 2000;
+	gp.g.nmr_config = "";
+	gp.g.nthreads = 1;
+	gp.g.td_privbody = _worker;
+	gp.g.polltimeo = 2000;
 #endif
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:F:L:Bk")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:Bk")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1630,10 +1631,10 @@ main(int argc, char **argv)
 			port = atoi(optarg);
 			break;
 		case 'l': /* HTTP OK content length */
-			dbi.msglen = atoi(optarg);
+			gp.msglen = atoi(optarg);
 			break;
 		case 'b': /* give the epoll_wait() timeo argument -1 */
-			dbi.g.polltimeo = atoi(optarg);
+			gp.g.polltimeo = atoi(optarg);
 			break;
 		case 'd':
 			{
@@ -1643,90 +1644,90 @@ main(int argc, char **argv)
 			 * and any word ending with dumb means not using sql
 			 */
 			if (p && (p - optarg == ol - strlen("dumb")))
-				dbi.type = DT_DUMB;
+				dbargs->type = DT_DUMB;
 			else
-				dbi.type = DT_SQLITE;
-			dbi.prefix = optarg;
-			dbi.pm = strstr(optarg, "pm") ? 1 : 0;
+				dbargs->type = DT_SQLITE;
+			dbargs->prefix = optarg;
+			dbargs->pm = strstr(optarg, "pm") ? 1 : 0;
 			}
 			break;
 		case 'L':
 			//use 7680 for approx 8GB
-			dbi._dbsiz = atol(optarg) * 1000000;
+			dbargs->size = atol(optarg) * 1000000;
 			break;
 		case 'm':
-			dbi.flags |= DBI_FLAGS_MMAP;
+			dbargs->flags |= DBI_FLAGS_MMAP;
 			break;
 		case 'D':
-			dbi.flags |= DBI_FLAGS_FDSYNC;
+			dbargs->flags |= DBI_FLAGS_FDSYNC;
 			break;
 		case 'N':
-			dbi.flags |= DBI_FLAGS_READMMAP;
+			dbargs->flags |= DBI_FLAGS_READMMAP;
 			break;
 		case 'i':
-			strncpy(dbi.ifname, optarg, sizeof(dbi.ifname));
+			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
 			break;
 		case 'x': /* PASTE */
-			dbi.flags |= DBI_FLAGS_PASTE;
+			dbargs->flags |= DBI_FLAGS_PASTE;
 			// use 7500 to fill up 8 GB mem
-			dbi.g.extmem_siz = atol(optarg) * 1000000;
+			gp.g.extmem_siz = atol(optarg) * 1000000;
 			// believe 90 % is available for bufs
-			dbi.g.extra_bufs = (dbi.g.extmem_siz / 2048) / 10 * 9;
-			dbi._dbsiz = dbi.g.extra_bufs * 8 * 2;
-			D("extra_bufs request %u", dbi.g.extra_bufs);
+			gp.g.extra_bufs = (gp.g.extmem_siz / 2048) / 10 * 9;
+			dbargs->size = gp.g.extra_bufs * 8 * 2;
+			D("extra_bufs request %u", gp.g.extra_bufs);
 			break;
 		case 'c':
-			dbi.httplen = 1;
+			gp.httplen = 1;
 			break;
 		case 'a':
-			dbi.g.affinity = atoi(optarg);
+			gp.g.affinity = atoi(optarg);
 			break;
 		case 'p':
-			dbi.g.nthreads = atoi(optarg);
+			gp.g.nthreads = atoi(optarg);
 			break;
 #ifdef WITH_STACKMAP
 		case 'C':
-			dbi.g.nmr_config = strdup(optarg);
+			gp.g.nmr_config = strdup(optarg);
 			break;
 #endif
-		case 'F':
-			dbi.fdel = atoi(optarg);
-			break;
 #ifdef WITH_BPLUS
 		case 'B':
-			dbi.flags |= DBI_FLAGS_BPLUS;
+			dbargs->flags |= DBI_FLAGS_BPLUS;
+			dbargs->metaprefix = "BPLUSFILE";
 			break;
 #endif /* WITH_BPLUS */
 #ifdef WITH_KVS
 		case 'k':
-			dbi.flags |= DBI_FLAGS_KVS;
+			dbargs->flags |= DBI_FLAGS_KVS;
 			break;
 #endif /* WITH_KVS */
 		}
 
 	}
 
-	fprintf(stderr, "%s built %s %s db: %s\n",
-		argv[0], __DATE__, __TIME__, dbi.prefix ? dbi.prefix : "none");
+	fprintf(stderr, "%s built %s %s db: %s\n", argv[0], __DATE__, __TIME__,
+			dbargs->prefix ? dbargs->prefix : "none");
 	usleep(1000);
 
 	argc -= optind;
 	argv += optind;
 
-	if (!port || !dbi.msglen)
+	if (!port || !gp.msglen)
 		usage();
-	else if (dbi.flags & DBI_FLAGS_PASTE && strlen(dbi.ifname) == 0)
+	else if (dbargs->flags & DBI_FLAGS_PASTE && strlen(gp.ifname) == 0)
+		usage();
+	else if (dbargs->type != DT_DUMB && dbargs->flags)
 		usage();
 
 	/* Preallocate HTTP header ? */
-	if (dbi.httplen) {
-		dbi.http = calloc(1, MAX_HTTPLEN);
-		if (!dbi.http) {
+	if (gp.httplen) {
+		gp.http = calloc(1, MAX_HTTPLEN);
+		if (!gp.http) {
 			perror("calloc");
 			usage();
 		}
-		dbi.httplen = generate_http(dbi.msglen, dbi.http, NULL);
-		D("preallocated http %d", dbi.httplen);
+		gp.httplen = generate_http(gp.msglen, gp.http, NULL);
+		D("preallocated http %d", gp.httplen);
 	}
 
 	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1763,55 +1764,55 @@ main(int argc, char **argv)
 		perror("listen");
 		goto close_socket;
 	}
-	dbi.sd = sd;
+	gp.sd = sd;
 
 #ifdef WITH_STACKMAP
-	if (dbi.ifname[0]) {
-		char *p = dbi.g.ifname;
-		struct nm_ifreq *ifreq = &dbi.ifreq;
+	if (gp.ifname[0]) {
+		char *p = gp.g.ifname;
+		struct nm_ifreq *ifreq = &gp.ifreq;
 #ifdef WITH_EXTMEM
 		struct netmap_pools_info *pi;
 #endif /* WITH_EXTMEM */
 
-		if (strlen(STMNAME) + 1 + strlen(dbi.ifname) > STMNAME_MAX) {
-			D("too long name %s", dbi.ifname);
+		if (strlen(STMNAME) + 1 + strlen(gp.ifname) > STMNAME_MAX) {
+			D("too long name %s", gp.ifname);
 			goto close_socket;
 		}
-		strcat(strcat(strcpy(p, STMNAME), "+"), dbi.ifname);
+		strcat(strcat(strcpy(p, STMNAME), "+"), gp.ifname);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
 
-		dbi.g.dev_type = DEV_NETMAP;
+		gp.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
-		if (dbi.flags & DBI_FLAGS_PASTE) {
+		if (dbargs->flags & DBI_FLAGS_PASTE) {
 			int fd;
 
 			unlink(PMEMFILE);
-			fd = dbi.extmemfd = open(PMEMFILE,
+			fd = gp.extmemfd = open(PMEMFILE,
 					O_RDWR|O_CREAT, S_IRWXU);
 	                if (fd < 0) {
 	                        perror("open");
 	                        goto close_socket;
 	                }
-			if (fallocate(fd, 0, 0, dbi.g.extmem_siz) < 0) {
+			if (fallocate(fd, 0, 0, gp.g.extmem_siz) < 0) {
 				D("error %s", PMEMFILE);
 				perror("fallocate");
 				goto close_socket;
 			}
-	                dbi.g.extmem = _do_mmap(fd, dbi.g.extmem_siz);
-	                if (dbi.g.extmem == NULL) {
+	                gp.g.extmem = _do_mmap(fd, gp.g.extmem_siz);
+	                if (gp.g.extmem == NULL) {
 				D("mmap failed");
 	                        goto close_socket;
 	                }
-			pi = (struct netmap_pools_info *)dbi.g.extmem;
-			pi->memsize = dbi.g.extmem_siz;
+			pi = (struct netmap_pools_info *)gp.g.extmem;
+			pi->memsize = gp.g.extmem_siz;
 
 			pi->if_pool_objtotal = IF_OBJTOTAL;
 			pi->ring_pool_objtotal = RING_OBJTOTAL;
 			pi->ring_pool_objsize = RING_OBJSIZE;
-			pi->buf_pool_objtotal = dbi.g.extra_bufs + 800000;
+			pi->buf_pool_objtotal = gp.g.extra_bufs + 800000;
 
 			/*
 			dbi.g.extmem = malloc(2152000000);
@@ -1820,26 +1821,26 @@ main(int argc, char **argv)
 				goto close_socket;
 			}
 			*/
-			D("mmap success %p", dbi.g.extmem);
+			D("mmap success %p", gp.g.extmem);
 		}
 #endif
 	} else {
-		dbi.g.dev_type = DEV_SOCKET;
+		gp.g.dev_type = DEV_SOCKET;
 	}
-	dbi.g.td_type = TD_TYPE_OTHER;
-	dbi.g.td_private_len = sizeof(struct thpriv);
-	if (nm_start(&dbi.g) < 0)
+	gp.g.td_type = TD_TYPE_OTHER;
+	gp.g.td_private_len = sizeof(struct thpriv);
+	if (nm_start(&gp.g) < 0)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
-	    nm_name, IPV4TCP_HDRLEN, dbi.g.nmd->nifp->ni_tx_rings);
+	    nm_name, IPV4TCP_HDRLEN, gp.g.nmd->nifp->ni_tx_rings);
 #endif /* WITH_STACKMAP */
 
 close_socket:
 #ifdef WITH_EXTMEM
-	if (dbi.g.extmem) {
-		if (dbi.g.extmem)
-			munmap(dbi.g.extmem, dbi.g.extmem_siz);
-		close(dbi.extmemfd);
+	if (gp.g.extmem) {
+		if (gp.g.extmem)
+			munmap(gp.g.extmem, gp.g.extmem_siz);
+		close(gp.extmemfd);
 		remove(PMEMFILE);
 	}
 #endif /* WITH_EXTMEM */
