@@ -118,83 +118,18 @@ user_clock_gettime(struct timespec *ts)
 #define RING_OBJTOTAL	512
 #define RING_OBJSIZE	33024
 
-/* Taken from Linux */
-#define NOP_DS_PREFIX 0x3e
-#define X86_FEATURE_CLFLUSHOPT	( 9*32+23) /* CLFLUSHOPT instruction */
-# define __force
-#define b_replacement(num)	"664"#num
-#define e_replacement(num)	"665"#num
-
-#define alt_end_marker		"663"
-#define alt_slen		"662b-661b"
-#define alt_pad_len		alt_end_marker"b-662b"
-#define alt_total_slen		alt_end_marker"b-661b"
-#define alt_rlen(num)		e_replacement(num)"f-"b_replacement(num)"f"
-
-#define __OLDINSTR(oldinstr, num)					\
-		"661:\n\t" oldinstr "\n662:\n"					\
-	".skip -(((" alt_rlen(num) ")-(" alt_slen ")) > 0) * "		\
-		"((" alt_rlen(num) ")-(" alt_slen ")),0x90\n"
-
-#define OLDINSTR(oldinstr, num)						\
-		__OLDINSTR(oldinstr, num)					\
-	alt_end_marker ":\n"
-
-#define ALTINSTR_ENTRY(feature, num)					      \
-		" .long 661b - .\n"				/* label           */ \
-	" .long " b_replacement(num)"f - .\n"		/* new instruction */ \
-	" .word " __stringify(feature) "\n"		/* feature bit     */ \
-	" .byte " alt_total_slen "\n"			/* source len      */ \
-	" .byte " alt_rlen(num) "\n"			/* replacement len */ \
-	" .byte " alt_pad_len "\n"			/* pad len */
-
-#define ALTINSTR_REPLACEMENT(newinstr, feature, num)	/* replacement */     \
-	b_replacement(num)":\n\t" newinstr "\n" e_replacement(num) ":\n\t"
-
-#define ALTERNATIVE(oldinstr, newinstr, feature)			\
-		OLDINSTR(oldinstr, 1)					\
-	".pushsection .altinstructions,\"a\"\n"				\
-	ALTINSTR_ENTRY(feature, 1)					\
-	".popsection\n"							\
-	".pushsection .altinstr_replacement, \"ax\"\n"			\
-	ALTINSTR_REPLACEMENT(newinstr, feature, 1)			\
-	".popsection"
-
-#define alternative_io(oldinstr, newinstr, feature, output, input...)	\
-		asm volatile (ALTERNATIVE(oldinstr, newinstr, feature)		\
-					: output : "i" (0), ## input)
-
-#define __stringify_1(x...)	#x
-#define __stringify(x...)	__stringify_1(x)
-
-static inline void clflush(volatile void *__p)
-{
-	asm volatile("clflush %0" : "+m" (*(volatile char __force *)__p));
-}
-
-// GCC < 5 doesn't compile _mm_clflushopt() well
-#if 0
-static inline void _mm_clflushopt(volatile void *__p)
-{
-	alternative_io(".byte " __stringify(NOP_DS_PREFIX) "; clflush %P0",
-		       ".byte 0x66; clflush %P0", X86_FEATURE_CLFLUSHOPT,
-			"+m" (*(volatile char __force *)__p));
-}
-#endif
-/* End - Taken from Linux */
-
 #define MAXCONNECTIONS 2048
 #define MAXQUERYLEN 32767
 
 #define MAX_HTTPLEN	65535
 
-#define DBF_FDSYNC	0x1
-#define DBF_READMMAP	0x2
-#define DBF_PASTE		0x4
-#define DBF_BPLUS		0x8
-#define DBF_KVS		0x10
-#define DBF_MMAP		0x20
-#define DBF_PMEM		0x40
+#define DF_FDSYNC	0x1
+#define DF_READMMAP	0x2
+#define DF_PASTE		0x4
+#define DF_BPLUS		0x8
+#define DF_KVS		0x10
+#define DF_MMAP		0x20
+#define DF_PMEM		0x40
 
 #define DBCOMMON	int	type;\
 			int	flags;\
@@ -220,7 +155,7 @@ struct dbinfo {
 static inline int
 is_pm(struct dbinfo *d)
 {
-	return !!(d->flags & DBF_PMEM);
+	return !!(d->flags & DF_PMEM);
 }
 
 struct dbargs {
@@ -295,55 +230,6 @@ set_rubbish(char *buf, int len)
 	memcpy(buf, r, min(len, 64));
 }
 
-//static struct timespec ts = {0, 0};
-#if 0
-static inline void
-clflush(volatile void *p)
-{
-	//nanosleep(&ts, NULL);
-	asm volatile ("clflush (%0)" :: "r"(p));
-}
-
-/* need ctrs.h */
-static inline void
-clflushx(volatile void *p, long ns)
-{
-	if (ns) {
-		struct timespec cur, w;
-
-		if (unlikely(ns > 10000 || ns < 100)) {
-			RD(1, "ns %ld may not be apprepriate", ns);
-		}
-		clock_gettime(CLOCK_REALTIME, &cur);
-		for (;;) {
-			clock_gettime(CLOCK_REALTIME, &w);
-			w = timespec_sub(w, cur);
-			if (unlikely(w.tv_sec < 0)) // maybe too short interval
-				continue;
-			else if (w.tv_nsec >= ns || w.tv_sec > 0)
-				break;
-		}
-	}
-	clflush(p);
-	return;
-}
-#endif /* 0 */
-
-/* taken from NOVA */
-#if 0
-#define _mm_clflush(addr)\
-		asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
-#ifndef NO_CLFLUSHOPT
-#define _mm_clflushopt(addr)\
-	asm volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr)))
-#else
-#define _mm_clflushopt _mm_clflush
-#endif
-	
-#define _mm_clwb(addr)\
-		asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))
-#endif /* 0 */
-
 static inline void
 wait_ns(long ns)
 {
@@ -382,7 +268,7 @@ sfence(long delay)
 }
 
 
-#define CACHE_LINE_SIZE	64 /* XXX */
+#define CLSIZ	64 /* XXX */
 
 #ifdef WITH_STACKMAP
 struct paste_hdr {
@@ -923,7 +809,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	u_int i = 0;
 	size_t aligned = len;
 
-	D("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
+	ND("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
 #ifdef WITH_BPLUS
 	if (vp) {
 		align = NETMAP_BUF_SIZE;
@@ -943,7 +829,7 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	if (buf)
 		memcpy(p, buf, len);
 	if (pm) {
-		for (; i < len; i += CACHE_LINE_SIZE) {
+		for (; i < len; i += CLSIZ) {
 			_mm_clflush(p + i);
 		}
 	}
@@ -1026,7 +912,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			}
 log:
 			if (type == DT_DUMB) {
-				if (flags & DBF_PASTE) {
+				if (flags & DF_PASTE) {
 					u_int i = 0;
 #ifdef WITH_KVS
 					struct netmap_slot tmp, *extra;
@@ -1034,7 +920,7 @@ log:
 					uint32_t extra_i = get_extra(tp, &db->cur);
 
 					/* flush data buffer */
-					for (; i < len; i += CACHE_LINE_SIZE) {
+					for (; i < len; i += CLSIZ) {
 						_mm_clflush(rxbuf + i);
 					}
 #ifdef WITH_BPLUS
@@ -1059,7 +945,7 @@ log:
 					extra->flags &= ~NS_BUF_CHANGED;
 
 					/* record current slot */
-					if (db->flags & DBF_KVS) {
+					if (db->flags & DF_KVS) {
 						_embed_slot(rxbuf, coff, extra);
 					}
 #else
@@ -1077,7 +963,7 @@ log:
 				} else {
 					if (writesync(rxbuf + coff, len, dbsiz,
 					    db->dumbfd, &db->cur,
-					    flags & DBF_FDSYNC)) {
+					    flags & DF_FDSYNC)) {
 						return -1;
 					}
 				}
@@ -1103,7 +989,7 @@ log:
 					goto get;
 				}
 				_to_tuple(datam, &_idx, &_off, &_len);
-				if (flags & DBF_PASTE) {
+				if (flags & DF_PASTE) {
 					char *_buf = NETMAP_BUF(rxr, _idx);
 
 					s = _digout_slot(_buf, _off);
@@ -1190,7 +1076,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct dbinfo *db = tp->db;
 	size_t max;
-	int readmmap = !!(db->flags & DBF_READMMAP);
+	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
 
 	rxbuf = txbuf = buf;
@@ -1233,7 +1119,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			} else {
 				if (writesync(rxbuf + coff, len, db->size,
 				    db->dumbfd, &db->cur,
-				    db->flags & DBF_FDSYNC)) {
+				    db->flags & DF_FDSYNC)) {
 					return -1;
 				}
 			}
@@ -1371,7 +1257,7 @@ error:
 #endif /* WITH_SQLITE */
 #ifdef WITH_BPLUS
 	/* need B+tree ? */
-	if (db->flags & DBF_BPLUS) {
+	if (db->flags & DF_BPLUS) {
 		int rc;
 
 		snprintf(db->metapath, sizeof(db->metapath), "%s%d",
@@ -1382,7 +1268,7 @@ error:
 			return -1;
 	}
 #endif /* WITH_BPLUS */
-	if (db->flags & DBF_BPLUS && db->flags & DBF_PASTE) {
+	if (db->flags & DF_BPLUS && db->flags & DF_PASTE) {
 		return 0;
 	} else {
 	    do {
@@ -1394,7 +1280,7 @@ error:
 			perror("open");
 			break;
 		}
-		if (db->flags & DBF_MMAP) {
+		if (db->flags & DF_MMAP) {
 			if (fallocate(fd, 0, 0, db->size) < 0) {
 				perror("fallocate");
 				break;
@@ -1650,7 +1536,7 @@ main(int argc, char **argv)
 				dbargs->type = DT_SQLITE;
 			dbargs->prefix = optarg;
 			if (strstr(optarg, "pm"))
-			       dbargs->flags |= DBF_PMEM;
+			       dbargs->flags |= DF_PMEM;
 			}
 			break;
 		case 'L':
@@ -1658,19 +1544,19 @@ main(int argc, char **argv)
 			dbargs->size = atol(optarg) * 1000000;
 			break;
 		case 'm':
-			dbargs->flags |= DBF_MMAP;
+			dbargs->flags |= DF_MMAP;
 			break;
 		case 'D':
-			dbargs->flags |= DBF_FDSYNC;
+			dbargs->flags |= DF_FDSYNC;
 			break;
 		case 'N':
-			dbargs->flags |= DBF_READMMAP;
+			dbargs->flags |= DF_READMMAP;
 			break;
 		case 'i':
 			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
 			break;
 		case 'x': /* PASTE */
-			dbargs->flags |= DBF_PASTE;
+			dbargs->flags |= DF_PASTE;
 			// use 7500 to fill up 8 GB mem
 			gp.g.extmem_siz = atol(optarg) * 1000000;
 			// believe 90 % is available for bufs
@@ -1694,13 +1580,13 @@ main(int argc, char **argv)
 #endif
 #ifdef WITH_BPLUS
 		case 'B':
-			dbargs->flags |= DBF_BPLUS;
+			dbargs->flags |= DF_BPLUS;
 			dbargs->metaprefix = "BPLUSFILE";
 			break;
 #endif /* WITH_BPLUS */
 #ifdef WITH_KVS
 		case 'k':
-			dbargs->flags |= DBF_KVS;
+			dbargs->flags |= DF_KVS;
 			break;
 #endif /* WITH_KVS */
 		}
@@ -1716,7 +1602,7 @@ main(int argc, char **argv)
 
 	if (!port || !gp.msglen)
 		usage();
-	else if (dbargs->flags & DBF_PASTE && strlen(gp.ifname) == 0)
+	else if (dbargs->flags & DF_PASTE && strlen(gp.ifname) == 0)
 		usage();
 	else if (dbargs->type != DT_DUMB && dbargs->flags)
 		usage();
@@ -1788,7 +1674,7 @@ main(int argc, char **argv)
 
 		gp.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
-		if (dbargs->flags & DBF_PASTE) {
+		if (dbargs->flags & DF_PASTE) {
 			int fd;
 
 			unlink(PMEMFILE);
