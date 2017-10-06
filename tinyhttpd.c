@@ -188,20 +188,22 @@ static inline void _mm_clflushopt(volatile void *__p)
 
 #define MAX_HTTPLEN	65535
 
-struct dbinfo {
-	int	type;
-	char path[64];
-	char metapath[64];
-	u_int pgsiz;
-#define DBI_FLAGS_FDSYNC	0x1
-#define DBI_FLAGS_READMMAP	0x2
-#define DBI_FLAGS_PASTE		0x4
-#define DBI_FLAGS_BPLUS		0x8
-#define DBI_FLAGS_KVS		0x10
-#define DBI_FLAGS_MMAP		0x20
-#define DBI_FLAGS_PMEM		0x40
-	int flags;
+#define DBF_FDSYNC	0x1
+#define DBF_READMMAP	0x2
+#define DBF_PASTE		0x4
+#define DBF_BPLUS		0x8
+#define DBF_KVS		0x10
+#define DBF_MMAP		0x20
+#define DBF_PMEM		0x40
 
+#define DBCOMMON	int	type;\
+			int	flags;\
+			size_t	size;\
+			size_t	pgsiz;\
+			int	i
+
+struct dbinfo {
+	DBCOMMON;
 	union {
 #ifdef WITH_SQLITE
 		sqlite3 *sql_conn;
@@ -210,23 +212,19 @@ struct dbinfo {
 	};
 	char *paddr;
 	void *vp; // gfile_t
-	size_t size;
-	int i;
 	size_t cur;
+	char path[64];
+	char metapath[64];
 };
 
 static inline int
 is_pm(struct dbinfo *d)
 {
-	return !!(d->flags & DBI_FLAGS_PMEM);
+	return !!(d->flags & DBF_PMEM);
 }
 
 struct dbargs {
-	int type;
-	size_t size;
-	size_t pgsiz;
-	int flags;
-	int i;
+	DBCOMMON;
 	char *prefix;
 	char *metaprefix;
 };
@@ -246,7 +244,6 @@ struct glpriv {
 	struct dbargs dbargs;
 };
 
-/* XXX DB-related info should also be moved here */
 struct thpriv {
 	struct nm_garg *g;
 	char *rxbuf;
@@ -983,7 +980,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	struct nm_garg *g = targ->g;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct thpriv *tp = targ->td_private;
-	struct dbinfo *dbi = tp->db;
+	struct dbinfo *db = tp->db;
 
 	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
 	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
@@ -991,9 +988,9 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	u_int rxcur = rxr->cur;
 	ssize_t msglen = gp->msglen;
 
-	const int type = dbi->type;
-	const int flags = dbi->flags;
-	const size_t dbsiz = dbi->size;
+	const int type = db->type;
+	const int flags = db->flags;
+	const size_t dbsiz = db->size;
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
@@ -1029,25 +1026,25 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			}
 log:
 			if (type == DT_DUMB) {
-				if (flags & DBI_FLAGS_PASTE) {
+				if (flags & DBF_PASTE) {
 					u_int i = 0;
 #ifdef WITH_KVS
 					struct netmap_slot tmp, *extra;
 #endif
-					uint32_t extra_i = get_extra(tp, &dbi->cur);
+					uint32_t extra_i = get_extra(tp, &db->cur);
 
 					/* flush data buffer */
 					for (; i < len; i += CACHE_LINE_SIZE) {
 						_mm_clflush(rxbuf + i);
 					}
 #ifdef WITH_BPLUS
-					if (dbi->vp) {
-						paste_bplus(dbi->vp, key, rxs,
+					if (db->vp) {
+						paste_bplus(db->vp, key, rxs,
 							off + coff, thisclen);
 					} else
 #endif
-				       	if (dbi->paddr) {
-						paste_wal(dbi->paddr, &dbi->cur,
+				       	if (db->paddr) {
+						paste_wal(db->paddr, &db->cur,
 						    dbsiz, rxs, off + coff,
 						    thisclen);
 					}
@@ -1062,7 +1059,7 @@ log:
 					extra->flags &= ~NS_BUF_CHANGED;
 
 					/* record current slot */
-					if (dbi->flags & DBI_FLAGS_KVS) {
+					if (db->flags & DBF_KVS) {
 						_embed_slot(rxbuf, coff, extra);
 					}
 #else
@@ -1072,15 +1069,15 @@ log:
 					tp->extra[extra_i] = i;
 #endif
 
-				} else if (dbi->paddr) {
-					copy_and_log(dbi->paddr, &dbi->cur,
+				} else if (db->paddr) {
+					copy_and_log(db->paddr, &db->cur,
 					    dbsiz, rxbuf + coff, thisclen,
-					    thisclen, is_pm(dbi) ? 0 : dbi->pgsiz,
-					    is_pm(dbi), dbi->vp, key);
+					    thisclen, is_pm(db) ? 0 : db->pgsiz,
+					    is_pm(db), db->vp, key);
 				} else {
 					if (writesync(rxbuf + coff, len, dbsiz,
-					    dbi->dumbfd, &dbi->cur,
-					    flags & DBI_FLAGS_FDSYNC)) {
+					    db->dumbfd, &db->cur,
+					    flags & DBF_FDSYNC)) {
 						return -1;
 					}
 				}
@@ -1093,7 +1090,7 @@ log:
 #ifdef WITH_KVS
 			uint64_t key = parse_get_key(rxbuf);
 
-			if (dbi->vp) {
+			if (db->vp) {
 				uint64_t datam = 0;
 				int rc;
 				uint32_t _idx;
@@ -1101,12 +1098,12 @@ log:
 				struct netmap_slot *s;
 				int t;
 
-				rc = btree_lookup(dbi->vp, key, &datam);
+				rc = btree_lookup(db->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
 				}
 				_to_tuple(datam, &_idx, &_off, &_len);
-				if (flags & DBI_FLAGS_PASTE) {
+				if (flags & DBF_PASTE) {
 					char *_buf = NETMAP_BUF(rxr, _idx);
 
 					s = _digout_slot(_buf, _off);
@@ -1137,7 +1134,7 @@ log:
 						msglen = _len;
 					}
 				} else {
-					content = dbi->paddr +
+					content = db->paddr +
 						NETMAP_BUF_SIZE * _idx;
 					msglen = _len;
 				}
@@ -1191,20 +1188,20 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	struct nm_garg *g = targ->g;
 	struct thpriv *tp = targ->td_private;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
-	struct dbinfo *dbi = tp->db;
+	struct dbinfo *db = tp->db;
 	size_t max;
-	int readmmap = !!(dbi->flags & DBI_FLAGS_READMMAP);
+	int readmmap = !!(db->flags & DBF_READMMAP);
 	char *content = NULL;
 
 	rxbuf = txbuf = buf;
 	if (readmmap) {
-		size_t cur = dbi->cur;
-		max = dbi->size - sizeof(struct paste_hdr) - cur;
-		if (unlikely(max < dbi->pgsiz)) {
+		size_t cur = db->cur;
+		max = db->size - sizeof(struct paste_hdr) - cur;
+		if (unlikely(max < db->pgsiz)) {
 			cur = 0;
-			max = dbi->size;
+			max = db->size;
 		}
-		rxbuf = dbi->paddr + dbi->cur + sizeof(uint64_t);// metadata space
+		rxbuf = db->paddr + db->cur + sizeof(uint64_t);// metadata space
 		max -= sizeof(uint64_t);
 	} else {
 		max = sizeof(buf);
@@ -1227,22 +1224,22 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			RD(1, "invalid clen");
 			return 0;
 		}
-		if (dbi->type == DT_DUMB) {
-			if (dbi->paddr) {
-				copy_and_log(dbi->paddr, &dbi->cur, dbi->size,
+		if (db->type == DT_DUMB) {
+			if (db->paddr) {
+				copy_and_log(db->paddr, &db->cur, db->size,
 				    readmmap ? NULL : rxbuf + coff, clen,
-				    dbi->pgsiz, is_pm(dbi) ? 0 : dbi->pgsiz,
-				    is_pm(dbi), dbi->vp, key);
+				    db->pgsiz, is_pm(db) ? 0 : db->pgsiz,
+				    is_pm(db), db->vp, key);
 			} else {
-				if (writesync(rxbuf + coff, len, dbi->size,
-				    dbi->dumbfd, &dbi->cur,
-				    dbi->flags & DBI_FLAGS_FDSYNC)) {
+				if (writesync(rxbuf + coff, len, db->size,
+				    db->dumbfd, &db->cur,
+				    db->flags & DBF_FDSYNC)) {
 					return -1;
 				}
 			}
 		}
 #if WITH_SQLITE
-		else if (dbi->type == DT_SQLITE) {
+		else if (db->type == DT_SQLITE) {
 			char query[MAXQUERYLEN];
 			int ret;
 			char *err_msg;
@@ -1265,16 +1262,16 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 #ifdef WITH_KVS
 		uint64_t key = parse_get_key(rxbuf);
 
-		if (dbi->vp) {
+		if (db->vp) {
 			uint64_t datam = 0;
 			int rc;
 			uint32_t _idx;
 			uint16_t _off, _len;
 
-			rc = btree_lookup(dbi->vp, key, &datam);
+			rc = btree_lookup(db->vp, key, &datam);
 			if (rc != ENOENT) {
 				_to_tuple(datam, &_idx, &_off, &_len);
-				content = dbi->paddr + NETMAP_BUF_SIZE * _idx;
+				content = db->paddr + NETMAP_BUF_SIZE * _idx;
 				msglen = _len;
 			}
 		}
@@ -1374,7 +1371,7 @@ error:
 #endif /* WITH_SQLITE */
 #ifdef WITH_BPLUS
 	/* need B+tree ? */
-	if (db->flags & DBI_FLAGS_BPLUS) {
+	if (db->flags & DBF_BPLUS) {
 		int rc;
 
 		snprintf(db->metapath, sizeof(db->metapath), "%s%d",
@@ -1385,7 +1382,7 @@ error:
 			return -1;
 	}
 #endif /* WITH_BPLUS */
-	if (db->flags & DBI_FLAGS_BPLUS && db->flags & DBI_FLAGS_PASTE) {
+	if (db->flags & DBF_BPLUS && db->flags & DBF_PASTE) {
 		return 0;
 	} else {
 	    do {
@@ -1397,7 +1394,7 @@ error:
 			perror("open");
 			break;
 		}
-		if (db->flags & DBI_FLAGS_MMAP) {
+		if (db->flags & DBF_MMAP) {
 			if (fallocate(fd, 0, 0, db->size) < 0) {
 				perror("fallocate");
 				break;
@@ -1426,16 +1423,16 @@ _worker(void *data)
 	struct dbargs *dbargs = &gp->dbargs;
 	int msglen = gp->msglen;
 	struct thpriv *tp = targ->td_private;
-	struct dbinfo dbi;
+	struct dbinfo db;
 
 	/* create db */
 	dbargs->size = dbargs->size / g->nthreads;
 	dbargs->i = targ->me;
-	if (create_db(dbargs, &dbi)) {
+	if (create_db(dbargs, &db)) {
 		D("error on create_db");
 		goto quit;
 	}
-	tp->db = &dbi;
+	tp->db = &db;
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
@@ -1593,7 +1590,7 @@ quit:
 		free(tp->extra);
 	if (tp->fds)
 		free(tp->fds);
-	close_db(&dbi);
+	close_db(&db);
 	return (NULL);
 }
 #endif /* WITH_STACKMAP */
@@ -1653,7 +1650,7 @@ main(int argc, char **argv)
 				dbargs->type = DT_SQLITE;
 			dbargs->prefix = optarg;
 			if (strstr(optarg, "pm"))
-			       dbargs->flags |= DBI_FLAGS_PMEM;
+			       dbargs->flags |= DBF_PMEM;
 			}
 			break;
 		case 'L':
@@ -1661,19 +1658,19 @@ main(int argc, char **argv)
 			dbargs->size = atol(optarg) * 1000000;
 			break;
 		case 'm':
-			dbargs->flags |= DBI_FLAGS_MMAP;
+			dbargs->flags |= DBF_MMAP;
 			break;
 		case 'D':
-			dbargs->flags |= DBI_FLAGS_FDSYNC;
+			dbargs->flags |= DBF_FDSYNC;
 			break;
 		case 'N':
-			dbargs->flags |= DBI_FLAGS_READMMAP;
+			dbargs->flags |= DBF_READMMAP;
 			break;
 		case 'i':
 			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
 			break;
 		case 'x': /* PASTE */
-			dbargs->flags |= DBI_FLAGS_PASTE;
+			dbargs->flags |= DBF_PASTE;
 			// use 7500 to fill up 8 GB mem
 			gp.g.extmem_siz = atol(optarg) * 1000000;
 			// believe 90 % is available for bufs
@@ -1697,13 +1694,13 @@ main(int argc, char **argv)
 #endif
 #ifdef WITH_BPLUS
 		case 'B':
-			dbargs->flags |= DBI_FLAGS_BPLUS;
+			dbargs->flags |= DBF_BPLUS;
 			dbargs->metaprefix = "BPLUSFILE";
 			break;
 #endif /* WITH_BPLUS */
 #ifdef WITH_KVS
 		case 'k':
-			dbargs->flags |= DBI_FLAGS_KVS;
+			dbargs->flags |= DBF_KVS;
 			break;
 #endif /* WITH_KVS */
 		}
@@ -1719,7 +1716,7 @@ main(int argc, char **argv)
 
 	if (!port || !gp.msglen)
 		usage();
-	else if (dbargs->flags & DBI_FLAGS_PASTE && strlen(gp.ifname) == 0)
+	else if (dbargs->flags & DBF_PASTE && strlen(gp.ifname) == 0)
 		usage();
 	else if (dbargs->type != DT_DUMB && dbargs->flags)
 		usage();
@@ -1791,7 +1788,7 @@ main(int argc, char **argv)
 
 		gp.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
-		if (dbargs->flags & DBI_FLAGS_PASTE) {
+		if (dbargs->flags & DBF_PASTE) {
 			int fd;
 
 			unlink(PMEMFILE);
@@ -1820,8 +1817,8 @@ main(int argc, char **argv)
 			pi->buf_pool_objtotal = gp.g.extra_bufs + 800000;
 
 			/*
-			dbi.g.extmem = malloc(2152000000);
-			if (dbi.g.extmem == NULL) {
+			db.g.extmem = malloc(2152000000);
+			if (db.g.extmem == NULL) {
 				perror("malloc");
 				goto close_socket;
 			}
