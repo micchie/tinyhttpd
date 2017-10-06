@@ -193,13 +193,13 @@ struct dbinfo {
 	char path[64];
 	char metapath[64];
 	u_int pgsiz;
-	int pm;
 #define DBI_FLAGS_FDSYNC	0x1
 #define DBI_FLAGS_READMMAP	0x2
 #define DBI_FLAGS_PASTE		0x4
 #define DBI_FLAGS_BPLUS		0x8
 #define DBI_FLAGS_KVS		0x10
 #define DBI_FLAGS_MMAP		0x20
+#define DBI_FLAGS_PMEM		0x40
 	int flags;
 
 	union {
@@ -215,12 +215,17 @@ struct dbinfo {
 	size_t cur;
 };
 
+static inline int
+is_pm(struct dbinfo *d)
+{
+	return !!(d->flags & DBI_FLAGS_PMEM);
+}
+
 struct dbargs {
 	int type;
 	size_t size;
 	size_t pgsiz;
 	int flags;
-	int pm;
 	int i;
 	char *prefix;
 	char *metaprefix;
@@ -1070,8 +1075,8 @@ log:
 				} else if (dbi->paddr) {
 					copy_and_log(dbi->paddr, &dbi->cur,
 					    dbsiz, rxbuf + coff, thisclen,
-					    thisclen, dbi->pm ? 0 : dbi->pgsiz,
-					    dbi->pm, dbi->vp, key);
+					    thisclen, is_pm(dbi) ? 0 : dbi->pgsiz,
+					    is_pm(dbi), dbi->vp, key);
 				} else {
 					if (writesync(rxbuf + coff, len, dbsiz,
 					    dbi->dumbfd, &dbi->cur,
@@ -1226,8 +1231,8 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			if (dbi->paddr) {
 				copy_and_log(dbi->paddr, &dbi->cur, dbi->size,
 				    readmmap ? NULL : rxbuf + coff, clen,
-				    dbi->pgsiz, dbi->pm ? 0 : dbi->pgsiz,
-				    dbi->pm, dbi->vp, key);
+				    dbi->pgsiz, is_pm(dbi) ? 0 : dbi->pgsiz,
+				    is_pm(dbi), dbi->vp, key);
 			} else {
 				if (writesync(rxbuf + coff, len, dbi->size,
 				    dbi->dumbfd, &dbi->cur,
@@ -1309,7 +1314,6 @@ create_db(struct dbargs *args, struct dbinfo *db)
 	db->flags = args->flags;
 	db->size = args->size;
 	db->pgsiz = args->pgsiz;
-	db->pm = args->pm;
 
 	ND("map %p", map);
 
@@ -1648,7 +1652,8 @@ main(int argc, char **argv)
 			else
 				dbargs->type = DT_SQLITE;
 			dbargs->prefix = optarg;
-			dbargs->pm = strstr(optarg, "pm") ? 1 : 0;
+			if (strstr(optarg, "pm"))
+			       dbargs->flags |= DBI_FLAGS_PMEM;
 			}
 			break;
 		case 'L':
