@@ -336,18 +336,17 @@ close_db(struct dbinfo *db)
 	}
 	bzero(&st, sizeof(st));
 	stat(db->path, &st);
-	D("removing %s (%ld bytes)", db->path, st.st_size);
 #ifdef WITH_SQLITE
 	if (dbip->type == DT_SQLITE) {
 		strncpy(path_wal, path, sizeof(path_wal));
 		strcat(path_wal, "-wal");
-		remove(path_wal);
+	//	remove(path_wal);
 		strncpy(path_shm, path, sizeof(path_wal));
 		strcat(path_shm, "-shm");
-		remove(path_shm);
+	//	remove(path_shm);
 	}
 #endif
-	remove(db->path);
+	//remove(db->path);
 }
 
 int
@@ -1145,12 +1144,11 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		uint64_t key = parse_get_key(rxbuf);
 
 		if (db->vp) {
-			uint64_t datam = 0;
-			int rc;
 			uint32_t _idx;
 			uint16_t _off, _len;
+			uint64_t datam = 0;
+			int rc = btree_lookup(db->vp, key, &datam);
 
-			rc = btree_lookup(db->vp, key, &datam);
 			if (rc != ENOENT) {
 				_to_tuple(datam, &_idx, &_off, &_len);
 				content = db->paddr + NETMAP_BUF_SIZE * _idx;
@@ -1159,16 +1157,14 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		}
 #endif
 	} else {
-		len = 0;
+		return 0;
 	}
 
-	if (len) {
-		if (gp->httplen && content == NULL) {
-			len = gp->httplen;
-			memcpy(buf, gp->http, len);
-		} else {
-			len = generate_http(msglen, buf, content);
-		}
+	if (gp->httplen && content == NULL) {
+		len = gp->httplen;
+		memcpy(buf, gp->http, len);
+	} else {
+		len = generate_http(msglen, buf, content);
 	}
 	written = write(fd, buf, len);
 	if (unlikely(written < 0)) {
@@ -1299,13 +1295,13 @@ static void *
 _worker(void *data)
 {
 	struct nm_targ *targ = (struct nm_targ *) data;
+	struct thpriv *tp = targ->td_private;
 	struct nm_garg *g = targ->g;
-	struct pollfd pfd[2] = {{ .fd = targ->fd }};
 	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct dbargs *dbargs = &gp->dbargs;
-	int msglen = gp->msglen;
-	struct thpriv *tp = targ->td_private;
 	struct dbinfo db;
+	struct pollfd pfd[2] = {{ .fd = targ->fd }};
+	int msglen = gp->msglen;
 
 	/* create db */
 	dbargs->size = dbargs->size / g->nthreads;
@@ -1492,8 +1488,6 @@ main(int argc, char **argv)
 #endif /* WITH_SQLITE */
 
 	bzero(&gp, sizeof(gp));
-	dbargs->type = DT_NONE;
-	dbargs->pgsiz = getpagesize();
 	gp.msglen = 64;
 #ifdef WITH_STACKMAP
 	gp.g.nmr_config = "";
@@ -1501,6 +1495,7 @@ main(int argc, char **argv)
 	gp.g.td_privbody = _worker;
 	gp.g.polltimeo = 2000;
 #endif
+	dbargs->pgsiz = getpagesize();
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
@@ -1645,7 +1640,6 @@ main(int argc, char **argv)
 		perror("bind");
 		goto close_socket;
 	}
-
 	if (listen(sd, SOMAXCONN) != 0) {
 		perror("listen");
 		goto close_socket;
@@ -1653,7 +1647,7 @@ main(int argc, char **argv)
 	gp.sd = sd;
 
 #ifdef WITH_STACKMAP
-	if (gp.ifname[0]) {
+	if (strlen(gp.ifname) > 0) {
 		char *p = gp.g.ifname;
 		struct nm_ifreq *ifreq = &gp.ifreq;
 #ifdef WITH_EXTMEM
@@ -1692,6 +1686,7 @@ main(int argc, char **argv)
 				D("mmap failed");
 	                        goto close_socket;
 	                }
+			D("mmap success %p", gp.g.extmem);
 			pi = (struct netmap_pools_info *)gp.g.extmem;
 			pi->memsize = gp.g.extmem_siz;
 
@@ -1699,15 +1694,6 @@ main(int argc, char **argv)
 			pi->ring_pool_objtotal = RING_OBJTOTAL;
 			pi->ring_pool_objsize = RING_OBJSIZE;
 			pi->buf_pool_objtotal = gp.g.extra_bufs + 800000;
-
-			/*
-			db.g.extmem = malloc(2152000000);
-			if (db.g.extmem == NULL) {
-				perror("malloc");
-				goto close_socket;
-			}
-			*/
-			D("mmap success %p", gp.g.extmem);
 		}
 #endif
 	} else {
@@ -1727,7 +1713,6 @@ close_socket:
 		if (gp.g.extmem)
 			munmap(gp.g.extmem, gp.g.extmem_siz);
 		close(gp.extmemfd);
-		remove(PMEMFILE);
 	}
 #endif /* WITH_EXTMEM */
 
