@@ -631,7 +631,8 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	int error;
 	size_t cur = *pos;
 
-	D("len %lu  space %lu fd %d pos %lu, fdsync %d", len, space, fd, *pos, fdsync);
+	ND("len %lu  space %lu fd %d pos %lu, fdsync %d",
+			len, space, fd, *pos, fdsync);
 	if (cur + len > space){
 		if (lseek(fd, 0, SEEK_SET) < 0) {
 			perror("lseek");
@@ -809,9 +810,9 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	u_int i = 0;
 	size_t aligned = len;
 
-	ND("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
+	D("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
 #ifdef WITH_BPLUS
-	if (vp) {
+	if (!align && vp) {
 		align = NETMAP_BUF_SIZE;
 	}
 #endif /* WITH_BPLUS */
@@ -1605,6 +1606,8 @@ main(int argc, char **argv)
 	else if (dbargs->flags & DF_PASTE && strlen(gp.ifname) == 0)
 		usage();
 	else if (dbargs->type != DT_DUMB && dbargs->flags)
+		usage();
+	else if (dbargs->flags & DF_READMMAP && !(dbargs->flags & DF_MMAP))
 		usage();
 
 	/* Preallocate HTTP header ? */
