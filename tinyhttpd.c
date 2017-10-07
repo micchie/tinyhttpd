@@ -181,11 +181,6 @@ struct glpriv {
 
 struct thpriv {
 	struct nm_garg *g;
-	char *rxbuf;
-	char *txbuf;
-	uint64_t pst_ent;
-	uint16_t txlen;
-	uint16_t rxlen;
 	struct nm_ifreq ifreq;
 	struct epoll_event evts[MAXCONNECTIONS];
 	int	*fds;
@@ -1067,7 +1062,7 @@ update_ctr:
 int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 {
 	char buf[MAXQUERYLEN];
-	char *rxbuf, *txbuf;
+	char *rxbuf;
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
@@ -1080,7 +1075,6 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
 
-	rxbuf = txbuf = buf;
 	if (readmmap) {
 		size_t cur = db->cur;
 		max = db->size - sizeof(struct paste_hdr) - cur;
@@ -1091,6 +1085,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		rxbuf = db->paddr + db->cur + sizeof(uint64_t);// metadata space
 		max -= sizeof(uint64_t);
 	} else {
+		rxbuf = buf;
 		max = sizeof(buf);
 	}
 	len = read(fd, rxbuf, max);
@@ -1170,12 +1165,12 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	if (len) {
 		if (gp->httplen && content == NULL) {
 			len = gp->httplen;
-			memcpy(txbuf, gp->http, len);
+			memcpy(buf, gp->http, len);
 		} else {
-			len = generate_http(msglen, txbuf, content);
+			len = generate_http(msglen, buf, content);
 		}
 	}
-	written = write(fd, txbuf, len);
+	written = write(fd, buf, len);
 	if (unlikely(written < 0)) {
 		perror("write");
 	} else if (unlikely(written < len)) {
