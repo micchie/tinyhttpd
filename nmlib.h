@@ -4,11 +4,6 @@
 #include<net/netmap_user.h>
 #include<ctrs.h>
 
-//#define DEFAULT_EXT_MEM_SIZE    2152000000 /* approx. 2.2 GB (2144 ok 2152M fail)*/
-//#define DEFAULT_EXT_MEM_SIZE    4000000000
-//const uint64_t DEFAULT_EXT_MEM_SIZE = 7000000000UL;
-//#define DEFAULT_EXT_MEM_SIZE    2560000000 /* approx. 2.5 GB */
-
 #ifndef D
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)

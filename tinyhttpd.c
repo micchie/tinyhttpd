@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stddef.h>	// typeof
 #include <x86intrin.h>
@@ -95,10 +96,11 @@ user_clock_gettime(struct timespec *ts)
 
 #define GET_LEN		4
 #define POST_LEN	5
-#define STMNAME	"stack:0"
-#define STMNAME_MAX	64
+#define ST_NAME	"stack:0"
+#define ST_NAME_MAX	64
 //#define EXTRA_BUF_NUM	160000
 //#define EXTRA_BUF_NUM	3000000
+#define FILESPATH	"/mnt/pmem"
 #define PMEMFILE         "/mnt/pmem/netmap_mem"
 #define BPLUSFILE	"/mnt/pmem/bplus"
 #endif /* WITH_STACKMAP */
@@ -125,8 +127,8 @@ user_clock_gettime(struct timespec *ts)
 
 #define DF_FDSYNC	0x1
 #define DF_READMMAP	0x2
-#define DF_PASTE		0x4
-#define DF_BPLUS		0x8
+#define DF_PASTE	0x4
+#define DF_BPLUS	0x8
 #define DF_KVS		0x10
 #define DF_MMAP		0x20
 #define DF_PMEM		0x40
@@ -137,7 +139,7 @@ user_clock_gettime(struct timespec *ts)
 			size_t	pgsiz;\
 			int	i
 
-struct dbinfo {
+struct dbctx {
 	DBCOMMON;
 	union {
 #ifdef WITH_SQLITE
@@ -153,7 +155,7 @@ struct dbinfo {
 };
 
 static inline int
-is_pm(struct dbinfo *d)
+is_pm(struct dbctx *d)
 {
 	return !!(d->flags & DF_PMEM);
 }
@@ -162,10 +164,11 @@ struct dbargs {
 	DBCOMMON;
 	char *prefix;
 	char *metaprefix;
+	char *nmprefix;
 };
 
 struct glpriv {
-	char ifname[IFNAMSIZ + 64]; /* stackmap ifname (also used as indicator) */
+	char ifname[IFNAMSIZ + 64];
 #ifdef WITH_STACKMAP
 	struct nm_garg g;
 	struct nm_ifreq ifreq;
@@ -175,8 +178,7 @@ struct glpriv {
 	char *http;
 	int httplen;
 	int msglen;
-	/* propagated to thread */
-	struct dbargs dbargs;
+	struct dbargs dbargs; // propagated to threads
 };
 
 struct thpriv {
@@ -190,22 +192,20 @@ struct thpriv {
 #else
 	uint32_t *extra;
 #endif
-	uint32_t extra_cur;
+	uint32_t extra_cur; // helper to manage the extra array
 	uint32_t extra_num;
-	struct dbinfo *db;
+	struct dbctx *db;
 };
 #define DEFAULT_NFDS	65535
 
 static inline uint32_t
-get_extra(struct thpriv *tp, size_t *dbcur)
+get_extra(struct thpriv *tp, size_t *curp)
 {
-	uint32_t ret;
-
-	ret = tp->extra_cur++;
+	uint32_t ret = tp->extra_cur++;
 
 	if (unlikely(tp->extra_cur == tp->extra_num)) {
 		tp->extra_cur = 0;
-		*dbcur = 0; //clear log too
+		*curp = 0; //clear log too
 	}
 	return ret;
 }
@@ -221,7 +221,8 @@ get_aligned(size_t len, size_t align)
 static inline void
 set_rubbish(char *buf, int len)
 {
-	static char *r = "A sample content of the tiny HTTP server. Nothing is meaningful"; // 64 characters
+	static char *r = "A sample content of the tiny HTTP server. "
+			 "Nothing is meaningful"; // 64 characters
 	memcpy(buf, r, min(len, 64));
 }
 
@@ -244,29 +245,10 @@ wait_ns(long ns)
 	}
 }
 
-static __inline void
-mfence(long delay)
-{
-	if (delay > 0)
-		wait_ns(delay);
-	//__asm __volatile("mfence" : : : "memory");
-	_mm_mfence();
-}
-
-static __inline void
-sfence(long delay)
-{
-	if (delay > 0)
-		wait_ns(delay);
-	//__asm __volatile("mfence" : : : "memory");
-	_mm_sfence();
-}
-
-
 #define CLSIZ	64 /* XXX */
 
 #ifdef WITH_STACKMAP
-struct paste_hdr {
+struct wal_hdr { // so far organized for Paste but it is dummy anyways.
 	char ifname[IFNAMSIZ + 64];
 	char path[256];
 	uint32_t buf_ofs;
@@ -306,7 +288,7 @@ _do_mmap(int fd, size_t len)
 }
 
 void
-close_db(struct dbinfo *db)
+close_db(struct dbctx *db)
 {
 	struct stat st;
 #ifdef WITH_SQLITE
@@ -510,8 +492,7 @@ ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
 {
 	char *p = buf;
-	/* From nginx */
-	static char *lines[5] = {
+	static const char *lines[5] = {
 	 "HTTP/1.1 200 OK\r\n",
 	 "Connection: keep-alive\r\n",
 	 "Content-Length: "};
@@ -534,15 +515,13 @@ generate_httphdr(ssize_t content_length, char *buf)
 static int
 generate_http(int content_length, char *buf, char *content)
 {
-	int hlen;
+	int hlen = generate_httphdr(content_length, buf);
 
-	hlen = generate_httphdr(content_length, buf);
 	if (content == NULL)
 		set_rubbish(buf + hlen, content_length);
 	else
 		memcpy(buf + hlen, content, content_length);
 	return hlen + content_length;
-
 }
 
 int
@@ -573,7 +552,7 @@ parse_post(char *post, int *coff, uint64_t *key)
 		return -1;
 	pp = p + 16; // "Content-Length: "
 	clen = strtol(pp, &end, 10);
-	if (end == pp)
+	if (unlikely(end == pp))
 		return -1;
 	pp = strstr(pp, "\r\n\r\n");
 	if (unlikely(!pp))
@@ -668,58 +647,57 @@ _from_tuple(uint32_t idx, uint16_t off, uint16_t len)
 static struct netmap_slot *
 set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 {
-	struct netmap_slot *txs, tmp;
+	struct netmap_slot tmp, *txs = NULL;
 
 	if (unlikely(nm_ring_space(txr) == 0)) {
 		return NULL;
 	}
-	txs = &txr->slot[txr->cur];
-	if (unlikely(any_slot == txs)) {
-		goto done;
-	}
-	tmp = *txs;
-	*txs = *any_slot;
-	txs->flags |= NS_BUF_CHANGED;
-	*any_slot = tmp;
-	any_slot->flags |= NS_BUF_CHANGED; // this might sit on the ring
-done:
+	do {
+		txs = &txr->slot[txr->cur];
+		if (unlikely(any_slot == txs)) {
+			break;
+		}
+		tmp = *txs;
+		*txs = *any_slot;
+		txs->flags |= NS_BUF_CHANGED;
+		*any_slot = tmp;
+		any_slot->flags |= NS_BUF_CHANGED; // this might sit on the ring
+	} while (0);
 	txr->cur = txr->head = nm_ring_next(txr, txr->cur);
 	return txs;
 }
 
-enum {SLOT_INVALID=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
+enum {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
+
 static inline int
-_between(u_int x, u_int a, u_int b, u_int lim)
+_between(u_int x, u_int a, u_int b)
 {
-	if (a < b) {
-		if (x >= a && x < b) {
-			return SLOT_USER;
-		} else {
-			return SLOT_KERNEL;
-		}
-	} else if (a > b) {
-		if (x >= b && x < a) {
-			return SLOT_KERNEL;
-		} else {
-			return SLOT_USER;
-		}
-	}
-	return SLOT_KERNEL; // a == b
+	return x >= a && x < b;
 }
 
+/* no handle on x > a && x > b */
+static inline int
+_between_wrap(u_int x, u_int a, u_int b)
+{
+	return a <= b ? _between(x, a, b) : !_between(x, b, a);
+}
+
+#define U(x)	((uintptr_t)(x))
 static inline int
 nm_where(struct netmap_ring *ring, struct netmap_slot *extra,
 		u_int extra_num, struct netmap_slot *slot)
 {
-	if ((uintptr_t)slot > (uintptr_t)ring->slot && 
-	    (uintptr_t)slot < (uintptr_t)(ring->slot + ring->num_slots)) {
-		u_int i = slot - ring->slot;
-		return _between(i, ring->head, ring->tail, ring->num_slots - 1);
-	} else if ((uintptr_t)slot >= (uintptr_t)extra &&
-	    (uintptr_t)slot < (uintptr_t)(extra + extra_num))
+	if (_between(U(slot), U(ring->slot), U(ring->slot + ring->num_slots))) {
+		if (_between_wrap(slot - ring->slot, ring->head, ring->tail))
+			return SLOT_USER;
+		else
+			return SLOT_KERNEL;
+	} else if (_between(U(slot), U(extra), U(extra + extra_num))) {
 		return SLOT_EXTRA;
-	return SLOT_INVALID;
+	}
+	return SLOT_UNKNOWN; // not on ring or extra, maybe kernel's extra
 }
+#undef U
 
 //POST http://www.micchie.net/ HTTP/1.1\r\nHost: 192.168.11.3:60000\r\nContent-Length: 1280\r\n\r\n2
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
@@ -731,7 +709,7 @@ _embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
 }
 
 static inline struct netmap_slot*
-_digout_slot(char *nmb, u_int coff)
+_unembed_slot(char *nmb, u_int coff)
 {
 	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
 }
@@ -779,7 +757,7 @@ paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 	uint64_t pst_ent;
 	size_t cur = *pos;
 	int plen = sizeof(pst_ent);
-	int phdrlen = sizeof(struct paste_hdr);
+	int phdrlen = sizeof(struct wal_hdr);
 	char *p = paddr;
 
 	/* make log */
@@ -800,11 +778,11 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	char *p;
 	int mlen = vp ? 0 : sizeof(uint64_t);
 	size_t cur = *pos;
-	int phdrlen = vp || !pm ? 0 : sizeof(struct paste_hdr); // dummy header
+	int phdrlen = vp || !pm ? 0 : sizeof(struct wal_hdr); // dummy header
 	u_int i = 0;
 	size_t aligned = len;
 
-	D("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
+	ND("paddr %p pos %lu dbsiz %lu buf %p len %lu nowrap %u align %lu pm %d vp %p key %lu", paddr, *pos, dbsiz, buf, len, nowrap, align, pm, vp, key);
 #ifdef WITH_BPLUS
 	if (!align && vp) {
 		align = NETMAP_BUF_SIZE;
@@ -861,7 +839,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	struct nm_garg *g = targ->g;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct thpriv *tp = targ->td_private;
-	struct dbinfo *db = tp->db;
+	struct dbctx *db = tp->db;
 
 	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
 	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
@@ -973,29 +951,29 @@ log:
 
 			if (db->vp) {
 				uint64_t datam = 0;
-				int rc;
 				uint32_t _idx;
 				uint16_t _off, _len;
-				struct netmap_slot *s;
-				int t;
+				int rc = btree_lookup(db->vp, key, &datam);
 
-				rc = btree_lookup(db->vp, key, &datam);
 				if (rc == ENOENT) {
 					goto get;
 				}
 				_to_tuple(datam, &_idx, &_off, &_len);
 				if (flags & DF_PASTE) {
+					struct netmap_slot *s;
 					char *_buf = NETMAP_BUF(rxr, _idx);
+					int t;
 
-					s = _digout_slot(_buf, _off);
-					t = nm_where(txr, tp->extra, tp->extra_num, s);
-					if (t != SLOT_INVALID) {
-						if (s->flags & NS_BUF_CHANGED) {
-							content = _buf + _off;
-							goto get;
-						}
-					}
-					if (t == SLOT_EXTRA || t == SLOT_USER) {
+					s = _unembed_slot(_buf, _off);
+					t = nm_where(txr, tp->extra,
+						     tp->extra_num, s);
+					if (t == SLOT_UNKNOWN) {
+						msglen = _len;
+					} else if (t == SLOT_KERNEL || 
+					 	   s->flags & NS_BUF_CHANGED) {
+						msglen = _len;
+						content = _buf + _off;
+					} else { // zero copy
 						struct netmap_slot *txs;
 						u_int hl;
 
@@ -1009,10 +987,6 @@ log:
 							RD(1, "mismatch");
 						}
 						goto update_ctr;
-					} else if (t == SLOT_KERNEL) {
-						content = _buf + off;
-					} else { // SLOT_INVALID
-						msglen = _len;
 					}
 				} else {
 					content = db->paddr +
@@ -1069,14 +1043,14 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	struct nm_garg *g = targ->g;
 	struct thpriv *tp = targ->td_private;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
-	struct dbinfo *db = tp->db;
+	struct dbctx *db = tp->db;
 	size_t max;
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
 
 	if (readmmap) {
 		size_t cur = db->cur;
-		max = db->size - sizeof(struct paste_hdr) - cur;
+		max = db->size - sizeof(struct wal_hdr) - cur;
 		if (unlikely(max < db->pgsiz)) {
 			cur = 0;
 			max = db->size;
@@ -1179,7 +1153,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
 		      (type *)( (char *)__mptr - offsetof(type,member) );})
 static int
-create_db(struct dbargs *args, struct dbinfo *db)
+create_db(struct dbargs *args, struct dbctx *db)
 {
 	int fd = 0;
 
@@ -1266,7 +1240,7 @@ error:
 	    do {
 		snprintf(db->path, sizeof(db->path), "%s%d",
 				args->prefix, args->i);
-		unlink(db->path);
+		//unlink(db->path);
 		fd = open(db->path, O_RDWR | O_CREAT, S_IRWXU);
 		if (fd < 0) {
 			perror("open");
@@ -1299,7 +1273,7 @@ _worker(void *data)
 	struct nm_garg *g = targ->g;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
 	struct dbargs *dbargs = &gp->dbargs;
-	struct dbinfo db;
+	struct dbctx db;
 	struct pollfd pfd[2] = {{ .fd = targ->fd }};
 	int msglen = gp->msglen;
 
@@ -1473,6 +1447,27 @@ quit:
 }
 #endif /* WITH_STACKMAP */
 
+void
+clean_dir(char *dirpath)
+{
+	DIR *dp;
+	struct dirent *ent;
+
+	if ((dp = opendir(dirpath)) == NULL) {
+		return;
+	}
+	while ((ent = readdir(dp))) {
+		char fullp[256]; // XXX
+
+		if (ent->d_name[0] == '.')
+			continue;
+		strncat(strncpy(fullp, dirpath, sizeof(fullp)), "/", 1);
+		strncat(fullp, ent->d_name, sizeof(fullp) - strlen(fullp));
+		if (unlink(fullp))
+			perror("unlink");
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1499,7 +1494,7 @@ main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:Bk")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:BkM:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1554,6 +1549,13 @@ main(int argc, char **argv)
 			gp.g.extra_bufs = (gp.g.extmem_siz / 2048) / 10 * 9;
 			dbargs->size = gp.g.extra_bufs * 8 * 2;
 			D("extra_bufs request %u", gp.g.extra_bufs);
+
+			if (!dbargs->nmprefix) {
+				dbargs->nmprefix = PMEMFILE;
+			}
+			break;
+		case 'M':
+			dbargs->nmprefix = optarg;
 			break;
 		case 'c':
 			gp.httplen = 1;
@@ -1583,6 +1585,8 @@ main(int argc, char **argv)
 		}
 
 	}
+
+	clean_dir(FILESPATH);
 
 	fprintf(stderr, "%s built %s %s db: %s\n", argv[0], __DATE__, __TIME__,
 			dbargs->prefix ? dbargs->prefix : "none");
@@ -1654,30 +1658,29 @@ main(int argc, char **argv)
 		struct netmap_pools_info *pi;
 #endif /* WITH_EXTMEM */
 
-		if (strlen(STMNAME) + 1 + strlen(gp.ifname) > STMNAME_MAX) {
+		if (strlen(ST_NAME) + 1 + strlen(gp.ifname) > ST_NAME_MAX) {
 			D("too long name %s", gp.ifname);
 			goto close_socket;
 		}
-		strcat(strcat(strcpy(p, STMNAME), "+"), gp.ifname);
+		strcat(strcat(strcpy(p, ST_NAME), "+"), gp.ifname);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
-		strncpy(ifreq->nifr_name, STMNAME, sizeof(ifreq->nifr_name));
+		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
 
 		gp.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
 		if (dbargs->flags & DF_PASTE) {
 			int fd;
 
-			unlink(PMEMFILE);
-			fd = gp.extmemfd = open(PMEMFILE,
+			fd = gp.extmemfd = open(dbargs->nmprefix,
 					O_RDWR|O_CREAT, S_IRWXU);
 	                if (fd < 0) {
 	                        perror("open");
 	                        goto close_socket;
 	                }
 			if (fallocate(fd, 0, 0, gp.g.extmem_siz) < 0) {
-				D("error %s", PMEMFILE);
+				D("error %s", dbargs->nmprefix);
 				perror("fallocate");
 				goto close_socket;
 			}
@@ -1709,7 +1712,7 @@ main(int argc, char **argv)
 
 close_socket:
 #ifdef WITH_EXTMEM
-	if (gp.g.extmem) {
+	if (gp.extmemfd) {
 		if (gp.g.extmem)
 			munmap(gp.g.extmem, gp.g.extmem_siz);
 		close(gp.extmemfd);
@@ -1718,5 +1721,7 @@ close_socket:
 
 	if (sd > 0)
 		close(sd);
+	if (gp.http)
+		free(gp.http);
 	return 0;
 }
