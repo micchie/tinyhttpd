@@ -414,10 +414,9 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		char *p = NETMAP_BUF(ring, slot->buf_idx) + off0;
 		int l = min(MAX_PAYLOAD, len - copied);
 
-		if (data)
+		if (data) {
 			nm_pkt_copy(data + copied, p, l);
-		else
-			set_rubbish(p, l);
+		}
 		slot->len = off0 + l;
 		slot->offset = off - virt_header; // XXX change API...
 		slot->fd = fd;
@@ -489,22 +488,23 @@ generate_http(int content_length, char *buf, char *content)
 {
 	int hlen = generate_httphdr(content_length, buf);
 
-	if (content == NULL)
-		set_rubbish(buf + hlen, content_length);
-	else
+	if (content)
 		memcpy(buf + hlen, content, content_length);
 	return hlen + content_length;
 }
 
 int
 generate_http_nm(int content_length, struct netmap_ring *ring, int virt_header,
-		int off, int fd, char *content)
+		int off, int fd, char *header, int hlen, char *content)
 {
-	int hlen, len, cur = ring->cur;
+	int len, cur = ring->cur;
 	struct netmap_slot *slot = &ring->slot[cur];
 	char *p = NETMAP_BUF(ring, slot->buf_idx) + virt_header + off;
 
-	hlen = generate_httphdr(content_length, p);
+	if (header)
+		memcpy(p, header, hlen);
+	else
+		hlen = generate_httphdr(content_length, p);
 	len = copy_to_nm(ring, virt_header, content, content_length,
 			off + hlen, off, fd);
 	return len < content_length ? -1 : hlen + len;
@@ -804,6 +804,8 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 	*pos = cur + aligned + (align ? 0 : mlen);
 }
 
+enum http {NONE=0, POST, GET};
+
 /* We assume GET/POST appears in the beginning of netmap buffer */
 int
 do_nm_ring(struct nm_targ *targ, int ring_nr)
@@ -825,12 +827,10 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
-		char *rxbuf;
-		int o = IPV4TCP_HDRLEN;
-		int off, len;
+		int off, len, thisclen = 0, o = IPV4TCP_HDRLEN, no_ok = 0;
 		int *fde = &tp->fds[rxs->fd];
-		int thisclen = 0;
-		char *content = NULL;
+		char *rxbuf, *content = NULL;
+		enum http req = NONE;
 #ifdef MYHZ
 		struct timespec ts1, ts2, ts3;
 		user_clock_gettime(&ts1);
@@ -841,21 +841,42 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		if (unlikely(len == 0)) {
 			continue;
 		}
+
 		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
+			req = POST;
+		} else if (!strncmp(rxbuf, "GET ", GET_LEN)) {
+			req = GET;
+		}
+		if (req == POST || req == NONE) {
 			uint64_t key;
-			int coff, clen = parse_post(rxbuf, &coff, &key);
-
-			thisclen = len - coff;
-			if (unlikely(thisclen < 0)) {
-				D("thisclen %d len %d coff %d", thisclen, len, coff);
-			}
-
-			if (unlikely(clen < 0))
+			int coff, clen;
+		       
+			if (req == POST) {
+				clen = parse_post(rxbuf, &coff, &key);
+				if (unlikely(clen < 0))
+					continue;
+				thisclen = len - coff;
+				if (unlikely(thisclen < 0)) {
+					D("thisclen %d len %d coff %d", thisclen, len, coff);
+				}
+				if (clen > thisclen) {
+					*fde = clen - thisclen;
+				}
+			} else if (*fde > 0) {
+				*fde -= len;
+				if (*fde <= 0) {
+					if (unlikely(*fde < 0)) {
+						RD(1, "bad leftover %d", *fde);
+						*fde = 0;
+					}
+				}
+				thisclen = len;
+			} else {
 				continue;
-			else if (clen > thisclen) {
-				*fde = clen - thisclen;
 			}
-log:
+			if (*fde > 0)
+				no_ok = 1;
+
 			if (type == DT_DUMB) {
 				if (flags & DF_PASTE) {
 					u_int i = 0;
@@ -913,85 +934,61 @@ log:
 					}
 				}
 			}
-			if (*fde == 0) {
-				goto get;
-			}
-
-		} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
-#ifdef WITH_KVS
-			uint64_t key = parse_get_key(rxbuf);
-
-			if (db->vp) {
-				uint64_t datam = 0;
-				uint32_t _idx;
-				uint16_t _off, _len;
-				int rc = btree_lookup(db->vp, key, &datam);
-
-				if (rc == ENOENT) {
-					goto get;
-				}
-				_to_tuple(datam, &_idx, &_off, &_len);
-				if (flags & DF_PASTE) {
-					struct netmap_slot *s;
-					char *_buf = NETMAP_BUF(rxr, _idx);
-					int t;
-
-					s = _unembed_slot(_buf, _off);
-					t = nm_where(txr, tp->extra,
-						     tp->extra_num, s);
-					if (t == SLOT_UNKNOWN) {
-						msglen = _len;
-					} else if (t == SLOT_KERNEL || 
-					 	   s->flags & NS_BUF_CHANGED) {
-						msglen = _len;
-						content = _buf + _off;
-					} else { // zero copy
-						struct netmap_slot *txs;
-						u_int hl;
-
-						txs = set_to_nm(txr, s);
-						txs->fd = rxs->fd;
-						txs->len = _off + _len; // XXX
-						_embed_slot(_buf, _off, txs);
-						hl = generate_httphdr(_len,
-								_buf + off);
-						if (unlikely(hl != _off - off)) {
-							RD(1, "mismatch");
-						}
-						goto update_ctr;
-					}
-				} else {
-					content = db->paddr +
-						NETMAP_BUF_SIZE * _idx;
-					msglen = _len;
-				}
-			}
-#endif /* WITH_KVS */
-
-get:
-			if (gp->httplen && content == NULL) { // use cache
-				if (copy_to_nm(txr, g->virt_header, gp->http,
-				    gp->httplen, o, o, rxs->fd) < gp->httplen) {
-					continue;
-				}
-			} else {
-				if (generate_http_nm(msglen, txr,
-				    g->virt_header, o, rxs->fd, content) < 0)
-					continue;
-			}
-		} else if (*fde > 0) {
-			*fde -= len;
-			if (*fde <= 0) {
-				if (unlikely(*fde < 0)) {
-					RD(1, "negative leftover to %d", *fde);
-					*fde = 0;
-				}
-				thisclen = len;
-				goto log;
-			}
 		}
 #ifdef WITH_KVS
-update_ctr:
+		else {
+		    do {
+		    uint64_t datum = 0, key;
+		    int rc, t;
+		    uint32_t _idx;
+		    uint16_t _off, _len;
+		    struct netmap_slot *s;
+		    char *_buf;
+
+		    if (!db->vp)
+		    	break;
+		    key = parse_get_key(rxbuf);
+		    rc = btree_lookup(db->vp, key, &datum);
+		    if (rc == ENOENT)
+		    	break;
+		    _to_tuple(datum, &_idx, &_off, &_len);
+
+		    if (!(flags & DF_PASTE)) {
+		    	content = db->paddr + NETMAP_BUF_SIZE * _idx;
+		    	msglen = _len;
+		    	break;
+		    }
+
+	       	    _buf = NETMAP_BUF(rxr, _idx);
+		    s = _unembed_slot(_buf, _off);
+		    t = nm_where(txr, tp->extra, tp->extra_num, s);
+		    if (t == SLOT_UNKNOWN) {
+		    	msglen = _len;
+		    } else if (t == SLOT_KERNEL || s->flags & NS_BUF_CHANGED) {
+		    	msglen = _len;
+		    	content = _buf + _off;
+		    } else { // zero copy
+		    	struct netmap_slot *txs;
+		    	u_int hl;
+
+		    	txs = set_to_nm(txr, s);
+		    	txs->fd = rxs->fd;
+		    	txs->len = _off + _len; // XXX
+		    	_embed_slot(_buf, _off, txs);
+		    	hl = generate_httphdr(_len, _buf + off);
+		    	if (unlikely(hl != _off - off)) {
+		    		RD(1, "mismatch");
+		    	}
+		    	no_ok = 1;
+		    }
+		    } while (0);
+		}
+#endif /* WITH_KVS */
+		if (!no_ok) {
+			generate_http_nm(msglen, txr, g->virt_header, o,
+		    		rxs->fd, gp->http, gp->httplen, content);
+		}
+#ifdef WITH_KVS
 #endif /* WITH_KVS */
 		nm_update_ctr(targ, 1, len);
 #ifdef MYHZ
@@ -1574,8 +1571,8 @@ main(int argc, char **argv)
 			perror("calloc");
 			usage();
 		}
-		gp.httplen = generate_http(gp.msglen, gp.http, NULL);
-		D("preallocated http %d", gp.httplen);
+		gp.httplen = generate_httphdr(gp.msglen, gp.http);
+		D("preallocated http hdr %d", gp.httplen);
 	}
 
 	gp.sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
