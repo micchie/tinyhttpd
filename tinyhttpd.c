@@ -430,34 +430,6 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 }
 
 #ifdef WITH_KVS
-#if 0
-ssize_t
-generate_httphdr(ssize_t content_length, char *buf)
-{
-	char *p = buf;
-	/* From nginx */
-	static char *lines[5] = {
-	 "HTTP/1.1 200 OK\r\n",
-	 "Connection: keep-alive\r\n",
-	 "Server: Apache/2.2.800\r\n",
-	 "Content-Length: "};
-	ssize_t l;
-	const size_t l0 = 17, l1 = 24, l2 = 24, l3 = 16;
-
-	//l0 = strlen(lines[0]);
-	p = mempcpy(p, lines[0], l0);
-	//l1 = strlen(lines[1]);
-	p = mempcpy(p, lines[1], l1);
-	//l2 = strlen(lines[2]);
-	p = mempcpy(p, lines[2], l2);
-	p = mempcpy(p, lines[3], l3);
-	l = sprintf(p, "%lu\r\n\r", content_length);
-	p += l;
-	*p++ = '\n';
-	return p - buf;
-}
-#endif /* 0 */
-
 static char *HTTPHDR = "HTTP/1.1 200 OK\r\n"
 		 "Connection: keep-alive\r\n"
 		 "Server: Apache/2.2.800\r\n"
@@ -1232,36 +1204,30 @@ error:
 		D("btree_create_btree() done (%d)", rc);
 		if (rc != 0)
 			return -1;
+		else if (db->flags & DF_PASTE)
+			return 0;
 	}
 #endif /* WITH_BPLUS */
-	if (db->flags & DF_BPLUS && db->flags & DF_PASTE) {
-		return 0;
-	} else {
-	    do {
-		snprintf(db->path, sizeof(db->path), "%s%d",
-				args->prefix, args->i);
-		//unlink(db->path);
-		fd = open(db->path, O_RDWR | O_CREAT, S_IRWXU);
-		if (fd < 0) {
-			perror("open");
-			break;
-		}
-		if (db->flags & DF_MMAP) {
-			if (fallocate(fd, 0, 0, db->size) < 0) {
-				perror("fallocate");
-				break;
-			}
-			db->paddr = _do_mmap(fd, db->size);
-			if (db->paddr == NULL)
-				break;
-		}
-		db->dumbfd = fd;
-		return 0;
-	    } while (0);
-	    if (fd > 0)
-		close(fd);
+	snprintf(db->path, sizeof(db->path), "%s%d", args->prefix, args->i);
+	fd = open(db->path, O_RDWR | O_CREAT, S_IRWXU);
+	if (fd < 0) {
+		perror("open");
+		return -1;
 	}
-	return -1;
+	if (db->flags & DF_MMAP) {
+		if (fallocate(fd, 0, 0, db->size) < 0) {
+			perror("fallocate");
+			close(fd);
+			return -1;
+		}
+		db->paddr = _do_mmap(fd, db->size);
+		if (db->paddr == NULL) {
+			close(fd);
+			return -1;
+		}
+	}
+	db->dumbfd = fd;
+	return 0;
 }
 
 #ifdef WITH_STACKMAP
@@ -1308,7 +1274,6 @@ _worker(void *data)
 			tp->extra[i] = next;
 #endif
 			p = NETMAP_BUF(any_ring, next);
-			//next = *(uint32_t *)NETMAP_BUF(any_ring, next);
 			next = *(uint32_t *)p;
 		}
 		tp->extra_num = i;
@@ -1317,7 +1282,7 @@ _worker(void *data)
 		tp->ifreq = gp->ifreq;
 
 		/* allocate fd table */
-		tp->fds =calloc(sizeof(*tp->fds), DEFAULT_NFDS);
+		tp->fds = calloc(sizeof(*tp->fds), DEFAULT_NFDS);
 		if (!tp->fds){
 			perror("calloc");
 			goto quit;
@@ -1387,19 +1352,19 @@ _worker(void *data)
 				}
 				if (unlikely(newfd >= tp->nfds)) {
 				       int *newfds, fdsiz = sizeof(*tp->fds);
-				       int curfds = tp->nfds;
+				       int nfds = tp->nfds;
 				      
-				       newfds = calloc(fdsiz, tp->nfds * 2);
+				       newfds = calloc(fdsiz, nfds * 2);
 				       if (!newfds) {
 					       perror("calloc");
 					       close(newfd);
 					       goto quit;
 				       }
-				       memcpy(newfds, tp->fds, fdsiz * curfds);
+				       memcpy(newfds, tp->fds, fdsiz * nfds);
 				       free(tp->fds);
 				       _mm_mfence();
 				       tp->fds = newfds;
-				       tp->nfds++;
+				       tp->nfds = nfds * 2;
 				}
 			}
 accepted:
@@ -1411,7 +1376,6 @@ accepted:
 			}
 
 			for (i = first_rx_ring; i <= last_rx_ring; i++) {
-
 				do_nm_ring(targ, i);
 			}
 		} else if (g->dev_type == DEV_SOCKET) {
@@ -1472,7 +1436,6 @@ int
 main(int argc, char **argv)
 {
 	int ch;
-	int sd;
 	struct sockaddr_in sin;
 	const int on = 1;
 	int port = 60000;
@@ -1615,24 +1578,25 @@ main(int argc, char **argv)
 		D("preallocated http %d", gp.httplen);
 	}
 
-	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sd < 0) {
+	gp.sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (gp.sd < 0) {
 		perror("socket");
 		return 0;
 	}
-	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+
+	if (setsockopt(gp.sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+	if (setsockopt(gp.sd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (setsockopt(sd, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
+	if (setsockopt(gp.sd, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (ioctl(sd, FIONBIO, &on) < 0) {
+	if (ioctl(gp.sd, FIONBIO, &on) < 0) {
 		perror("ioctl");
 		goto close_socket;
 	}
@@ -1640,15 +1604,14 @@ main(int argc, char **argv)
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = htonl(INADDR_ANY);
 	sin.sin_port = htons(port);
-	if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+	if (bind(gp.sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
 		perror("bind");
 		goto close_socket;
 	}
-	if (listen(sd, SOMAXCONN) != 0) {
+	if (listen(gp.sd, SOMAXCONN) != 0) {
 		perror("listen");
 		goto close_socket;
 	}
-	gp.sd = sd;
 
 #ifdef WITH_STACKMAP
 	if (strlen(gp.ifname) > 0) {
@@ -1719,8 +1682,8 @@ close_socket:
 	}
 #endif /* WITH_EXTMEM */
 
-	if (sd > 0)
-		close(sd);
+	if (gp.sd > 0)
+		close(gp.sd);
 	if (gp.http)
 		free(gp.http);
 	return 0;
