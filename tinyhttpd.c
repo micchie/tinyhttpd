@@ -54,7 +54,6 @@
 #include <sqlite3.h>
 #endif /* WITH_SQLITE */
 #include <pthread.h>
-#ifdef WITH_STACKMAP
 #include <net/netmap.h>
 #include <net/netmap_user.h>
 
@@ -103,7 +102,6 @@ user_clock_gettime(struct timespec *ts)
 #define FILESPATH	"/mnt/pmem"
 #define PMEMFILE         "/mnt/pmem/netmap_mem"
 #define BPLUSFILE	"/mnt/pmem/bplus"
-#endif /* WITH_STACKMAP */
 #define IPV4TCP_HDRLEN	66
 #define NETMAP_BUF_SIZE	2048
 
@@ -169,11 +167,9 @@ struct dbargs {
 
 struct glpriv {
 	char ifname[IFNAMSIZ + 64];
-#ifdef WITH_STACKMAP
 	struct nm_garg g;
 	struct nm_ifreq ifreq;
 	int extmemfd;
-#endif /* WITH_STACKMAP */
 	int sd;
 	char *http;
 	int httplen;
@@ -247,13 +243,11 @@ wait_ns(long ns)
 
 #define CLSIZ	64 /* XXX */
 
-#ifdef WITH_STACKMAP
 struct wal_hdr { // so far organized for Paste but it is dummy anyways.
 	char ifname[IFNAMSIZ + 64];
 	char path[256];
 	uint32_t buf_ofs;
 };
-#endif /* WITH_STACKMAP */
 
 enum { DT_NONE=0, DT_DUMB, DT_SQLITE};
 const char *SQLDBTABLE = "tinytable";
@@ -1284,7 +1278,6 @@ error:
 	return 0;
 }
 
-#ifdef WITH_STACKMAP
 static void *
 _worker(void *data)
 {
@@ -1453,7 +1446,6 @@ quit:
 	close_db(&db);
 	return (NULL);
 }
-#endif /* WITH_STACKMAP */
 
 void
 clean_dir(char *dirpath)
@@ -1491,12 +1483,10 @@ main(int argc, char **argv)
 
 	bzero(&gp, sizeof(gp));
 	gp.msglen = 64;
-#ifdef WITH_STACKMAP
 	gp.g.nmr_config = "";
 	gp.g.nthreads = 1;
 	gp.g.td_privbody = _worker;
 	gp.g.polltimeo = 2000;
-#endif
 	dbargs->pgsiz = getpagesize();
 
 	signal(SIGPIPE, SIG_IGN); // XXX
@@ -1573,11 +1563,9 @@ main(int argc, char **argv)
 		case 'p':
 			gp.g.nthreads = atoi(optarg);
 			break;
-#ifdef WITH_STACKMAP
 		case 'C':
 			gp.g.nmr_config = strdup(optarg);
 			break;
-#endif
 #ifdef WITH_BPLUS
 		case 'B':
 			dbargs->flags |= DF_BPLUS;
@@ -1657,7 +1645,6 @@ main(int argc, char **argv)
 		goto close_socket;
 	}
 
-#ifdef WITH_STACKMAP
 	if (strlen(gp.ifname) > 0) {
 		char *p = gp.g.ifname;
 		struct nm_ifreq *ifreq = &gp.ifreq;
@@ -1715,7 +1702,6 @@ main(int argc, char **argv)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
 	    nm_name, IPV4TCP_HDRLEN, gp.g.nmd->nifp->ni_tx_rings);
-#endif /* WITH_STACKMAP */
 
 close_socket:
 #ifdef WITH_EXTMEM
