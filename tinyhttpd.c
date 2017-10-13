@@ -549,7 +549,24 @@ usage(void)
 	exit(1);
 }
 
-int do_accept(int fd, int epfd)
+int fdtable_expand(struct thpriv *tp)
+{
+	int *newfds, fdsiz = sizeof(*tp->fds);
+	int nfds = tp->nfds;
+
+	newfds = calloc(fdsiz, nfds * 2);
+	if (!newfds) {
+		perror("calloc");
+		return ENOMEM;
+	}
+	memcpy(newfds, tp->fds, fdsiz * nfds);
+	free(tp->fds);
+	_mm_mfence();
+	tp->fds = newfds;
+	tp->nfds = nfds * 2;
+}
+
+int do_accept(struct thpriv *tp, int fd, int epfd)
 {
 	struct epoll_event ev;
 	struct sockaddr_in sin;
@@ -562,6 +579,12 @@ int do_accept(int fd, int epfd)
 		//}
 		//int yes = 1;
 		//setsockopt(newfd, SOL_SOCKET, SO_BUSY_POLL, &yes, sizeof(yes));
+		if (newfd >= tp->nfds) {
+			if (fdtable_expand(tp)) {
+				close(newfd);
+				break;
+			}
+		}
 		memset(&ev, 0, sizeof(ev));
 		ev.events = POLLIN;
 		ev.data.fd = newfd;
@@ -675,9 +698,9 @@ nm_where(struct netmap_ring *ring, struct netmap_slot *extra,
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
 #define KVS_SLOT_OFF 8
 static inline void
-_embed_slot(char *buf, u_int coff, struct netmap_slot *slot)
+_embed_slot(char *buf, struct netmap_slot *slot)
 {
-	*(struct netmap_slot **)(buf + coff + KVS_SLOT_OFF) = slot;
+	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
 }
 
 static inline struct netmap_slot*
@@ -805,6 +828,18 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 }
 
 enum http {NONE=0, POST, GET};
+static __inline int
+httpreq(const char *p)
+{
+	enum http req = NONE;
+
+	if (!strncmp(p, "POST ", POST_LEN)) {
+		req = POST;
+	} else if (!strncmp(p, "GET ", GET_LEN)) {
+		req = GET;
+	}
+	return req;
+}
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
 int
@@ -829,8 +864,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		int off, len, thisclen = 0, o = IPV4TCP_HDRLEN, no_ok = 0;
 		int *fde = &tp->fds[rxs->fd];
-		char *rxbuf, *content = NULL;
-		enum http req = NONE;
+		char *rxbuf, *cbuf, *content = NULL;
+		enum http req;
 #ifdef MYHZ
 		struct timespec ts1, ts2, ts3;
 		user_clock_gettime(&ts1);
@@ -842,148 +877,145 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			continue;
 		}
 
-		if (!strncmp(rxbuf, "POST ", POST_LEN)) {
-			req = POST;
-		} else if (!strncmp(rxbuf, "GET ", GET_LEN)) {
-			req = GET;
-		}
-		if (req == POST || req == NONE) {
-			uint64_t key;
-			int coff, clen;
-		       
-			if (req == POST) {
-				clen = parse_post(rxbuf, &coff, &key);
-				if (unlikely(clen < 0))
-					continue;
-				thisclen = len - coff;
-				if (unlikely(thisclen < 0)) {
-					D("thisclen %d len %d coff %d", thisclen, len, coff);
-				}
-				if (clen > thisclen) {
-					*fde = clen - thisclen;
-				}
-			} else if (*fde > 0) {
-				*fde -= len;
-				if (*fde <= 0) {
-					if (unlikely(*fde < 0)) {
-						RD(1, "bad leftover %d", *fde);
-						*fde = 0;
-					}
-				}
-				thisclen = len;
-			} else {
+		switch (httpreq(rxbuf)) {
+		uint64_t key;
+		int coff, clen;
+#ifdef WITH_KVS
+		uint64_t datum;
+		int rc, t;
+		uint32_t _idx;
+		uint16_t _off, _len;
+		struct netmap_slot *s;
+		char *_buf;
+#endif
+		case NONE:
+			if (*fde <= 0)
 				continue;
+			*fde -= len;
+			if (unlikely(*fde < 0)) {
+				RD(1, "bad leftover %d", *fde);
+				*fde = 0;
+			} else if (*fde > 0) {
+				no_ok = 1;
+			}
+			thisclen = len;
+			break;
+		case POST:
+			clen = parse_post(rxbuf, &coff, &key);
+			if (unlikely(clen < 0))
+				continue;
+			thisclen = len - coff;
+			if (unlikely(thisclen < 0)) {
+				D("thisclen %d len %d coff %d",
+					thisclen, len, coff);
+			}
+			if (clen > thisclen) {
+				*fde = clen - thisclen;
 			}
 			if (*fde > 0)
 				no_ok = 1;
+			cbuf = rxbuf + coff;
 
-			if (type == DT_DUMB) {
-				if (flags & DF_PASTE) {
-					u_int i = 0;
+			if (type != DT_DUMB)
+				break;
+			if (flags & DF_PASTE) {
+				u_int i = 0;
 #ifdef WITH_KVS
-					struct netmap_slot tmp, *extra;
+				struct netmap_slot tmp, *extra;
 #endif
-					uint32_t extra_i = get_extra(tp, &db->cur);
+				uint32_t extra_i = get_extra(tp, &db->cur);
 
 					/* flush data buffer */
-					for (; i < len; i += CLSIZ) {
-						_mm_clflush(rxbuf + i);
-					}
+				for (; i < thisclen; i += CLSIZ) {
+					_mm_clflush(cbuf + i);
+				}
 #ifdef WITH_BPLUS
-					if (db->vp) {
-						paste_bplus(db->vp, key, rxs,
-							off + coff, thisclen);
-					} else
+				if (db->vp) {
+					paste_bplus(db->vp, key, rxs,
+						off + coff, thisclen);
+				} else
 #endif
-				       	if (db->paddr) {
-						paste_wal(db->paddr, &db->cur,
-						    dbsiz, rxs, off + coff,
-						    thisclen);
-					}
+				if (db->paddr) {
+					paste_wal(db->paddr, &db->cur, dbsiz,
+					    rxs, off + coff, thisclen);
+				}
 
-					/* swap out buffer */
+				/* swap out buffer */
 #ifdef WITH_KVS
-					extra = &tp->extra[extra_i];
-					tmp = *rxs;
-					rxs->buf_idx = extra->buf_idx;
-					rxs->flags |= NS_BUF_CHANGED;
-					*extra = tmp;
-					extra->flags &= ~NS_BUF_CHANGED;
+				extra = &tp->extra[extra_i];
+				tmp = *rxs;
+				rxs->buf_idx = extra->buf_idx;
+				rxs->flags |= NS_BUF_CHANGED;
+				*extra = tmp;
+				extra->flags &= ~NS_BUF_CHANGED;
 
-					/* record current slot */
-					if (db->flags & DF_KVS) {
-						_embed_slot(rxbuf, coff, extra);
-					}
+				/* record current slot */
+				if (db->flags & DF_KVS) {
+					_embed_slot(cbuf, extra);
+				}
 #else
-					i = rxs->buf_idx;
-					rxs->buf_idx = tp->extra[extra_i];
-					rxs->flags |= NS_BUF_CHANGED;
-					tp->extra[extra_i] = i;
+				i = rxs->buf_idx;
+				rxs->buf_idx = tp->extra[extra_i];
+				rxs->flags |= NS_BUF_CHANGED;
+				tp->extra[extra_i] = i;
 #endif
 
-				} else if (db->paddr) {
-					copy_and_log(db->paddr, &db->cur,
-					    dbsiz, rxbuf + coff, thisclen,
-					    thisclen, is_pm(db) ? 0 : db->pgsiz,
-					    is_pm(db), db->vp, key);
-				} else {
-					if (writesync(rxbuf + coff, len, dbsiz,
-					    db->dumbfd, &db->cur,
-					    flags & DF_FDSYNC)) {
-						return -1;
-					}
+			} else if (db->paddr) {
+				copy_and_log(db->paddr, &db->cur, dbsiz, cbuf,
+				    thisclen, thisclen, is_pm(db) ? 0 :
+				    db->pgsiz, is_pm(db), db->vp, key);
+			} else {
+				if (writesync(cbuf, len, dbsiz, db->dumbfd,
+				    &db->cur, flags & DF_FDSYNC)) {
+					return -1;
 				}
 			}
-		}
+			break;
 #ifdef WITH_KVS
-		else {
-		    do {
-		    uint64_t datum = 0, key;
-		    int rc, t;
-		    uint32_t _idx;
-		    uint16_t _off, _len;
-		    struct netmap_slot *s;
-		    char *_buf;
+		case GET:
+			if (!db->vp)
+				break;
+			key = parse_get_key(rxbuf);
+			rc = btree_lookup(db->vp, key, &datum);
+			if (rc == ENOENT)
+				break;
+			_to_tuple(datum, &_idx, &_off, &_len);
 
-		    if (!db->vp)
-		    	break;
-		    key = parse_get_key(rxbuf);
-		    rc = btree_lookup(db->vp, key, &datum);
-		    if (rc == ENOENT)
-		    	break;
-		    _to_tuple(datum, &_idx, &_off, &_len);
+			if (!(flags & DF_PASTE)) {
+				content = db->paddr + NETMAP_BUF_SIZE * _idx;
+				msglen = _len;
+				break;
+			}
 
-		    if (!(flags & DF_PASTE)) {
-		    	content = db->paddr + NETMAP_BUF_SIZE * _idx;
-		    	msglen = _len;
-		    	break;
-		    }
+			_buf = NETMAP_BUF(rxr, _idx);
+			s = _unembed_slot(_buf, _off);
+			t = nm_where(txr, tp->extra, tp->extra_num, s);
+			if (t == SLOT_UNKNOWN) {
+				msglen = _len;
+			} else if (t == SLOT_KERNEL ||
+				   s->flags & NS_BUF_CHANGED) {
+				msglen = _len;
+				content = _buf + _off;
+			} else { // zero copy
+				struct netmap_slot *txs;
+				u_int hl;
 
-	       	    _buf = NETMAP_BUF(rxr, _idx);
-		    s = _unembed_slot(_buf, _off);
-		    t = nm_where(txr, tp->extra, tp->extra_num, s);
-		    if (t == SLOT_UNKNOWN) {
-		    	msglen = _len;
-		    } else if (t == SLOT_KERNEL || s->flags & NS_BUF_CHANGED) {
-		    	msglen = _len;
-		    	content = _buf + _off;
-		    } else { // zero copy
-		    	struct netmap_slot *txs;
-		    	u_int hl;
-
-		    	txs = set_to_nm(txr, s);
-		    	txs->fd = rxs->fd;
-		    	txs->len = _off + _len; // XXX
-		    	_embed_slot(_buf, _off, txs);
-		    	hl = generate_httphdr(_len, _buf + off);
-		    	if (unlikely(hl != _off - off)) {
-		    		RD(1, "mismatch");
-		    	}
-		    	no_ok = 1;
-		    }
-		    } while (0);
-		}
+				txs = set_to_nm(txr, s);
+				txs->fd = rxs->fd;
+				txs->len = _off + _len; // XXX
+				_embed_slot(_buf + _off, txs);
+				hl = generate_httphdr(_len, _buf + off);
+				if (unlikely(hl != _off - off)) {
+					RD(1, "mismatch");
+				}
+				no_ok = 1;
+			}
+			break;
 #endif /* WITH_KVS */
+		default:
+			break;
+		}
+
 		if (!no_ok) {
 			generate_http_nm(msglen, txr, g->virt_header, o,
 		    		rxs->fd, gp->http, gp->httplen, content);
@@ -1004,7 +1036,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 {
 	char buf[MAXQUERYLEN];
-	char *rxbuf;
+	char *rxbuf, *cbuf;
 #ifdef WITH_SQLITE
 	static u_int seq = 0;
 #endif
@@ -1016,6 +1048,9 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	size_t max;
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
+	enum http req;
+	int *fde = &tp->fds[fd];
+	int no_ok = 0;
 
 	if (readmmap) {
 		size_t cur = db->cur;
@@ -1040,20 +1075,42 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 		return -1;
 	}
 
-	if (strncmp(rxbuf, "POST ", POST_LEN) == 0) {
-		uint64_t key;
-		int coff, clen = parse_post(rxbuf, &coff, &key);
+	switch (httpreq(rxbuf)) {
+	uint64_t key;
+	int coff, clen, thisclen;
+	int pm = is_pm(db);
 
+	case NONE: 
+		if (unlikely(*fde <= 0))
+			return 0;
+		*fde -= len;
+		if (unlikely(*fde < 0)) {
+			RD(1, "bad leftover %d", *fde);
+			*fde = 0;
+		} else if (*fde > 0) {
+			no_ok = 1;
+		}
+		thisclen = len;
+		break;
+	case POST:
+		clen = parse_post(rxbuf, &coff, &key);
 		if (unlikely(clen < 0)) {
 			RD(1, "invalid clen");
 			return 0;
 		}
+		thisclen = len - coff;
+		if (clen > thisclen) {
+			*fde = clen - thisclen;
+		}
+		if (*fde > 0)
+			no_ok = 1;
+		cbuf = rxbuf + coff;
+
 		if (db->type == DT_DUMB) {
 			if (db->paddr) {
 				copy_and_log(db->paddr, &db->cur, db->size,
-				    readmmap ? NULL : rxbuf + coff, clen,
-				    db->pgsiz, is_pm(db) ? 0 : db->pgsiz,
-				    is_pm(db), db->vp, key);
+				    readmmap ? NULL : cbuf, clen, db->pgsiz,
+				    pm ? 0 : db->pgsiz, pm, db->vp, key);
 			} else {
 				if (writesync(rxbuf + coff, len, db->size,
 				    db->dumbfd, &db->cur,
@@ -1062,7 +1119,7 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 				}
 			}
 		}
-#if WITH_SQLITE
+#ifdef WITH_SQLITE
 		else if (db->type == DT_SQLITE) {
 			char query[MAXQUERYLEN];
 			int ret;
@@ -1082,10 +1139,10 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			}
 		}
 #endif /* SQLITE */
-	} else if (strncmp(rxbuf, "GET ", GET_LEN) == 0) {
+		break;
+	case GET:
 #ifdef WITH_KVS
-		uint64_t key = parse_get_key(rxbuf);
-
+		key = parse_get_key(rxbuf);
 		if (db->vp) {
 			uint32_t _idx;
 			uint16_t _off, _len;
@@ -1099,7 +1156,8 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 			}
 		}
 #endif
-	} else {
+		break;
+	default:
 		return 0;
 	}
 
@@ -1127,7 +1185,6 @@ create_db(struct dbargs *args, struct dbctx *db)
 	int fd = 0;
 
 	bzero(db, sizeof(*db));
-
 	db->type = args->type;
 	db->flags = args->flags;
 	db->size = args->size;
@@ -1195,8 +1252,8 @@ error:
 	if (db->flags & DF_BPLUS) {
 		int rc;
 
-		snprintf(db->metapath, sizeof(db->metapath), "%s%d",
-				args->metaprefix, args->i);
+		snprintf(db->metapath, sizeof(db->metapath),
+				"%s%d", args->metaprefix, args->i);
 		rc = btree_create_btree(db->metapath, ((gfile_t **)&db->vp));
 		D("btree_create_btree() done (%d)", rc);
 		if (rc != 0)
@@ -1249,6 +1306,14 @@ _worker(void *data)
 	}
 	tp->db = &db;
 
+	/* allocate fd table */
+	tp->fds = calloc(sizeof(*tp->fds), DEFAULT_NFDS);
+	if (!tp->fds){
+		perror("calloc");
+		goto quit;
+	}
+	tp->nfds = DEFAULT_NFDS;
+
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
 		struct nmreq *req = &targ->nmd->req;
@@ -1277,14 +1342,6 @@ _worker(void *data)
 		D("imported %u extra buffers", i);
 
 		tp->ifreq = gp->ifreq;
-
-		/* allocate fd table */
-		tp->fds = calloc(sizeof(*tp->fds), DEFAULT_NFDS);
-		if (!tp->fds){
-			perror("calloc");
-			goto quit;
-		}
-		tp->nfds = DEFAULT_NFDS;
 	}
 
 	if (g->dev_type == DEV_SOCKET) {
@@ -1348,25 +1405,15 @@ _worker(void *data)
 					goto quit;
 				}
 				if (unlikely(newfd >= tp->nfds)) {
-				       int *newfds, fdsiz = sizeof(*tp->fds);
-				       int nfds = tp->nfds;
-				      
-				       newfds = calloc(fdsiz, nfds * 2);
-				       if (!newfds) {
-					       perror("calloc");
-					       close(newfd);
-					       goto quit;
-				       }
-				       memcpy(newfds, tp->fds, fdsiz * nfds);
-				       free(tp->fds);
-				       _mm_mfence();
-				       tp->fds = newfds;
-				       tp->nfds = nfds * 2;
+					if (fdtable_expand(tp)) {
+						close(newfd);
+						goto quit;
+					}
 				}
 			}
 accepted:
 			/*
-			 * check accepted sockets
+			 * check the netmap socket
 			 */
 			if (!(pfd[0].revents & POLLIN)) {
 				continue;
@@ -1390,7 +1437,7 @@ accepted:
 				int fd = evts[i].data.fd;
 
 				if (fd == sd) {
-					if (do_accept(sd, epfd) < 0)
+					if (do_accept(tp, sd, epfd) < 0)
 						goto quit;
 				} else {
 					do_established(fd, msglen, targ);
