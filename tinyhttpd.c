@@ -656,7 +656,7 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 	return txs;
 }
 
-enum {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
+enum slot {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 
 static inline int
 _between(u_int x, u_int a, u_int b)
@@ -673,8 +673,8 @@ _between_wrap(u_int x, u_int a, u_int b)
 
 #define U(x)	((uintptr_t)(x))
 static inline int
-nm_where(struct netmap_ring *ring, struct netmap_slot *extra,
-		u_int extra_num, struct netmap_slot *slot)
+whose_slot(struct netmap_slot *slot, struct netmap_ring *ring,
+		struct netmap_slot *extra, u_int extra_num)
 {
 	if (_between(U(slot), U(ring->slot), U(ring->slot + ring->num_slots))) {
 		if (_between_wrap(slot - ring->slot, ring->head, ring->tail))
@@ -692,13 +692,13 @@ nm_where(struct netmap_ring *ring, struct netmap_slot *extra,
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
 #define KVS_SLOT_OFF 8
 static inline void
-_embed_slot(char *buf, struct netmap_slot *slot)
+embed_slot(struct netmap_slot *slot, char *buf)
 {
 	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
 }
 
 static inline struct netmap_slot*
-_unembed_slot(char *nmb, u_int coff)
+unembed_slot(char *nmb, u_int coff)
 {
 	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
 }
@@ -876,7 +876,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		int coff, clen;
 #ifdef WITH_KVS
 		uint64_t datum;
-		int rc, t;
+		int rc;
+		enum slot t;
 		uint32_t _idx;
 		uint16_t _off, _len;
 		struct netmap_slot *s;
@@ -945,7 +946,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 
 				/* record current slot */
 				if (db->flags & DF_KVS) {
-					_embed_slot(cbuf, extra);
+					embed_slot(extra, cbuf);
 				}
 #else
 				i = rxs->buf_idx;
@@ -982,8 +983,8 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			}
 
 			_buf = NETMAP_BUF(rxr, _idx);
-			s = _unembed_slot(_buf, _off);
-			t = nm_where(txr, tp->extra, tp->extra_num, s);
+			s = unembed_slot(_buf, _off);
+			t = whose_slot(s, txr, tp->extra, tp->extra_num);
 			if (t == SLOT_UNKNOWN) {
 				msglen = _len;
 			} else if (t == SLOT_KERNEL ||
@@ -997,7 +998,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 				txs = set_to_nm(txr, s);
 				txs->fd = rxs->fd;
 				txs->len = _off + _len; // XXX
-				_embed_slot(_buf + _off, txs);
+				embed_slot(txs, _buf + _off);
 				hl = generate_httphdr(_len, _buf + off);
 				if (unlikely(hl != _off - off)) {
 					RD(1, "mismatch");
@@ -1027,7 +1028,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 	return 0;
 }
 
-int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
+int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 {
 	char buf[MAXQUERYLEN];
 	char *rxbuf, *cbuf;
@@ -1332,7 +1333,6 @@ _worker(void *data)
 		}
 		tp->extra_num = i;
 		D("imported %u extra buffers", i);
-
 		tp->ifreq = gp->ifreq;
 	}
 
@@ -1432,7 +1432,7 @@ accepted:
 					if (do_accept(tp, sd, epfd) < 0)
 						goto quit;
 				} else {
-					do_established(fd, msglen, targ);
+					do_read(fd, msglen, targ);
 				}
 			}
 		}
