@@ -1042,7 +1042,6 @@ int do_established(int fd, ssize_t msglen, struct nm_targ *targ)
 	size_t max;
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
-	enum http req;
 	int *fde = &tp->fds[fd];
 	int no_ok = 0;
 
