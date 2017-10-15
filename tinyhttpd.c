@@ -118,7 +118,7 @@ user_clock_gettime(struct timespec *ts)
 #define RING_OBJTOTAL	512
 #define RING_OBJSIZE	33024
 
-#define MAXCONNECTIONS 2048
+#define EPOLLEVENTS 2048
 #define MAXQUERYLEN 32767
 
 #define MAX_HTTPLEN	65535
@@ -177,10 +177,11 @@ struct glpriv {
 	struct dbargs dbargs; // propagated to threads
 };
 
+#define ARRAYSIZ(a)	(sizeof(a) / sizeof(a[0]))
 struct thpriv {
 	struct nm_garg *g;
 	struct nm_ifreq ifreq;
-	struct epoll_event evts[MAXCONNECTIONS];
+	struct epoll_event evts[EPOLLEVENTS];
 	int	*fds;
 	int	nfds;
 #ifdef WITH_KVS
@@ -193,6 +194,13 @@ struct thpriv {
 	struct dbctx *db;
 };
 #define DEFAULT_NFDS	65535
+
+static inline void
+free_if_exist(void *p)
+{
+	if (p != NULL)
+		free(p);
+}
 
 static inline uint32_t
 get_extra(struct thpriv *tp, size_t *curp)
@@ -558,6 +566,7 @@ int fdtable_expand(struct thpriv *tp)
 	_mm_mfence();
 	tp->fds = newfds;
 	tp->nfds = nfds * 2;
+	return 0;
 }
 
 int do_accept(struct thpriv *tp, int fd, int epfd)
@@ -618,7 +627,7 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 }
 
 static inline void
-_to_tuple(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
+unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 {
 	*idx = p >> 32;
 	*off = (p & 0x00000000ffff0000) >> 16;
@@ -626,7 +635,7 @@ _to_tuple(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 }
 
 static inline uint64_t
-_from_tuple(uint32_t idx, uint16_t off, uint16_t len)
+pack(uint32_t idx, uint16_t off, uint16_t len)
 {
 	return (uint64_t)idx << 32 | off<< 16 | len;
 }
@@ -712,50 +721,40 @@ str_to_key(uint64_t *k)
 	return atoi(c);
 }
 
-static inline void
-print_force(char *p, int len)
-{
-	int i;
-	for (i = 0; i <len; i++) {
-		printf("%c", p[i]);
-	}
-	printf("\n");
-}
-
 #ifdef WITH_BPLUS
 static inline void
-paste_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
+nmidx_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, size_t len)
 {
-	uint64_t pst_ent;
+	uint64_t packed;
 	//uint64_t datam;
 	static int unique = 0;
 	int rc;
 
-	pst_ent = _from_tuple(slot->buf_idx, off, len);
-	rc = btree_insert(vp, key, pst_ent);
+	packed = pack(slot->buf_idx, off, len);
+	rc = btree_insert(vp, key, packed);
 	if (rc == 0)
 		unique++;
-	ND("key %lu val %lu idx %u off %lu len %lu", key, pst_ent, slot->buf_idx, off, len);
+	ND("key %lu val %lu idx %u off %lu len %lu", key, packed, slot->buf_idx, off, len);
 }
 #endif /* WITH_BPLUS */
 
 static inline void
-paste_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
+nmidx_wal(char *paddr, size_t *pos, size_t dbsiz, struct netmap_slot *slot,
 		size_t off, size_t len)
 {
-	uint64_t pst_ent;
+	uint64_t packed;
 	size_t cur = *pos;
-	int plen = sizeof(pst_ent);
+	int plen = sizeof(packed);
 	int phdrlen = sizeof(struct wal_hdr);
 	char *p = paddr;
 
 	/* make log */
-	pst_ent = _from_tuple(slot->buf_idx, off, len);
+	packed = pack(slot->buf_idx, off, len);
 	/* position log */
 	if (unlikely(plen > dbsiz - phdrlen - cur))
 		cur = 0;
 	p += phdrlen + cur;
-	*(uint64_t *)p = pst_ent;
+	*(uint64_t *)p = packed;
 	_mm_clflush(p);
 	*pos = cur + plen;
 }
@@ -804,8 +803,8 @@ copy_and_log(char *paddr, size_t *pos, size_t dbsiz, char *buf, size_t len,
 #ifdef WITH_BPLUS
 	if (vp) {
 		static int unique = 0;
-		uint64_t pst_ent = _from_tuple(cur/NETMAP_BUF_SIZE, 0, len);
-		int rc = btree_insert(vp, key, pst_ent);
+		uint64_t packed = pack(cur/NETMAP_BUF_SIZE, 0, len);
+		int rc = btree_insert(vp, key, packed);
 		if (rc == 0)
 			unique++;
 	} else
@@ -859,7 +858,6 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 		int off, len, thisclen = 0, o = IPV4TCP_HDRLEN, no_ok = 0;
 		int *fde = &tp->fds[rxs->fd];
 		char *rxbuf, *cbuf, *content = NULL;
-		enum http req;
 #ifdef MYHZ
 		struct timespec ts1, ts2, ts3;
 		user_clock_gettime(&ts1);
@@ -926,12 +924,12 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 				}
 #ifdef WITH_BPLUS
 				if (db->vp) {
-					paste_bplus(db->vp, key, rxs,
+					nmidx_bplus(db->vp, key, rxs,
 						off + coff, thisclen);
 				} else
 #endif
 				if (db->paddr) {
-					paste_wal(db->paddr, &db->cur, dbsiz,
+					nmidx_wal(db->paddr, &db->cur, dbsiz,
 					    rxs, off + coff, thisclen);
 				}
 
@@ -974,7 +972,7 @@ do_nm_ring(struct nm_targ *targ, int ring_nr)
 			rc = btree_lookup(db->vp, key, &datum);
 			if (rc == ENOENT)
 				break;
-			_to_tuple(datum, &_idx, &_off, &_len);
+			unpack(datum, &_idx, &_off, &_len);
 
 			if (!(flags & DF_PASTE)) {
 				content = db->paddr + NETMAP_BUF_SIZE * _idx;
@@ -1072,7 +1070,6 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 	switch (httpreq(rxbuf)) {
 	uint64_t key;
 	int coff, clen, thisclen;
-	int pm = is_pm(db);
 
 	case NONE: 
 		if (unlikely(*fde <= 0))
@@ -1101,6 +1098,7 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 		cbuf = rxbuf + coff;
 
 		if (db->type == DT_DUMB) {
+			int pm = is_pm(db);
 			if (db->paddr) {
 				copy_and_log(db->paddr, &db->cur, db->size,
 				    readmmap ? NULL : cbuf, clen, db->pgsiz,
@@ -1144,7 +1142,7 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 			int rc = btree_lookup(db->vp, key, &datam);
 
 			if (rc != ENOENT) {
-				_to_tuple(datam, &_idx, &_off, &_len);
+				unpack(datam, &_idx, &_off, &_len);
 				content = db->paddr + NETMAP_BUF_SIZE * _idx;
 				msglen = _len;
 			}
@@ -1155,6 +1153,8 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 		return 0;
 	}
 
+	if (no_ok)
+		return 0;
 	if (gp->httplen && content == NULL) {
 		len = gp->httplen;
 		memcpy(buf, gp->http, len);
@@ -1309,8 +1309,8 @@ _worker(void *data)
 
 	/* import extra buffers */
 	if (g->dev_type == DEV_NETMAP) {
-		struct nmreq *req = &targ->nmd->req;
-		struct netmap_if *nifp = targ->nmd->nifp;
+		const struct nmreq *req = &targ->nmd->req;
+		const struct netmap_if *nifp = targ->nmd->nifp;
 		struct netmap_ring *any_ring = targ->nmd->some_ring;
 		uint32_t i, next = nifp->ni_bufs_head;
 		int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; /* XXX */
@@ -1334,9 +1334,7 @@ _worker(void *data)
 		tp->extra_num = i;
 		D("imported %u extra buffers", i);
 		tp->ifreq = gp->ifreq;
-	}
-
-	if (g->dev_type == DEV_SOCKET) {
+	} else if (g->dev_type == DEV_SOCKET) {
 		struct epoll_event ev;
 
 		targ->fd = epoll_create1(EPOLL_CLOEXEC);
@@ -1388,7 +1386,6 @@ _worker(void *data)
 					/* ignore this socket */
 					goto accepted;
 				}
-				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(targ->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
 					close(newfd);
@@ -1416,11 +1413,11 @@ accepted:
 			}
 		} else if (g->dev_type == DEV_SOCKET) {
 			int i, nfd, epfd = targ->fd;
-			int timeo = g->polltimeo;
 			int sd = gp->sd;
 			struct epoll_event *evts = tp->evts;
+			int nevts = ARRAYSIZ(tp->evts);
 
-			nfd = epoll_wait(epfd, evts, MAXCONNECTIONS, timeo);
+			nfd = epoll_wait(epfd, evts, nevts, g->polltimeo);
 			if (nfd < 0) {
 				perror("epoll_wait");
 				goto quit;
@@ -1430,7 +1427,7 @@ accepted:
 
 				if (fd == sd) {
 					if (do_accept(tp, sd, epfd) < 0)
-						goto quit;
+						break;
 				} else {
 					do_read(fd, msglen, targ);
 				}
@@ -1438,10 +1435,8 @@ accepted:
 		}
 	}
 quit:
-	if (tp->extra)
-		free(tp->extra);
-	if (tp->fds)
-		free(tp->fds);
+	free_if_exist(tp->extra);
+	free_if_exist(tp->fds);
 	close_db(&db);
 	return (NULL);
 }
@@ -1486,6 +1481,10 @@ main(int argc, char **argv)
 	gp.g.nthreads = 1;
 	gp.g.td_privbody = _worker;
 	gp.g.polltimeo = 2000;
+	gp.g.dev_type = DEV_SOCKET;
+	gp.g.td_type = TD_TYPE_OTHER;
+	gp.g.td_private_len = sizeof(struct thpriv);
+
 	dbargs->pgsiz = getpagesize();
 
 	signal(SIGPIPE, SIG_IGN); // XXX
@@ -1535,6 +1534,7 @@ main(int argc, char **argv)
 			dbargs->flags |= DF_READMMAP;
 			break;
 		case 'i':
+			gp.g.dev_type = DEV_NETMAP;
 			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
 			break;
 		case 'x': /* PASTE */
@@ -1598,7 +1598,7 @@ main(int argc, char **argv)
 	else if (dbargs->flags & DF_READMMAP && !(dbargs->flags & DF_MMAP))
 		usage();
 
-	/* Preallocate HTTP header ? */
+	/* Preallocate HTTP header */
 	if (gp.httplen) {
 		gp.http = calloc(1, MAX_HTTPLEN);
 		if (!gp.http) {
@@ -1614,7 +1614,6 @@ main(int argc, char **argv)
 		perror("socket");
 		return 0;
 	}
-
 	if (setsockopt(gp.sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
@@ -1661,7 +1660,6 @@ main(int argc, char **argv)
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
 
-		gp.g.dev_type = DEV_NETMAP;
 #ifdef WITH_EXTMEM
 		if (dbargs->flags & DF_PASTE) {
 			int fd;
@@ -1692,11 +1690,7 @@ main(int argc, char **argv)
 			pi->buf_pool_objtotal = gp.g.extra_bufs + 800000;
 		}
 #endif
-	} else {
-		gp.g.dev_type = DEV_SOCKET;
 	}
-	gp.g.td_type = TD_TYPE_OTHER;
-	gp.g.td_private_len = sizeof(struct thpriv);
 	if (nm_start(&gp.g) < 0)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
@@ -1713,7 +1707,6 @@ close_socket:
 
 	if (gp.sd > 0)
 		close(gp.sd);
-	if (gp.http)
-		free(gp.http);
+	free_if_exist(gp.http);
 	return 0;
 }
