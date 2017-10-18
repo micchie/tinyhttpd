@@ -1311,9 +1311,9 @@ _worker(void *data)
 	if (g->dev_type == DEV_NETMAP) {
 		const struct nmreq *req = &targ->nmd->req;
 		const struct netmap_if *nifp = targ->nmd->nifp;
-		struct netmap_ring *any_ring = targ->nmd->some_ring;
+		const struct netmap_ring *any_ring = targ->nmd->some_ring;
 		uint32_t i, next = nifp->ni_bufs_head;
-		int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; /* XXX */
+		const int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; // XXX
 
 		D("have %u extra buffers from %u ring %p", n, next, any_ring);
 		tp->extra = calloc(sizeof(*tp->extra), n);
@@ -1539,10 +1539,10 @@ main(int argc, char **argv)
 			break;
 		case 'x': /* PASTE */
 			dbargs->flags |= DF_PASTE;
-			// use 7500 to fill up 8 GB mem
-			gp.g.extmem_siz = atol(optarg) * 1000000;
+			gp.g.extmem_siz = atol(optarg) * 1000000; // MB to B
 			// believe 90 % is available for bufs
-			gp.g.extra_bufs = (gp.g.extmem_siz / 2048) / 10 * 9;
+			gp.g.extra_bufs = (gp.g.extmem_siz / NETMAP_BUF_SIZE) /
+				 10 * 9;
 			dbargs->size = gp.g.extra_bufs * 8 * 2;
 			D("extra_bufs request %u", gp.g.extra_bufs);
 
