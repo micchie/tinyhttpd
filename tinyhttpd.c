@@ -1386,6 +1386,7 @@ _worker(void *data)
 					/* ignore this socket */
 					goto accepted;
 				}
+				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(targ->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
 					close(newfd);
