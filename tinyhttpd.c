@@ -1156,8 +1156,8 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 	if (no_ok)
 		return 0;
 	if (gp->httplen && content == NULL) {
-		len = gp->httplen;
-		memcpy(buf, gp->http, len);
+		memcpy(buf, gp->http, gp->httplen);
+		len = gp->httplen + msglen;
 	} else {
 		len = generate_http(msglen, buf, content);
 	}
@@ -1356,8 +1356,8 @@ _worker(void *data)
 
 	while (!targ->cancel) {
 		if (g->dev_type == DEV_NETMAP) {
-			u_int first_rx_ring = targ->nmd->first_rx_ring;
-			u_int last_rx_ring = targ->nmd->last_rx_ring;
+			u_int first_ring = targ->nmd->first_rx_ring;
+			u_int last_ring = targ->nmd->last_rx_ring;
 			int i;
 
 			pfd[0].fd = targ->fd;
@@ -1409,7 +1409,7 @@ accepted:
 				continue;
 			}
 
-			for (i = first_rx_ring; i <= last_rx_ring; i++) {
+			for (i = first_ring; i <= last_ring; i++) {
 				do_nm_ring(targ, i);
 			}
 		} else if (g->dev_type == DEV_SOCKET) {
