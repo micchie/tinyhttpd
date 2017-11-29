@@ -1,8 +1,14 @@
 
 #include <math.h>
+#ifdef __FreeBSD__
+#include<sys/cpuset.h>
+#include <pthread_np.h> /* pthread w/ affinity */
+#endif
 #include<net/netmap.h>
 #include<net/netmap_user.h>
 #include<ctrs.h>
+#include<pthread.h>
+#include<sys/sysctl.h>	/* sysctl */
 
 #ifndef D
 #define D(fmt, ...) \
@@ -18,7 +24,9 @@
 enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
 enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER, TD_TYPE_DUMMY };
 
+#ifdef linux
 #define cpuset_t        cpu_set_t
+#endif
 /* set the thread affinity. */
 static inline int
 setaffinity(pthread_t me, int i)
@@ -95,6 +103,9 @@ struct nm_garg {
 	int64_t win[STATS_WIN];
 	int wait_link;
 	int polltimeo;
+#ifdef __FreeBSD__
+	struct timespec polltimeo_ts;
+#endif
 	int verbose;
 	int report_interval;
 #define OPT_PPS_STATS   2048

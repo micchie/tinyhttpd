@@ -1,5 +1,6 @@
 CFLAGS += -Werror -Wall -O2 -g
-LDFLAGS += -lpthread -lm -ldl -lrt # sqlite requires them
+#LDFLAGS += -lpthread -lm -ldl -lrt # sqlite requires them
+LDFLAGS += -lpthread -lm -lrt # sqlite requires them
 #LDFLAGS += -lrt # for clock_gettime()
 EXTRA_CFLAGS += -I/usr/local/include -I../libsqlite/include
 #EXTRA_LDFLAGS += ../libsqlite/lib/libsqlite3.a -lrt

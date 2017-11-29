@@ -26,13 +26,18 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <sys/poll.h>
+#ifdef linux
 #include <sys/epoll.h>
+#else
+#include <sys/event.h>
+#endif /* linux */
 #include <sys/stat.h>
 
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <net/if.h>
 #include <net/ethernet.h>
+#include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -109,6 +114,11 @@ user_clock_gettime(struct timespec *ts)
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
 #define max(a, b) (((a) > (b)) ? (a) : (b)) 
 
+#ifdef __FreeBSD__
+#define fallocate(a, b, c, d)	posix_fallocate(a, c, d)
+#define SOL_TCP	SOL_SOCKET
+#endif
+
 #ifndef D
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
@@ -181,7 +191,11 @@ struct glpriv {
 struct thpriv {
 	struct nm_garg *g;
 	struct nm_ifreq ifreq;
+#ifdef linux
 	struct epoll_event evts[EPOLLEVENTS];
+#else
+	struct kevent	evts[EPOLLEVENTS];
+#endif /* linux */
 	int	*fds;
 	int	nfds;
 #ifdef WITH_KVS
@@ -221,6 +235,7 @@ get_aligned(size_t len, size_t align)
 	return d ? len + align - d : len;
 }
 
+#if 0
 /* overflow some */
 static inline void
 set_rubbish(char *buf, int len)
@@ -248,6 +263,7 @@ wait_ns(long ns)
 			break;
 	}
 }
+#endif /* 0 */
 
 #define CLSIZ	64 /* XXX */
 
@@ -314,7 +330,7 @@ close_db(struct dbctx *db)
 	}
 #endif
 	/* remove file */
-	if (!db->path || !strncmp(db->path, ":memory:", 8)) {
+	if (!strlen(db->path) || !strncmp(db->path, ":memory:", 8)) {
 		D("No dbfile to remove");
 		return;
 	}
@@ -461,6 +477,10 @@ generate_httphdr(size_t content_length, char *buf)
 	return c - buf;
 }
 #else
+#ifdef __FreeBSD__
+#define mempcpy(d, s, l)	(memcpy(d, s, l) + l)
+#endif
+
 ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
 {
@@ -537,11 +557,13 @@ parse_post(char *post, int *coff, uint64_t *key)
 	return clen;
 }
 
+#ifdef WITH_KVS
 static inline uint64_t
 parse_get_key(char *get)
 {
 	return *(uint64_t *)(get + GET_LEN + 1); // jump '/'
 }
+#endif /* WITH_KVS */
 
 static void
 usage(void)
@@ -571,7 +593,11 @@ int fdtable_expand(struct thpriv *tp)
 
 int do_accept(struct thpriv *tp, int fd, int epfd)
 {
+#ifdef linux
 	struct epoll_event ev;
+#else
+	struct kevent ev;
+#endif
 	struct sockaddr_in sin;
 	socklen_t addrlen;
 	int newfd;
@@ -589,15 +615,20 @@ int do_accept(struct thpriv *tp, int fd, int epfd)
 			}
 		}
 		memset(&ev, 0, sizeof(ev));
+#ifdef linux
 		ev.events = POLLIN;
 		ev.data.fd = newfd;
 		epoll_ctl(epfd, EPOLL_CTL_ADD, newfd, &ev);
+#else
+		EV_SET(&ev, newfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		kevent(epfd, &ev, 1, NULL, 0, NULL);
+#endif
 	}
 	return 0;
 }
 
 static int
-writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
+writesync(char *buf, ssize_t len, size_t space, int fd, size_t *pos, int fdsync)
 {
 	int error;
 	size_t cur = *pos;
@@ -626,6 +657,7 @@ writesync(char *buf, size_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+#ifdef WITH_KVS
 static inline void
 unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 {
@@ -633,6 +665,7 @@ unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 	*off = (p & 0x00000000ffff0000) >> 16;
 	*len = p & 0x000000000000ffff;
 }
+#endif /* WITH_KVS */
 
 static inline uint64_t
 pack(uint32_t idx, uint16_t off, uint16_t len)
@@ -713,6 +746,7 @@ unembed_slot(char *nmb, u_int coff)
 }
 #endif /* WITH_KVS */
 
+#if 0
 static inline int
 str_to_key(uint64_t *k)
 {
@@ -720,6 +754,7 @@ str_to_key(uint64_t *k)
 	strncpy(c, (char *)k, sizeof(c));
 	return atoi(c);
 }
+#endif /* 0 */
 
 #ifdef WITH_BPLUS
 static inline void
@@ -1335,6 +1370,7 @@ _worker(void *data)
 		D("imported %u extra buffers", i);
 		tp->ifreq = gp->ifreq;
 	} else if (g->dev_type == DEV_SOCKET) {
+#ifdef linux
 		struct epoll_event ev;
 
 		targ->fd = epoll_create1(EPOLL_CLOEXEC);
@@ -1352,6 +1388,22 @@ _worker(void *data)
 			targ->cancel = 1;
 			goto quit;
 		}
+#else /* !linux */
+		struct kevent ev;
+
+		targ->fd = kqueue();
+		if (targ->fd < 0) {
+			perror("kqueue");
+			targ->cancel = 1;
+			goto quit;
+		}
+		EV_SET(&ev, gp->sd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		if (kevent(targ->fd, &ev, 1, NULL, 0, NULL)) {
+			perror("kevent");
+			targ->cancel = 1;
+			goto quit;
+		}
+#endif /* linux */
 	}
 
 	while (!targ->cancel) {
@@ -1415,16 +1467,26 @@ accepted:
 		} else if (g->dev_type == DEV_SOCKET) {
 			int i, nfd, epfd = targ->fd;
 			int sd = gp->sd;
-			struct epoll_event *evts = tp->evts;
 			int nevts = ARRAYSIZ(tp->evts);
+#ifdef linux
+			struct epoll_event *evts = tp->evts;
 
 			nfd = epoll_wait(epfd, evts, nevts, g->polltimeo);
 			if (nfd < 0) {
 				perror("epoll_wait");
 				goto quit;
 			}
+#else
+			struct kevent *evts = tp->evts;
+
+			nfd = kevent(epfd, NULL, 0, evts, nevts, NULL /* TODO */);
+#endif
 			for (i = 0; i < nfd; i++) {
+#ifdef linux	
 				int fd = evts[i].data.fd;
+#else
+				int fd = evts[i].ident;
+#endif
 
 				if (fd == sd) {
 					if (do_accept(tp, sd, epfd) < 0)
@@ -1456,8 +1518,8 @@ clean_dir(char *dirpath)
 
 		if (ent->d_name[0] == '.')
 			continue;
-		strncat(strncpy(fullp, dirpath, sizeof(fullp)), "/", 1);
-		strncat(fullp, ent->d_name, sizeof(fullp) - strlen(fullp));
+		strncat(strncpy(fullp, dirpath, sizeof(fullp)-2), "/", 1);
+		strncat(fullp, ent->d_name, sizeof(fullp) - strlen(fullp) - 1);
 		if (unlink(fullp))
 			perror("unlink");
 	}
