@@ -333,9 +333,7 @@ nm_start_threads(struct nm_garg *g)
 					continue;
 				}
 				D("got %u extra bufs at %u",
-				    t->nmd->req.nr_arg3 ?
-				    t->nmd->req.nr_arg3 :
-				    t->nmd->req.nr_arg4,
+				    t->nmd->req.nr_arg3,
 				    t->nmd->nifp->ni_bufs_head);
 			} else {
 				t->nmd = g->nmd;
@@ -548,9 +546,7 @@ nm_start(struct nm_garg *g)
 #ifdef WITH_EXTMEM
 	if (g->extmem) {
 		req.nr_cmd2 = NETMAP_POOLS_CREATE;
-		if (g->extra_bufs)
-			base_nmd.req.nr_arg4 = base_nmd.req.nr_arg3;
-                memcpy((void *)&req.nr_arg1, &g->extmem, sizeof(void *));
+                memcpy((void *)&req.nr_ptr, &g->extmem, sizeof(void *));
 	}
 #endif /* WITH_EXTMEM */
 	base_nmd.req.nr_flags |= NR_ACCEPT_VNET_HDR;
@@ -559,10 +555,10 @@ nm_start(struct nm_garg *g)
 		D("Invalid name '%s': %s", g->ifname, errmsg);
 		return -EINVAL;
 	}
-	if (strlen(base_nmd.req.nr_suffix) > 0) {
-		strncpy(req.nr_suffix, base_nmd.req.nr_suffix,
-				sizeof(req.nr_suffix));
-		bzero(base_nmd.req.nr_suffix, sizeof(base_nmd.req.nr_suffix));
+	if (strlen(base_nmd.req.nr_extname) > 0) {
+		strncpy(req.nr_extname, base_nmd.req.nr_extname,
+				sizeof(req.nr_extname));
+		bzero(base_nmd.req.nr_extname, sizeof(base_nmd.req.nr_extname));
 	}
 
 	/*
@@ -573,8 +569,7 @@ nm_start(struct nm_garg *g)
 	 * reconfigure. We do the open here to have time to reset.
 	 */
 	flags = NM_OPEN_IFNAME | NM_OPEN_RING_CFG;
-	if (req.nr_cmd2 != NETMAP_POOLS_CREATE)
-		flags |= NM_OPEN_ARG1 | NM_OPEN_ARG2 | NM_OPEN_ARG3;
+	flags |= NM_OPEN_ARG1 | NM_OPEN_ARG2 | NM_OPEN_ARG3;
 	if (g->nthreads > 1) {
 		base_nmd.req.nr_flags &= ~NR_REG_MASK;
 		base_nmd.req.nr_flags |= NR_REG_ONE_NIC;
@@ -585,8 +580,8 @@ nm_start(struct nm_garg *g)
 		D("Unable to open %s: %s", g->ifname, strerror(errno));
 		goto out;
 	}
-	ND("got %u extra bufs at %u", g->nmd->req.nr_arg3 ?  g->nmd->req.nr_arg3
-			: g->nmd->req.nr_arg4, g->nmd->nifp->ni_bufs_head);
+	ND("got %u extra bufs at %u", g->nmd->req.nr_arg3,
+			g->nmd->nifp->ni_bufs_head);
 
 	/* XXX remove unnecessary suffix */
 	if ((p = index(g->ifname, ','))) {

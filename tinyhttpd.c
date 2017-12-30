@@ -1346,7 +1346,7 @@ _worker(void *data)
 		const struct netmap_if *nifp = targ->nmd->nifp;
 		const struct netmap_ring *any_ring = targ->nmd->some_ring;
 		uint32_t i, next = nifp->ni_bufs_head;
-		const int n = req->nr_arg3 ? req->nr_arg3 : req->nr_arg4; // XXX
+		const int n = req->nr_arg3;
 
 		D("have %u extra buffers from %u ring %p", n, next, any_ring);
 		tp->extra = calloc(sizeof(*tp->extra), n);
