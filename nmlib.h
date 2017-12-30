@@ -104,7 +104,7 @@ struct nm_garg {
 	int wait_link;
 	int polltimeo;
 #ifdef __FreeBSD__
-	struct timespec polltimeo_ts;
+	struct timespec *polltimeo_ts;
 #endif
 	int verbose;
 	int report_interval;

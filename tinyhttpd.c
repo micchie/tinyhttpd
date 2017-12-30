@@ -114,9 +114,10 @@ user_clock_gettime(struct timespec *ts)
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
 #define max(a, b) (((a) > (b)) ? (a) : (b)) 
 
-#ifdef __FreeBSD__
-#define fallocate(a, b, c, d)	posix_fallocate(a, c, d)
+#ifndef linux
 #define SOL_TCP	SOL_SOCKET
+#define fallocate(a, b, c, d)	posix_fallocate(a, c, d)
+#define mempcpy(d, s, l)	(memcpy(d, s, l) + l)
 #endif
 
 #ifndef D
@@ -477,9 +478,6 @@ generate_httphdr(size_t content_length, char *buf)
 	return c - buf;
 }
 #else
-#ifdef __FreeBSD__
-#define mempcpy(d, s, l)	(memcpy(d, s, l) + l)
-#endif
 
 ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
@@ -1479,7 +1477,7 @@ accepted:
 #else
 			struct kevent *evts = tp->evts;
 
-			nfd = kevent(epfd, NULL, 0, evts, nevts, NULL /* TODO */);
+			nfd = kevent(epfd, NULL, 0, evts, nevts, g->polltimeo_ts);
 #endif
 			for (i = 0; i < nfd; i++) {
 #ifdef linux	
@@ -1754,6 +1752,19 @@ main(int argc, char **argv)
 		}
 #endif
 	}
+#ifdef __FreeBSD__
+	/* kevent requires struct timespec for timeout */ 
+	if (gp.g.polltimeo >= 0) {
+		struct timespec *x = calloc(1, sizeof(*x));
+		if (!x) {
+			perror("malloc");
+			usage();
+		}
+		x->tv_sec = gp.g.polltimeo / 1000;
+		x->tv_nsec = (gp.g.polltimeo % 1000) * 1000000;
+		gp.g.polltimeo_ts = x;
+	}
+#endif /* FreeBSD */
 	if (nm_start(&gp.g) < 0)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
@@ -1771,5 +1782,8 @@ close_socket:
 	if (gp.sd > 0)
 		close(gp.sd);
 	free_if_exist(gp.http);
+#ifdef __FreeBSD__
+	free_if_exist(gp.g.polltimeo_ts);
+#endif
 	return 0;
 }
