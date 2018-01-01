@@ -1741,9 +1741,9 @@ main(int argc, char **argv)
 				D("mmap failed");
 	                        goto close_socket;
 	                }
-			D("mmap success %p", gp.g.extmem);
 			pi = (struct netmap_pools_info *)gp.g.extmem;
 			pi->memsize = gp.g.extmem_siz;
+			D("mmap success %p %lu bytes", gp.g.extmem, pi->memsize);
 
 			pi->if_pool_objtotal = IF_OBJTOTAL;
 			pi->ring_pool_objtotal = RING_OBJTOTAL;
