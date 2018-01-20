@@ -6,14 +6,15 @@ EXTRA_CFLAGS += -I/usr/local/include -I../libsqlite/include
 #EXTRA_LDFLAGS += ../libsqlite/lib/libsqlite3.a -lrt
 CFLAGS += $(EXTRA_CFLAGS)
 #PROG = tinyhttpd-s test_nvdimm
-PROG = tinyhttpd tinyhttpd-b tinyhttpd-k
+PROG = tinyhttpd tinyhttpd-b tinyhttpd-k tinyhttpd-f
 #OBJS = tinyhttpd-s.o test_nvdimm.o
-OBJS = tinyhttpd-b.o tinyhttpd-k.o bplus_support.o bplus_impl.o
+OBJS = tinyhttpd-b.o tinyhttpd-k.o tinyhttpd-f.o bplus_support.o bplus_impl.o
 #OPT = -DWITH_SQLITE
 SOPT = -DWITH_EXTMEM
 SPATH ?= -I../netmap/sys/ -I../netmap/apps/include -DNETMAP_WITH_LIBS
 BOPT = -DWITH_BPLUS -I./
 KOPT = -DWITH_KVS $(BOPT)
+FOPT = -DWITH_NOFLUSH
 
 all: $(PROG)
 
@@ -24,6 +25,10 @@ all: $(PROG)
 tinyhttpd: tinyhttpd.c nmlib.h
 	$(CC) $(CFLAGS) $(OPT) $(SOPT) $(SPATH) tinyhttpd.c -o tinyhttpd $(EXTRA_CFLAGS) $(LDFLAGS)
 
+tinyhttpd-f: tinyhttpd-f.o
+	$(CC) $(CFLAGS) -o tinyhttpd-f tinyhttpd-f.o $(LDFLAGS) $(EXTRA_CFLAGS)
+tinyhttpd-f.o: tinyhttpd.c nmlib.h
+	$(CC) $(CFLAGS) $(OPT) $(SOPT) $(FOPT) $(SPATH) -c tinyhttpd.c -o tinyhttpd-f.o $(EXTRA_CFLAGS)
 tinyhttpd-k: tinyhttpd-k.o bplus_support.o bplus_impl.o
 	$(CC) $(CFLAGS) -o tinyhttpd-k tinyhttpd-k.o bplus_impl.o bplus_support.o $(LDFLAGS) $(EXTRA_CFLAGS)
 tinyhttpd-k.o: tinyhttpd.c nmlib.h bplus_common.h bplus_support.h

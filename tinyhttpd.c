@@ -70,6 +70,9 @@
 #include <bplus_common.h>
 #endif /* WITH_BPLUS */
 
+#ifdef WITH_NOFLUSH
+#define _mm_clflush(p) (void)(p)
+#endif
 
 #define container_of(ptr, type, member) ({          \
 		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
@@ -1550,7 +1553,7 @@ main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:BkM:")) != -1) {
+	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:BkM:F")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1637,6 +1640,10 @@ main(int argc, char **argv)
 			dbargs->flags |= DF_KVS;
 			break;
 #endif /* WITH_KVS */
+#ifdef WITH_NOFLUSH
+		case 'F': // just to tell the script to use tinyhttpd-f
+			break;
+#endif /* WITH_NOFLUSH */
 		}
 
 	}
