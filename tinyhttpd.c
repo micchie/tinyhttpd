@@ -1321,15 +1321,16 @@ _worker(void *data)
 	struct thpriv *tp = targ->td_private;
 	struct nm_garg *g = targ->g;
 	struct glpriv *gp = container_of(g, struct glpriv, g);
-	struct dbargs *dbargs = &gp->dbargs;
+	//struct dbargs *dbargs = &gp->dbargs;
 	struct dbctx db;
 	struct pollfd pfd[2] = {{ .fd = targ->fd }};
 	int msglen = gp->msglen;
+	struct dbargs dbargs = gp->dbargs;
 
 	/* create db */
-	dbargs->size = dbargs->size / g->nthreads;
-	dbargs->i = targ->me;
-	if (create_db(dbargs, &db)) {
+	dbargs.size = dbargs.size / g->nthreads;
+	dbargs.i = targ->me;
+	if (create_db(&dbargs, &db)) {
 		D("error on create_db");
 		goto quit;
 	}
@@ -1349,7 +1350,7 @@ _worker(void *data)
 		const struct netmap_if *nifp = targ->nmd->nifp;
 		const struct netmap_ring *any_ring = targ->nmd->some_ring;
 		uint32_t i, next = nifp->ni_bufs_head;
-		const int n = req->nr_arg3;
+		const u_int n = req->nr_arg3;
 
 		D("have %u extra buffers from %u ring %p", n, next, any_ring);
 		tp->extra = calloc(sizeof(*tp->extra), n);
