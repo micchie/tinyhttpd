@@ -316,6 +316,10 @@ nm_start_threads(struct nm_garg *g)
 					    nmd.req.nr_flags & ~NR_REG_MASK;
 					nmd.req.nr_flags |= NR_REG_ONE_NIC;
 					nmd.req.nr_ringid = i;
+					if (nmd.req.nr_arg3) { /* extra buffers */
+						D("setting nmd_flags NM_OPEN_ARG3 for %u", nmd.req.nr_arg3);
+						nmd_flags |= NM_OPEN_ARG3;
+					}
 				}
 				/* Only touch one of the rings
 				 * (rx is already ok)
