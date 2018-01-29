@@ -1,4 +1,5 @@
-
+#ifndef _NMLIB_H_
+#define _NMLIB_H_
 #include <math.h>
 #ifdef __FreeBSD__
 #include<sys/cpuset.h>
@@ -9,6 +10,7 @@
 #include<ctrs.h>
 #include<pthread.h>
 #include<sys/sysctl.h>	/* sysctl */
+#include <netinet/tcp.h>	/* SOL_TCP */
 
 #ifndef D
 #define D(fmt, ...) \
@@ -80,6 +82,9 @@ tx_output(struct my_ctrs *cur, double delta, const char *msg)
 		norm(b1, pps), norm(b2, bw), norm(b3, raw_bw), abs);
 }
 
+struct nm_msg {
+};
+
 struct nm_garg {
 	char ifname[MAX_IFNAMELEN]; // must be here
 	struct nm_desc *nmd;
@@ -111,6 +116,9 @@ struct nm_garg {
 #define OPT_PPS_STATS   2048
 	int options;
 	int td_private_len; // passed down to targ
+
+	void (*data)(struct nm_msg *);
+	void (*connection)(struct nm_msg *);
 };
 
 struct nm_targ {
@@ -688,4 +696,73 @@ out:
 	return 0;
 }
 
+int netmap_server_init(uint16_t port, int *fdp,
+		void (*data)(struct nm_msg *),
+		void (*connection)(struct nm_msg *))
+{
+	int sd;
+	struct sockaddr_in sin;
+	struct nm_garg *g;
 
+	g = calloc(1, sizeof(*g));
+	if (!g) {
+		perror("calloc");
+		return -ENOMEM;
+	}
+
+	/* initialize nm_garg */
+	g->polltimeo = 1000;
+	g->td_privbody = NULL; // TODO netmap_worker;
+	g->dev_type = DEV_NETMAP;
+	g->connection = connection;
+	g->data = data;
+
+	strncpy(g->ifname, "eth1", sizeof(g->ifname));
+
+	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sd < 0) {
+		perror("socket");
+		return -EBUSY;
+	}
+
+	*fdp = sd;
+
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &(int){1},
+	    sizeof(int)) < 0) {
+		perror("setsockopt");
+		goto close_socket;
+	}
+	if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, &(int){1},
+	    sizeof(int)) < 0) {
+		perror("setsockopt");
+		goto close_socket;
+	}
+	if (setsockopt(sd, SOL_TCP, TCP_NODELAY, &(int){1}, sizeof(int)) < 0) {
+		perror("setsockopt");
+		goto close_socket;
+	}
+	if (ioctl(sd, FIONBIO, &(int){1}) < 0) {
+		perror("ioctl");
+		goto close_socket;
+	}
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	sin.sin_port = htons(port);
+	if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+		perror("bind");
+		goto close_socket;
+	}
+	if (listen(sd, SOMAXCONN) != 0) {
+		perror("listen");
+		goto close_socket;
+	}
+	return 0;
+
+close_socket:
+	if (sd > 0)
+		close(sd);
+	free(g);
+	return -EFAULT;
+}
+#endif /* _NMLIB_H_ */
