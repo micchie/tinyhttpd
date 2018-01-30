@@ -83,6 +83,10 @@ tx_output(struct my_ctrs *cur, double delta, const char *msg)
 }
 
 struct nm_msg {
+	struct netmap_ring *rxring;
+	struct netmap_ring *txring;
+	struct netmap_slot *slot;
+	struct nm_garg *g;
 };
 
 struct nm_garg {
@@ -117,6 +121,7 @@ struct nm_garg {
 	int options;
 	int td_private_len; // passed down to targ
 
+	struct nm_ifreq ifreq;
 	void (*data)(struct nm_msg *);
 	void (*connection)(struct nm_msg *);
 };
@@ -696,73 +701,64 @@ out:
 	return 0;
 }
 
-int netmap_server_init(uint16_t port, int *fdp,
-		void (*data)(struct nm_msg *),
-		void (*connection)(struct nm_msg *))
+#define ST_NAME "stack:0"
+#define ST_NAME_MAX	64
+void netmap_eventloop(void **ret, int *error,
+	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
 {
-	int sd;
-	struct sockaddr_in sin;
-	struct nm_garg *g;
+	struct nm_garg *g = calloc(1, sizeof(*g));
 
-	g = calloc(1, sizeof(*g));
+	*error = 0;
 	if (!g) {
 		perror("calloc");
-		return -ENOMEM;
+		*error = -ENOMEM;
+		return;
 	}
-
-	/* initialize nm_garg */
 	g->polltimeo = 1000;
 	g->td_privbody = NULL; // TODO netmap_worker;
 	g->dev_type = DEV_NETMAP;
 	g->connection = connection;
 	g->data = data;
-
 	strncpy(g->ifname, "eth1", sizeof(g->ifname));
+	*ret = g;
 
-	sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sd < 0) {
-		perror("socket");
-		return -EBUSY;
-	}
+	signal(SIGPIPE, SIG_IGN);
 
-	*fdp = sd;
+	if (strlen(g->ifname)) {
+		char *p = g->ifname;
+		struct nm_ifreq *ifreq = &g->ifreq;
 
-	if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &(int){1},
-	    sizeof(int)) < 0) {
-		perror("setsockopt");
-		goto close_socket;
-	}
-	if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, &(int){1},
-	    sizeof(int)) < 0) {
-		perror("setsockopt");
-		goto close_socket;
-	}
-	if (setsockopt(sd, SOL_TCP, TCP_NODELAY, &(int){1}, sizeof(int)) < 0) {
-		perror("setsockopt");
-		goto close_socket;
-	}
-	if (ioctl(sd, FIONBIO, &(int){1}) < 0) {
-		perror("ioctl");
-		goto close_socket;
-	}
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_family = AF_INET;
-	sin.sin_addr.s_addr = htonl(INADDR_ANY);
-	sin.sin_port = htons(port);
-	if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-		perror("bind");
-		goto close_socket;
-	}
-	if (listen(sd, SOMAXCONN) != 0) {
-		perror("listen");
-		goto close_socket;
-	}
-	return 0;
+		if (strlen(ST_NAME) + 1 + strlen(g->ifname) > ST_NAME_MAX) {
+			D("too long name %s", g->ifname);
+			*error = -EINVAL;
+			return;
+		}
+		strcat(strcat(strcpy(p, ST_NAME), "+"), g->ifname);
 
-close_socket:
-	if (sd > 0)
-		close(sd);
-	free(g);
-	return -EFAULT;
+		/* pre-initialize ifreq for accept() */
+		bzero(ifreq, sizeof(*ifreq));
+		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
+	}
+	*error = nm_start(g);
+}
+
+#define IPV4TCP_HDRLEN	66
+int
+netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
+{
+	struct nm_garg *g = msgp->g;
+	struct netmap_ring *ring = (struct netmap_ring *) msgp->txring;
+	u_int cur = ring->cur;
+	int virt_header = g->virt_header;
+	struct netmap_slot *slot = &ring->slot[cur];
+	char *p = NETMAP_BUF(ring, slot->buf_idx) + virt_header + IPV4TCP_HDRLEN;
+
+	D ("Sending %lu bytes\n", len);
+	memcpy (p, data, len);
+	slot->len = virt_header + IPV4TCP_HDRLEN + len;
+    	slot->fd = msgp->slot->fd;
+    	slot->offset = IPV4TCP_HDRLEN;
+	ring->cur = ring->head = nm_ring_next(ring, cur);
+	return len;
 }
 #endif /* _NMLIB_H_ */
