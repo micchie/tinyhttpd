@@ -86,7 +86,7 @@ struct nm_msg {
 	struct netmap_ring *rxring;
 	struct netmap_ring *txring;
 	struct netmap_slot *slot;
-	struct nm_garg *g;
+	struct nm_targ *targ;
 };
 
 struct nm_garg {
@@ -124,6 +124,8 @@ struct nm_garg {
 	struct nm_ifreq ifreq;
 	void (*data)(struct nm_msg *);
 	void (*connection)(struct nm_msg *);
+	int *fds;
+	int fdnum;
 };
 
 struct nm_targ {
@@ -142,7 +144,13 @@ struct nm_targ {
 	int me;
 	int affinity;
 	pthread_t thread;
+	struct netmap_slot *extra;
+	uint32_t extra_cur;
+	uint32_t extra_num;
 	void *td_private;
+	int *fdtable;
+	int fdtable_siz;
+
 };
 
 static inline void
@@ -514,7 +522,7 @@ nm_main_thread(struct nm_garg *g)
 		tx_output(&cur, delta_t, "Received");
 }
 
-int
+static int
 nm_start(struct nm_garg *g)
 {
 	int i, devqueues = 0;
@@ -703,10 +711,12 @@ out:
 
 #define ST_NAME "stack:0"
 #define ST_NAME_MAX	64
-void netmap_eventloop(void **ret, int *error,
+static void
+netmap_eventloop(void **ret, int *error,
 	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
 {
 	struct nm_garg *g = calloc(1, sizeof(*g));
+	char ifname[8] = "eth1"; /* XXX */
 
 	*error = 0;
 	if (!g) {
@@ -719,21 +729,20 @@ void netmap_eventloop(void **ret, int *error,
 	g->dev_type = DEV_NETMAP;
 	g->connection = connection;
 	g->data = data;
-	strncpy(g->ifname, "eth1", sizeof(g->ifname));
 	*ret = g;
 
 	signal(SIGPIPE, SIG_IGN);
 
-	if (strlen(g->ifname)) {
+	if (strlen(ifname)) {
 		char *p = g->ifname;
 		struct nm_ifreq *ifreq = &g->ifreq;
 
-		if (strlen(ST_NAME) + 1 + strlen(g->ifname) > ST_NAME_MAX) {
-			D("too long name %s", g->ifname);
+		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
+			D("too long name %s", ifname);
 			*error = -EINVAL;
 			return;
 		}
-		strcat(strcat(strcpy(p, ST_NAME), "+"), g->ifname);
+		strcat(strcat(strcpy(p, ST_NAME), "+"), ifname);
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
@@ -743,13 +752,13 @@ void netmap_eventloop(void **ret, int *error,
 }
 
 #define IPV4TCP_HDRLEN	66
-int
+static int
 netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
 {
-	struct nm_garg *g = msgp->g;
+	struct nm_targ *t = msgp->targ;
 	struct netmap_ring *ring = (struct netmap_ring *) msgp->txring;
 	u_int cur = ring->cur;
-	int virt_header = g->virt_header;
+	int virt_header = t->g->virt_header;
 	struct netmap_slot *slot = &ring->slot[cur];
 	char *p = NETMAP_BUF(ring, slot->buf_idx) + virt_header + IPV4TCP_HDRLEN;
 
@@ -760,5 +769,201 @@ netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
     	slot->offset = IPV4TCP_HDRLEN;
 	ring->cur = ring->head = nm_ring_next(ring, cur);
 	return len;
+}
+
+/* XXX wrap */
+static inline uint32_t
+netmap_extra_next(struct nm_targ *t, size_t *curp)
+{
+	uint32_t ret = t->extra_cur++;
+
+	if (unlikely(t->extra_cur == t->extra_num)) {
+		t->extra_cur = 0;
+		*curp = 0; //clear log too
+	}
+	return ret;
+}
+
+static void inline
+netmap_copy_out(struct nm_msg *nmsg)
+{
+	struct netmap_ring *ring = nmsg->rxring;
+	struct netmap_slot *slot = nmsg->slot;
+	struct nm_targ *t = nmsg->targ;
+	char *p, *ep;
+	uint32_t i = slot->buf_idx;
+	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur);
+	u_int off = t->g->virt_header + slot->offset;
+	u_int len = slot->len - off;
+
+	p = NETMAP_BUF(ring, i) + off;
+	ep = NETMAP_BUF(ring, extra_i) + off;
+	memcpy(ep, p, len);
+	for (i = 0; i < len; i += 64) {
+		_mm_clflush(ep, i);
+	}
+}
+
+/* XXX should we update nmsg->slot to new one? */
+static void inline
+netmap_swap_out(struct nm_msg *nmsg)
+{
+	struct netmap_ring *ring = nmsg->rxring;
+	struct netmap_slot *slot = nmsg->slot, *extra, tmp;
+	struct nm_targ *t = nmsg->targ;
+	uint32_t i = slot->buf_idx;
+	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur);
+
+	tmp = *slot;
+	extra = &t->extra[extra_i];
+	slot->buf_idx = extra->buf_idx;
+	slot->flags |= NS_BUF_CHANGED;
+	*extra = tmp;
+}
+
+static void *
+netmap_worker(void *data)
+{
+	struct nm_targ *t = (struct nm_targ *) data;
+	struct nm_garg *g = t->g;
+	struct nm_desc *nmd = t->nmd;
+	struct pollfd pfd[2] = {{ .fd = targ->fd }}; // XXX make variable size
+
+	/* allocate fd table */
+	t->fdtable = calloc(sizeof(*t->fdtable), DEFAULT_NFDS);
+	if (!t->fdtable) {
+		perror("calloc");
+		goto quit;
+	}
+	t->fdtable_siz = DEFAULT_NFDS;
+
+	/* import extra buffers */
+	if (g->dev_type == DEV_NETMAP) {
+		const struct nmreq *req = &nmd->req;
+		const struct netmap_if *nifp = nmd->nifp;
+		const struct netmap_ring *any_ring = nmd->some_ring;
+		uint32_t i, next = nifp->ni_bufs_head;
+		const u_int n = req->nr_arg3;
+
+		D("have %u extra buffers from %u ring %p", n, next, any_ring);
+		tp->extra = calloc(sizeof(*tp->extra), n);
+		if (!tp->extra) {
+			perror("calloc");
+			goto quit;
+		}
+		for (i = 0; i < n && next; i++) {
+			char *p;
+#ifdef WITH_EXTRA_SLOT
+			t->extra[i].buf_idx = next;
+#else
+			t->extra[i] = next;
+#endif
+			p = NETMAP_BUF(any_ring, next);
+			next = *(uint32_t *)p;
+		}
+		t->extra_num = i;
+		D("imported %u extra buffers", i);
+		t->ifreq = g->ifreq;
+	} else if (g->dev_type == DEV_SOCKET) {
+#ifdef linux
+		struct epoll_event ev;
+
+		t->fd = epoll_create1(EPOLL_CLOEXEC);
+		if (t->fd < 0) {
+			perror("epoll_create1");
+			t->cancel = 1;
+			goto quit;
+		}
+
+		/* XXX make variable ev num. */
+		bzero(&ev, sizeof(ev));
+		ev.events = POLLIN;
+		ev.data.fd = g->fds[0];
+		if (epoll_ctl(t->fd, EPOLL_CTL_ADD, ev.data.fd, &ev)) {
+			perror("epoll_ctl");
+			t->cancel = 1;
+			goto quit;
+		}
+#else /* !linux */
+		struct kevent ev;
+
+		t->fd = kqueue();
+		if (t->fd < 0) {
+			perror("kqueue");
+			t->cancel = 1;
+			goto quit;
+		}
+		EV_SET(&ev, g->fds[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+		if (kevent(t->fd, &ev, 1, NULL, 0, NULL)) {
+			perror("kevent");
+			t->cancel = 1;
+			goto quit;
+		}
+#endif /* linux */
+	}
+
+	while (!targ->cancel) {
+		if (g->dev_type == DEV_NETMAP) {
+			u_int first_ring = nmd->first_rx_ring;
+			u_int last_ring = nmd->last_rx_ring;
+			int i;
+
+			pfd[0].fd = t->fd;
+			pfd[0].events = POLLIN;
+			/* XXX make safer... */
+			for (i = 0; i < t->g->fdnum; i++) {
+				pfd[i+1].fd = t->g->fds[i];
+			}
+			if ((poll(pfd, i+1, t->g->polltimeo)) < 0) {
+				perror("poll");
+				goto quit;
+			}
+			/*
+			 * check listen sockets
+			 */
+			for (i = 1; i <= t->g->fdnum; i++) {
+				struct sockaddr_storage tmp;
+				struct nm_ifreq *ifreq = &t->ifreq;
+				int newfd;
+				socklen_t len = sizeof(tmp);
+
+				if (!(pfd[i].revents & POLLIN))
+					continue;
+				newfd = accept(pfd[i].fd,
+						(struct sockaddr *)&tmp, &len);
+				if (newfd < 0) {
+					RD(1, "accept error");
+					/* ignore this socket */
+					goto accepted;
+				}
+				memcpy(ifreq->data, &newfd, sizeof(newfd));
+				if (ioctl(t->fd, NIOCCONFIG, ifreq)) {
+					perror("ioctl");
+					close(newfd);
+close_pfds:
+					i = 1;
+					for (i < t->g->fdnum; i++) {
+						close(pfd[i].fd);
+					}
+					/* be conservative to this error... */
+					goto quit;
+				}
+				if (unlikely(newfd >= t->fdtable_siz)) {
+					if (fdtable_expand(t)) {
+						goto close_pfds;
+					}
+				}
+			}
+
+			/* check the netmap fd */
+			if (!(pfd[0].revents & POLLIN)) {
+				continue;
+			}
+
+
+
+		}
+	}
+
 }
 #endif /* _NMLIB_H_ */
