@@ -821,7 +821,6 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
 
-	D("rxcur %u rxtail %u", rxcur, rxtail);
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		int off, len, o = IPV4TCP_HDRLEN;
@@ -835,6 +834,29 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		m.targ = t;
 		t->g->data(&m);
 	}
+	rxr->head = rxr->cur = rxcur;
+}
+
+static int
+do_setsockopt(int fd)
+{
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0) {
+		perror("setsockopt");
+		return -EFAULT;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int)) < 0) {
+		perror("setsockopt");
+		return -EFAULT;
+	}
+	if (setsockopt(fd, SOL_TCP, TCP_NODELAY, &(int){1}, sizeof(int)) < 0) {
+		perror("setsockopt");
+		return -EFAULT;
+	}
+	if (ioctl(fd, FIONBIO, &(int){1}) < 0) {
+		perror("ioctl");
+		return -EFAULT;
+	}
+	return 0;
 }
 
 #define DEFAULT_NFDS	1024
@@ -845,6 +867,13 @@ netmap_worker(void *data)
 	struct nm_garg *g = t->g;
 	struct nm_desc *nmd = t->nmd;
 	struct pollfd pfd[2] = {{ .fd = t->fd }}; // XXX make variable size
+	int i;
+
+	//for (i = 0; i < g->fdnum; i++) {
+	//	if (do_setsockopt(g->fds[i]) < 0) {
+	//		goto quit;
+	//	}
+	//}
 
 	/* allocate fd table */
 	t->fdtable = calloc(sizeof(*t->fdtable), DEFAULT_NFDS);
@@ -924,12 +953,15 @@ netmap_worker(void *data)
 			u_int first_ring = nmd->first_rx_ring;
 			u_int last_ring = nmd->last_rx_ring;
 			int i;
+			struct nm_msg msg;
+			struct netmap_slot slot;
 
 			pfd[0].fd = t->fd;
 			pfd[0].events = POLLIN;
 			/* XXX make safer... */
 			for (i = 0; i < t->g->fdnum; i++) {
 				pfd[i+1].fd = t->g->fds[i];
+				pfd[i+1].events = POLLIN;
 			}
 			if ((poll(pfd, i+1, t->g->polltimeo)) < 0) {
 				perror("poll");
@@ -970,6 +1002,9 @@ close_pfds:
 						goto close_pfds;
 					}
 				}
+				slot.fd = newfd;
+				msg.slot = &slot;
+				t->g->connection(&msg);
 			}
 
 			/* check the netmap fd */
@@ -991,11 +1026,12 @@ quit:
 #define ST_NAME "stack:0"
 #define ST_NAME_MAX	64
 static void
-netmap_eventloop(void **ret, int *error,
+netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
 {
 	struct nm_garg *g = calloc(1, sizeof(*g));
 	char ifname[8] = "eth1"; /* XXX */
+	int i;
 
 	*error = 0;
 	if (!g) {
@@ -1008,9 +1044,21 @@ netmap_eventloop(void **ret, int *error,
 	g->dev_type = DEV_NETMAP;
 	g->connection = connection;
 	g->data = data;
+	g->fds = fds;
+	g->fdnum = fdnum;
 	*ret = g;
 
+	for (i = 0; i < fdnum; i++) {
+		if (do_setsockopt(fds[i]) < 0) {
+			perror("setsockopt");
+			*error = -EFAULT;
+			return;
+		}
+		D("done for %d", fds[i]);
+	}
+
 	signal(SIGPIPE, SIG_IGN);
+
 
 	if (strlen(ifname)) {
 		char *p = g->ifname;
