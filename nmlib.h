@@ -812,6 +812,31 @@ static int fdtable_expand(struct nm_targ *t)
 	return 0;
 }
 
+static int
+do_nm_ring(struct nm_targ *t, int ring_nr)
+{
+	struct nm_garg *g;
+	struct netmap_ring *rxr = NETMAP_RXRING(t->nmd->nifp, ring_nr);
+	struct netmap_ring *txr = NETMAP_TXRING(t->nmd->nifp, ring_nr);
+	u_int const rxtail = rxr->tail;
+	u_int rxcur = rxr->cur;
+
+	D("rxcur %u rxtail %u", rxcur, rxtail);
+	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
+		struct netmap_slot *rxs = &rxr->slot[rxcur];
+		int off, len, o = IPV4TCP_HDRLEN;
+		int *fde = &t->fdtable[rxs->fd];
+		char *rxbuf, *cbuf, *content = NULL;
+		struct nm_msg m;
+
+		m.rxring = rxr;
+		m.txring = txr;
+		m.slot = rxs;
+		m.targ = t;
+		t->g->data(&m);
+	}
+}
+
 #define DEFAULT_NFDS	1024
 static void *
 netmap_worker(void *data)
@@ -950,6 +975,10 @@ close_pfds:
 			/* check the netmap fd */
 			if (!(pfd[0].revents & POLLIN)) {
 				continue;
+			}
+
+			for (i = first_ring; i <= last_ring; i++) {
+				do_nm_ring(t, i);
 			}
 		}
 	}
