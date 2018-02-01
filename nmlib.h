@@ -11,6 +11,10 @@
 #include<pthread.h>
 #include<sys/sysctl.h>	/* sysctl */
 #include <netinet/tcp.h>	/* SOL_TCP */
+#include <sys/poll.h>
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif /* __linux__ */
 
 #ifndef D
 #define D(fmt, ...) \
@@ -93,7 +97,6 @@ struct nm_garg {
 	char ifname[MAX_IFNAMELEN]; // must be here
 	struct nm_desc *nmd;
 	void *(*td_body)(void *);
-	void *(*td_privbody)(void *);
 	int nthreads;
 	int affinity;
 	int dev_type;
@@ -144,13 +147,17 @@ struct nm_targ {
 	int me;
 	int affinity;
 	pthread_t thread;
+#ifdef NMLIB_EXTRA_SLOT
 	struct netmap_slot *extra;
+#else
+	uint32_t *extra; 
+#endif
 	uint32_t extra_cur;
 	uint32_t extra_num;
 	void *td_private;
 	int *fdtable;
 	int fdtable_siz;
-
+	struct nm_ifreq ifreq;
 };
 
 static inline void
@@ -293,7 +300,7 @@ nm_thread(void *data)
 			targ->fd, targ->g->main_fd, targ->affinity);
 	if (setaffinity(targ->thread, targ->affinity))
 		goto quit;
-	g->td_privbody(data);
+	g->td_body(data);
 
 quit:
 	targ->used = 0;
@@ -709,47 +716,6 @@ out:
 	return 0;
 }
 
-#define ST_NAME "stack:0"
-#define ST_NAME_MAX	64
-static void
-netmap_eventloop(void **ret, int *error,
-	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
-{
-	struct nm_garg *g = calloc(1, sizeof(*g));
-	char ifname[8] = "eth1"; /* XXX */
-
-	*error = 0;
-	if (!g) {
-		perror("calloc");
-		*error = -ENOMEM;
-		return;
-	}
-	g->polltimeo = 1000;
-	g->td_privbody = NULL; // TODO netmap_worker;
-	g->dev_type = DEV_NETMAP;
-	g->connection = connection;
-	g->data = data;
-	*ret = g;
-
-	signal(SIGPIPE, SIG_IGN);
-
-	if (strlen(ifname)) {
-		char *p = g->ifname;
-		struct nm_ifreq *ifreq = &g->ifreq;
-
-		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
-			D("too long name %s", ifname);
-			*error = -EINVAL;
-			return;
-		}
-		strcat(strcat(strcpy(p, ST_NAME), "+"), ifname);
-
-		/* pre-initialize ifreq for accept() */
-		bzero(ifreq, sizeof(*ifreq));
-		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
-	}
-	*error = nm_start(g);
-}
 
 #define IPV4TCP_HDRLEN	66
 static int
@@ -821,13 +787,39 @@ netmap_swap_out(struct nm_msg *nmsg)
 	*extra = tmp;
 }
 
+static inline void
+free_if_exist(void *p)
+{
+	if (p != NULL)
+		free(p);
+}
+
+static int fdtable_expand(struct nm_targ *t)
+{
+	int *newfds, fdsiz = sizeof(*t->fdtable);
+	int nfds = t->fdtable_siz;
+
+	newfds = calloc(fdsiz, nfds * 2);
+	if (!newfds) {
+		perror("calloc");
+		return ENOMEM;
+	}
+	memcpy(newfds, t->fdtable, fdsiz * nfds);
+	free(t->fdtable);
+	//mm_mfence(); // XXX
+	t->fdtable = newfds;
+	t->fdtable_siz = nfds * 2;
+	return 0;
+}
+
+#define DEFAULT_NFDS	1024
 static void *
 netmap_worker(void *data)
 {
 	struct nm_targ *t = (struct nm_targ *) data;
 	struct nm_garg *g = t->g;
 	struct nm_desc *nmd = t->nmd;
-	struct pollfd pfd[2] = {{ .fd = targ->fd }}; // XXX make variable size
+	struct pollfd pfd[2] = {{ .fd = t->fd }}; // XXX make variable size
 
 	/* allocate fd table */
 	t->fdtable = calloc(sizeof(*t->fdtable), DEFAULT_NFDS);
@@ -846,14 +838,14 @@ netmap_worker(void *data)
 		const u_int n = req->nr_arg3;
 
 		D("have %u extra buffers from %u ring %p", n, next, any_ring);
-		tp->extra = calloc(sizeof(*tp->extra), n);
-		if (!tp->extra) {
+		t->extra = calloc(sizeof(*t->extra), n);
+		if (!t->extra) {
 			perror("calloc");
 			goto quit;
 		}
 		for (i = 0; i < n && next; i++) {
 			char *p;
-#ifdef WITH_EXTRA_SLOT
+#ifdef NMLIB_EXTRA_SLOT
 			t->extra[i].buf_idx = next;
 #else
 			t->extra[i] = next;
@@ -902,7 +894,7 @@ netmap_worker(void *data)
 #endif /* linux */
 	}
 
-	while (!targ->cancel) {
+	while (!t->cancel) {
 		if (g->dev_type == DEV_NETMAP) {
 			u_int first_ring = nmd->first_rx_ring;
 			u_int last_ring = nmd->last_rx_ring;
@@ -918,12 +910,13 @@ netmap_worker(void *data)
 				perror("poll");
 				goto quit;
 			}
+accepted:
 			/*
 			 * check listen sockets
 			 */
 			for (i = 1; i <= t->g->fdnum; i++) {
 				struct sockaddr_storage tmp;
-				struct nm_ifreq *ifreq = &t->ifreq;
+				struct nm_ifreq *ifreq = &g->ifreq;
 				int newfd;
 				socklen_t len = sizeof(tmp);
 
@@ -941,8 +934,7 @@ netmap_worker(void *data)
 					perror("ioctl");
 					close(newfd);
 close_pfds:
-					i = 1;
-					for (i < t->g->fdnum; i++) {
+					for (i = 1; i < t->g->fdnum; i++) {
 						close(pfd[i].fd);
 					}
 					/* be conservative to this error... */
@@ -959,11 +951,53 @@ close_pfds:
 			if (!(pfd[0].revents & POLLIN)) {
 				continue;
 			}
-
-
-
 		}
 	}
+quit:
+	free_if_exist(t->extra);
+	free_if_exist(t->fdtable);
+	return (NULL);
+}
 
+#define ST_NAME "stack:0"
+#define ST_NAME_MAX	64
+static void
+netmap_eventloop(void **ret, int *error,
+	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
+{
+	struct nm_garg *g = calloc(1, sizeof(*g));
+	char ifname[8] = "eth1"; /* XXX */
+
+	*error = 0;
+	if (!g) {
+		perror("calloc");
+		*error = -ENOMEM;
+		return;
+	}
+	g->polltimeo = 1000;
+	g->td_body = netmap_worker;
+	g->dev_type = DEV_NETMAP;
+	g->connection = connection;
+	g->data = data;
+	*ret = g;
+
+	signal(SIGPIPE, SIG_IGN);
+
+	if (strlen(ifname)) {
+		char *p = g->ifname;
+		struct nm_ifreq *ifreq = &g->ifreq;
+
+		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
+			D("too long name %s", ifname);
+			*error = -EINVAL;
+			return;
+		}
+		strcat(strcat(strcpy(p, ST_NAME), "+"), ifname);
+
+		/* pre-initialize ifreq for accept() */
+		bzero(ifreq, sizeof(*ifreq));
+		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
+	}
+	*error = nm_start(g);
 }
 #endif /* _NMLIB_H_ */
