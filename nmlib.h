@@ -728,7 +728,6 @@ netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
 	struct netmap_slot *slot = &ring->slot[cur];
 	char *p = NETMAP_BUF(ring, slot->buf_idx) + virt_header + IPV4TCP_HDRLEN;
 
-	RD (1, "Sending %lu bytes\n", len);
 	memcpy (p, data, len);
 	slot->len = virt_header + IPV4TCP_HDRLEN + len;
     	slot->fd = msgp->slot->fd;
@@ -833,6 +832,7 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		m.slot = rxs;
 		m.targ = t;
 		t->g->data(&m);
+		nm_update_ctr(t, 1, rxs->len - t->g->virt_header - rxs->offset);
 	}
 	rxr->head = rxr->cur = rxcur;
 }
@@ -1023,6 +1023,31 @@ quit:
 	return (NULL);
 }
 
+#define IF_OBJTOTAL	128
+#define RING_OBJTOTAL	512
+#define RING_OBJSIZE	33024
+
+static char *
+_do_mmap(int fd, size_t len)
+{
+	char *p;
+
+	if (lseek(fd, len -1, SEEK_SET) < 0) {
+		perror("lseek");
+		return NULL;
+	}
+	if (write(fd, "", 1) != 1) {
+		perror("write");
+		return NULL;
+	}
+	p = mmap(0, len, PROT_WRITE, MAP_SHARED | MAP_FILE, fd, 0);
+	if (p == MAP_FAILED) {
+		perror("mmap");
+		return NULL;
+	}
+	return p;
+}
+
 #define ST_NAME "stack:0"
 #define ST_NAME_MAX	64
 static void
@@ -1030,7 +1055,7 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
 {
 	struct nm_garg *g = calloc(1, sizeof(*g));
-	char ifname[8] = "eth1"; /* XXX */
+	char ifname[16] = "eth1"; /* XXX */
 	int i;
 
 	*error = 0;
@@ -1039,6 +1064,8 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 		*error = -ENOMEM;
 		return;
 	}
+
+	unlink("/mnt/pmem/netmap");
 	g->polltimeo = 1000;
 	g->td_body = netmap_worker;
 	g->dev_type = DEV_NETMAP;
@@ -1047,6 +1074,10 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 	g->fds = fds;
 	g->fdnum = fdnum;
 	*ret = g;
+
+	/* XXX */
+	g->extmem_siz = 768UL * 1000000UL;
+	g->extra_bufs = g->extmem_siz / 2048;
 
 	for (i = 0; i < fdnum; i++) {
 		if (do_setsockopt(fds[i]) < 0) {
@@ -1063,6 +1094,7 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 	if (strlen(ifname)) {
 		char *p = g->ifname;
 		struct nm_ifreq *ifreq = &g->ifreq;
+		struct netmap_pools_info *pi;
 
 		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
 			D("too long name %s", ifname);
@@ -1074,6 +1106,39 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
+
+		{
+			int fd;
+
+			fd = open("/mnt/pmem/netmap",
+					O_RDWR|O_CREAT, S_IRWXU);
+	                if (fd < 0) {
+	                        perror("open");
+				*error = -EINVAL;
+				return;
+	                }
+			D("allocating %lu byte", g->extmem_siz);
+			if (fallocate(fd, 0, 0, g->extmem_siz) < 0) {
+				D("error %s", "/mnt/pmem/netmap");
+				perror("fallocate");
+				*error = -EINVAL;
+				return;
+			}
+	                g->extmem = _do_mmap(fd, g->extmem_siz);
+	                if (g->extmem == NULL) {
+				D("mmap failed");
+				*error = MAP_FAILED;
+				return;
+	                }
+			pi = (struct netmap_pools_info *)g->extmem;
+			pi->memsize = g->extmem_siz;
+			D("mmap success %p %lu bytes", g->extmem, pi->memsize);
+
+			pi->if_pool_objtotal = IF_OBJTOTAL;
+			pi->ring_pool_objtotal = RING_OBJTOTAL;
+			pi->ring_pool_objsize = RING_OBJSIZE;
+			pi->buf_pool_objtotal = g->extra_bufs + 800000;
+		}
 	}
 	*error = nm_start(g);
 }
