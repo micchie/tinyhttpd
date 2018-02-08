@@ -732,24 +732,31 @@ netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
 	slot->len = virt_header + IPV4TCP_HDRLEN + len;
     	slot->fd = msgp->slot->fd;
     	slot->offset = IPV4TCP_HDRLEN;
+	ND("slot->buf_idx %u slot->len %u slot->fd %u", slot->buf_idx, slot->len, slot->fd);
 	ring->cur = ring->head = nm_ring_next(ring, cur);
 	return len;
 }
 
-/* XXX wrap */
+#define NM_NOEXTRA	(~0U)
 static inline uint32_t
-netmap_extra_next(struct nm_targ *t, size_t *curp)
+netmap_extra_next(struct nm_targ *t, size_t *curp, int wrap)
 {
-	uint32_t ret = t->extra_cur++;
-
-	if (unlikely(t->extra_cur == t->extra_num)) {
-		t->extra_cur = 0;
-		*curp = 0; //clear log too
+	uint32_t ret = t->extra_cur;
+       
+	if (unlikely(ret == t->extra_num)) {
+		if (!wrap) {
+			return NM_NOEXTRA;
+		} else {
+			ret = 0;
+			t->extra_cur = 1;
+		}
+	} else {
+		t->extra_cur++;
 	}
 	return ret;
 }
 
-static void inline
+static int inline
 netmap_copy_out(struct nm_msg *nmsg)
 {
 	struct netmap_ring *ring = nmsg->rxring;
@@ -757,33 +764,40 @@ netmap_copy_out(struct nm_msg *nmsg)
 	struct nm_targ *t = nmsg->targ;
 	char *p, *ep;
 	uint32_t i = slot->buf_idx;
-	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur);
+	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur, 0);
 	u_int off = t->g->virt_header + slot->offset;
 	u_int len = slot->len - off;
 
+	if (extra_i == NM_NOEXTRA)
+		return -1;
 	p = NETMAP_BUF(ring, i) + off;
 	ep = NETMAP_BUF(ring, extra_i) + off;
 	memcpy(ep, p, len);
 	for (i = 0; i < len; i += 64) {
 		_mm_clflush(ep, i);
 	}
+	return 0;
 }
 
 /* XXX should we update nmsg->slot to new one? */
-static void inline
+static int inline
 netmap_swap_out(struct nm_msg *nmsg)
 {
 	struct netmap_ring *ring = nmsg->rxring;
 	struct netmap_slot *slot = nmsg->slot, *extra, tmp;
 	struct nm_targ *t = nmsg->targ;
 	uint32_t i = slot->buf_idx;
-	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur);
+	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur, 0);
 
+	if (extra_i == NM_NOEXTRA)
+		return -1;
 	tmp = *slot;
 	extra = &t->extra[extra_i];
+	ND("%u is swaped with extra[%d] %u", i, extra_i, extra->buf_idx);
 	slot->buf_idx = extra->buf_idx;
 	slot->flags |= NS_BUF_CHANGED;
 	*extra = tmp;
+	return 0;
 }
 
 static inline void
@@ -827,6 +841,7 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		char *rxbuf, *cbuf, *content = NULL;
 		struct nm_msg m;
 
+		bzero(&m, sizeof(m));
 		m.rxring = rxr;
 		m.txring = txr;
 		m.slot = rxs;
