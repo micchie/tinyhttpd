@@ -26,6 +26,7 @@
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
 #define VIRT_HDR_MAX	VIRT_HDR_2
 #define MAP_HUGETLB	0x40000
+#define EPOLLEVENTS 2048
 
 enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
 enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER, TD_TYPE_DUMMY };
@@ -122,13 +123,16 @@ struct nm_garg {
 	int report_interval;
 #define OPT_PPS_STATS   2048
 	int options;
-	int td_private_len; // passed down to targ
+	int targ_opaque_len; // passed down to targ
 
 	struct nm_ifreq ifreq;
 	void (*data)(struct nm_msg *);
 	void (*connection)(struct nm_msg *);
+	int (*read)(int, struct nm_targ *);
+	int (*thread)(struct nm_targ *);
 	int *fds;
 	int fdnum;
+	void *garg_private;
 };
 
 struct nm_targ {
@@ -154,10 +158,15 @@ struct nm_targ {
 #endif
 	uint32_t extra_cur;
 	uint32_t extra_num;
-	void *td_private;
 	int *fdtable;
 	int fdtable_siz;
 	struct nm_ifreq ifreq;
+#ifdef linux
+	struct epoll_event evts[EPOLLEVENTS];
+#else
+	struct kevent	evts[EPOLLEVENTS];
+#endif /* linux */
+	void *opaque;
 };
 
 static inline void
@@ -323,8 +332,8 @@ nm_start_threads(struct nm_garg *g)
 		bzero(t, sizeof(*t));
 		t->fd = -1;
 		t->g = g;
-		t->td_private = calloc(g->td_private_len, 1);
-		if (t->td_private == NULL) {
+		t->opaque = calloc(g->targ_opaque_len, 1);
+		if (t->opaque == NULL) {
 			continue;
 		}
 
@@ -709,8 +718,8 @@ out:
 	nm_main_thread(g);
 
 	for (i = 0; i < g->nthreads; i++) {
-		if (targs[i].td_private)
-			free(targs[i].td_private);
+		if (targs[i].opaque)
+			free(targs[i].opaque);
 	}
 	free(targs);
 	return 0;
@@ -738,6 +747,7 @@ netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
 }
 
 #define NM_NOEXTRA	(~0U)
+/* curp is reset when it wraps */
 static inline uint32_t
 netmap_extra_next(struct nm_targ *t, size_t *curp, int wrap)
 {
@@ -746,16 +756,17 @@ netmap_extra_next(struct nm_targ *t, size_t *curp, int wrap)
 	if (unlikely(ret == t->extra_num)) {
 		if (!wrap) {
 			return NM_NOEXTRA;
-		} else {
-			ret = 0;
-			t->extra_cur = 1;
 		}
-	} else {
-		t->extra_cur++;
+		ret = t->extra_cur = 0;
+		if (curp) {
+			*curp = 0;
+		}
 	}
+	t->extra_cur++;
 	return ret;
 }
 
+#ifdef NMLIB_EXTRA_SLOT
 static int inline
 netmap_copy_out(struct nm_msg *nmsg)
 {
@@ -764,7 +775,7 @@ netmap_copy_out(struct nm_msg *nmsg)
 	struct nm_targ *t = nmsg->targ;
 	char *p, *ep;
 	uint32_t i = slot->buf_idx;
-	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur, 0);
+	uint32_t extra_i = netmap_extra_next(t, (size_t *)&t->extra_cur, 0);
 	u_int off = t->g->virt_header + slot->offset;
 	u_int len = slot->len - off;
 
@@ -774,7 +785,7 @@ netmap_copy_out(struct nm_msg *nmsg)
 	ep = NETMAP_BUF(ring, extra_i) + off;
 	memcpy(ep, p, len);
 	for (i = 0; i < len; i += 64) {
-		_mm_clflush(ep, i);
+		_mm_clflush(ep + i);
 	}
 	return 0;
 }
@@ -787,7 +798,7 @@ netmap_swap_out(struct nm_msg *nmsg)
 	struct netmap_slot *slot = nmsg->slot, *extra, tmp;
 	struct nm_targ *t = nmsg->targ;
 	uint32_t i = slot->buf_idx;
-	uint32_t extra_i = netmap_extra_next(t, &t->extra_cur, 0);
+	uint32_t extra_i = netmap_extra_next(t, (size_t *)&t->extra_cur, 0);
 
 	if (extra_i == NM_NOEXTRA)
 		return -1;
@@ -799,6 +810,7 @@ netmap_swap_out(struct nm_msg *nmsg)
 	*extra = tmp;
 	return 0;
 }
+#endif /* NMLIB_EXTRA_SLOT */
 
 static inline void
 free_if_exist(void *p)
@@ -874,7 +886,44 @@ do_setsockopt(int fd)
 	return 0;
 }
 
-#define DEFAULT_NFDS	1024
+static int do_accept(struct nm_targ *t, int fd, int epfd)
+{
+#ifdef linux
+	struct epoll_event ev;
+#else
+	struct kevent ev;
+#endif
+	struct sockaddr_in sin;
+	socklen_t addrlen;
+	int newfd;
+	//int val = 1;
+	while ((newfd = accept(fd, (struct sockaddr *)&sin, &addrlen)) != -1) {
+		//if (ioctl(fd, FIONBIO, &val) < 0) {
+		//	perror("ioctl");
+		//}
+		//int yes = 1;
+		//setsockopt(newfd, SOL_SOCKET, SO_BUSY_POLL, &yes, sizeof(yes));
+		if (newfd >= t->fdtable_siz) {
+			if (fdtable_expand(t)) {
+				close(newfd);
+				break;
+			}
+		}
+		memset(&ev, 0, sizeof(ev));
+#ifdef linux
+		ev.events = POLLIN;
+		ev.data.fd = newfd;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, newfd, &ev);
+#else
+		EV_SET(&ev, newfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+		kevent(epfd, &ev, 1, NULL, 0, NULL);
+#endif
+	}
+	return 0;
+}
+
+#define DEFAULT_NFDS	65535
+#define ARRAYSIZ(a)	(sizeof(a) / sizeof(a[0]))
 static void *
 netmap_worker(void *data)
 {
@@ -884,11 +933,13 @@ netmap_worker(void *data)
 	struct pollfd pfd[2] = {{ .fd = t->fd }}; // XXX make variable size
 	int i;
 
-	//for (i = 0; i < g->fdnum; i++) {
-	//	if (do_setsockopt(g->fds[i]) < 0) {
-	//		goto quit;
-	//	}
-	//}
+	if (g->thread) {
+		int error = g->thread(t);
+		if (error) {
+			D("error on t->thread");
+			goto quit;
+		}
+	}
 
 	/* allocate fd table */
 	t->fdtable = calloc(sizeof(*t->fdtable), DEFAULT_NFDS);
@@ -988,25 +1039,25 @@ accepted:
 			 */
 			for (i = 1; i <= t->g->fdnum; i++) {
 				struct sockaddr_storage tmp;
+				struct sockaddr *sa = (struct sockaddr *)&tmp;
 				struct nm_ifreq *ifreq = &g->ifreq;
 				int newfd;
 				socklen_t len = sizeof(tmp);
 
 				if (!(pfd[i].revents & POLLIN))
 					continue;
-				newfd = accept(pfd[i].fd,
-						(struct sockaddr *)&tmp, &len);
+				newfd = accept(pfd[i].fd, sa, &len);
 				if (newfd < 0) {
 					RD(1, "accept error");
 					/* ignore this socket */
-					goto accepted;
+					continue;
 				}
 				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(t->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
 					close(newfd);
 close_pfds:
-					for (i = 1; i < t->g->fdnum; i++) {
+					for (i = 1; i < g->fdnum; i++) {
 						close(pfd[i].fd);
 					}
 					/* be conservative to this error... */
@@ -1019,7 +1070,8 @@ close_pfds:
 				}
 				slot.fd = newfd;
 				msg.slot = &slot;
-				t->g->connection(&msg);
+				if (g->connection)
+					g->connection(&msg);
 			}
 
 			/* check the netmap fd */
@@ -1029,6 +1081,40 @@ close_pfds:
 
 			for (i = first_ring; i <= last_ring; i++) {
 				do_nm_ring(t, i);
+			}
+		} else if (g->dev_type == DEV_SOCKET) {
+			int i, nfd, epfd = t->fd;
+			int nevts = ARRAYSIZ(t->evts);
+#ifdef linux
+			struct epoll_event *evts = t->evts;
+
+			nfd = epoll_wait(epfd, evts, nevts, g->polltimeo);
+			if (nfd < 0) {
+				perror("epoll_wait");
+				goto quit;
+			}
+#else
+			struct kevent *evts = t->evts;
+
+			nfd = kevent(epfd, NULL, 0, evts, nevts, g->polltimeo_ts);
+#endif
+			for (i = 0; i < nfd; i++) {
+#ifdef linux	
+				int fd = evts[i].data.fd;
+#else
+				int fd = evts[i].ident;
+#endif
+
+				for (i = 0; i < t->g->fdnum; i++) {
+					if (fd != t->g->fds[i]) {
+						continue;
+					}
+					do_accept(t, fd, epfd);
+					break;
+				}
+				if (i != t->g->fdnum)
+					continue;
+				g->read(fd, t);
 			}
 		}
 	}
@@ -1043,7 +1129,7 @@ quit:
 #define RING_OBJSIZE	33024
 
 static char *
-_do_mmap(int fd, size_t len)
+do_mmap(int fd, size_t len)
 {
 	char *p;
 
@@ -1065,12 +1151,23 @@ _do_mmap(int fd, size_t len)
 
 #define ST_NAME "stack:0"
 #define ST_NAME_MAX	64
+
+#define IF_OBJTOTAL	128
+#define RING_OBJTOTAL	512
+#define RING_OBJSIZE	33024
+
+struct netmap_events {
+	void (*data)(struct nm_msg *);
+	int (*read)(int, struct nm_targ *);
+	void (*connection)(struct nm_msg *);
+	int (*thread)(struct nm_targ *targ);
+};
+
 static void
-netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
-	void (*data)(struct nm_msg *), void (*connection)(struct nm_msg *))
+netmap_eventloop(char *ifname, void **ret, int *error, int *fds, int fdnum,
+	struct netmap_events *e, struct nm_garg *args, void *garg_private)
 {
 	struct nm_garg *g = calloc(1, sizeof(*g));
-	char ifname[16] = "eth1"; /* XXX */
 	int i;
 
 	*error = 0;
@@ -1081,17 +1178,27 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 	}
 
 	unlink("/mnt/pmem/netmap");
-	g->polltimeo = 1000;
+#define B(a, v, l, h, d) \
+		(!(a) ? d : (((a)->v >= l && (a)->v <= h) ? (a)->v : d))
+	g->polltimeo = B(args, polltimeo, 0, 2000, 1000);
+	g->dev_type = B(args, dev_type, 0, DEV_SOCKET, DEV_SOCKET);
+	g->nthreads = B(args, nthreads, 1, 128, 1);
+	g->affinity = B(args, affinity, -1, 128, -1);
+	g->extmem_siz = B(args, extmem_siz, 0, 8192000000000UL, 0);
+	g->extra_bufs = B(args, extra_bufs, 0, 4096000000UL, 0);
+#undef B
+	g->targ_opaque_len = args ? args->targ_opaque_len : 0;
+	g->nmr_config = args ? args->nmr_config : NULL;
+	g->extmem = args->extmem;
 	g->td_body = netmap_worker;
-	g->dev_type = DEV_NETMAP;
-	g->connection = connection;
-	g->data = data;
+	g->connection = e->connection;
+	g->data = e->data;
+	g->read = e->read;
+	g->thread = e->thread;
 	g->fds = fds;
 	g->fdnum = fdnum;
 	*ret = g;
 
-	/* XXX */
-	g->extmem_siz = 768UL * 1000000UL;
 	g->extra_bufs = g->extmem_siz / 2048;
 
 	for (i = 0; i < fdnum; i++) {
@@ -1100,16 +1207,13 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 			*error = -EFAULT;
 			return;
 		}
-		D("done for %d", fds[i]);
 	}
 
 	signal(SIGPIPE, SIG_IGN);
 
-
-	if (strlen(ifname)) {
+	if (ifname && strlen(ifname)) {
 		char *p = g->ifname;
 		struct nm_ifreq *ifreq = &g->ifreq;
-		struct netmap_pools_info *pi;
 
 		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
 			D("too long name %s", ifname);
@@ -1121,40 +1225,19 @@ netmap_eventloop(void **ret, int *error, int *fds, int fdnum,
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
 		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
-
-		{
-			int fd;
-
-			fd = open("/mnt/pmem/netmap",
-					O_RDWR|O_CREAT, S_IRWXU);
-	                if (fd < 0) {
-	                        perror("open");
-				*error = -EINVAL;
-				return;
-	                }
-			D("allocating %lu byte", g->extmem_siz);
-			if (fallocate(fd, 0, 0, g->extmem_siz) < 0) {
-				D("error %s", "/mnt/pmem/netmap");
-				perror("fallocate");
-				*error = -EINVAL;
-				return;
-			}
-	                g->extmem = _do_mmap(fd, g->extmem_siz);
-	                if (g->extmem == NULL) {
-				D("mmap failed");
-				*error = MAP_FAILED;
-				return;
-	                }
+#ifdef WITH_EXTMEM
+		if (g->extmem_siz) {
+			struct netmap_pools_info *pi;
 			pi = (struct netmap_pools_info *)g->extmem;
 			pi->memsize = g->extmem_siz;
-			D("mmap success %p %lu bytes", g->extmem, pi->memsize);
-
 			pi->if_pool_objtotal = IF_OBJTOTAL;
 			pi->ring_pool_objtotal = RING_OBJTOTAL;
 			pi->ring_pool_objsize = RING_OBJSIZE;
 			pi->buf_pool_objtotal = g->extra_bufs + 800000;
 		}
+#endif
 	}
+	g->garg_private = garg_private;
 	*error = nm_start(g);
 }
 #endif /* _NMLIB_H_ */

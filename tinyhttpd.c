@@ -63,7 +63,9 @@
 #include <net/netmap_user.h>
 
 #include<sched.h>
+#define NMLIB_EXTRA_SLOT 1
 #include "nmlib.h"
+
 
 #ifdef WITH_BPLUS
 #include <bplus_support.h>
@@ -73,10 +75,6 @@
 #ifdef WITH_NOFLUSH
 #define _mm_clflush(p) (void)(p)
 #endif
-
-#define container_of(ptr, type, member) ({          \
-		const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
-		(type *)( (char *)__mptr - offsetof(type,member) );})
 
 //#define MYHZ	2400000000
 #ifdef MYHZ
@@ -105,8 +103,6 @@ user_clock_gettime(struct timespec *ts)
 #define POST_LEN	5
 #define ST_NAME	"stack:0"
 #define ST_NAME_MAX	64
-//#define EXTRA_BUF_NUM	160000
-//#define EXTRA_BUF_NUM	3000000
 #define FILESPATH	"/mnt/pmem"
 #define PMEMFILE         "/mnt/pmem/netmap_mem"
 #define BPLUSFILE	"/mnt/pmem/bplus"
@@ -127,10 +123,6 @@ user_clock_gettime(struct timespec *ts)
 #define D(fmt, ...) \
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
-
-#define IF_OBJTOTAL	128
-#define RING_OBJTOTAL	512
-#define RING_OBJSIZE	33024
 
 #define EPOLLEVENTS 2048
 #define MAXQUERYLEN 32767
@@ -157,7 +149,7 @@ struct dbctx {
 #ifdef WITH_SQLITE
 		sqlite3 *sql_conn;
 #endif
-		int	dumbfd;
+		int	fd;
 	};
 	char *paddr;
 	void *vp; // gfile_t
@@ -166,12 +158,6 @@ struct dbctx {
 	char metapath[64];
 };
 
-static inline int
-is_pm(struct dbctx *d)
-{
-	return !!(d->flags & DF_PMEM);
-}
-
 struct dbargs {
 	DBCOMMON;
 	char *prefix;
@@ -179,10 +165,8 @@ struct dbargs {
 	char *nmprefix;
 };
 
-struct glpriv {
+struct gpriv {
 	char ifname[IFNAMSIZ + 64];
-	struct nm_garg g;
-	struct nm_ifreq ifreq;
 	int extmemfd;
 	int sd;
 	char *http;
@@ -191,46 +175,14 @@ struct glpriv {
 	struct dbargs dbargs; // propagated to threads
 };
 
+static inline int
+is_pm(struct dbctx *d)
+{
+	return !!(d->flags & DF_PMEM);
+}
+
+
 #define ARRAYSIZ(a)	(sizeof(a) / sizeof(a[0]))
-struct thpriv {
-	struct nm_garg *g;
-	struct nm_ifreq ifreq;
-#ifdef linux
-	struct epoll_event evts[EPOLLEVENTS];
-#else
-	struct kevent	evts[EPOLLEVENTS];
-#endif /* linux */
-	int	*fds;
-	int	nfds;
-#ifdef WITH_KVS
-	struct netmap_slot *extra;
-#else
-	uint32_t *extra;
-#endif
-	uint32_t extra_cur; // helper to manage the extra array
-	uint32_t extra_num;
-	struct dbctx *db;
-};
-#define DEFAULT_NFDS	65535
-
-static inline void
-free_if_exist(void *p)
-{
-	if (p != NULL)
-		free(p);
-}
-
-static inline uint32_t
-get_extra(struct thpriv *tp, size_t *curp)
-{
-	uint32_t ret = tp->extra_cur++;
-
-	if (unlikely(tp->extra_cur == tp->extra_num)) {
-		tp->extra_cur = 0;
-		*curp = 0; //clear log too
-	}
-	return ret;
-}
 
 static inline size_t
 get_aligned(size_t len, size_t align)
@@ -288,27 +240,6 @@ static u_int stat_minnfds;
 static uint64_t stat_vnfds;
 #endif /* 0 */
 
-static char *
-_do_mmap(int fd, size_t len)
-{
-	char *p;
-
-	if (lseek(fd, len -1, SEEK_SET) < 0) {
-		perror("lseek");
-		return NULL;
-	}
-	if (write(fd, "", 1) != 1) {
-		perror("write");
-		return NULL;
-	}
-	p = mmap(0, len, PROT_WRITE, MAP_SHARED | MAP_FILE, fd, 0);
-	if (p == MAP_FAILED) {
-		perror("mmap");
-		return NULL;
-	}
-	return p;
-}
-
 void
 close_db(struct dbctx *db)
 {
@@ -322,9 +253,9 @@ close_db(struct dbctx *db)
 		if (db->paddr)
 			if (munmap(db->paddr, db->size))
 				perror("munmap");
-		if (db->dumbfd > 0) {
-			D("closing dumbfd");
-			close(db->dumbfd);
+		if (db->fd > 0) {
+			D("closing db's fd");
+			close(db->fd);
 		}
 	}
 #ifdef WITH_SQLITE
@@ -450,7 +381,6 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 	return len;
 }
 
-#ifdef WITH_KVS
 static char *HTTPHDR = "HTTP/1.1 200 OK\r\n"
 		 "Connection: keep-alive\r\n"
 		 "Server: Apache/2.2.800\r\n"
@@ -480,8 +410,8 @@ generate_httphdr(size_t content_length, char *buf)
 	*c++ = '\n';
 	return c - buf;
 }
-#else
 
+#if 0
 ssize_t
 generate_httphdr(ssize_t content_length, char *buf)
 {
@@ -504,7 +434,7 @@ generate_httphdr(ssize_t content_length, char *buf)
 	*p++ = '\n';
 	return p - buf;
 }
-#endif /* WITH_KVS */
+#endif /* 0 */
 
 static int
 generate_http(int content_length, char *buf, char *content)
@@ -558,13 +488,11 @@ parse_post(char *post, int *coff, uint64_t *key)
 	return clen;
 }
 
-#ifdef WITH_KVS
 static inline uint64_t
 parse_get_key(char *get)
 {
 	return *(uint64_t *)(get + GET_LEN + 1); // jump '/'
 }
-#endif /* WITH_KVS */
 
 static void
 usage(void)
@@ -572,60 +500,6 @@ usage(void)
 	fprintf(stderr,
 	    "usage: tinyhttpd -p port -l msglen [-d dbname]\n");
 	exit(1);
-}
-
-int fdtable_expand(struct thpriv *tp)
-{
-	int *newfds, fdsiz = sizeof(*tp->fds);
-	int nfds = tp->nfds;
-
-	newfds = calloc(fdsiz, nfds * 2);
-	if (!newfds) {
-		perror("calloc");
-		return ENOMEM;
-	}
-	memcpy(newfds, tp->fds, fdsiz * nfds);
-	free(tp->fds);
-	_mm_mfence();
-	tp->fds = newfds;
-	tp->nfds = nfds * 2;
-	return 0;
-}
-
-int do_accept(struct thpriv *tp, int fd, int epfd)
-{
-#ifdef linux
-	struct epoll_event ev;
-#else
-	struct kevent ev;
-#endif
-	struct sockaddr_in sin;
-	socklen_t addrlen;
-	int newfd;
-	//int val = 1;
-	while ((newfd = accept(fd, (struct sockaddr *)&sin, &addrlen)) != -1) {
-		//if (ioctl(fd, FIONBIO, &val) < 0) {
-		//	perror("ioctl");
-		//}
-		//int yes = 1;
-		//setsockopt(newfd, SOL_SOCKET, SO_BUSY_POLL, &yes, sizeof(yes));
-		if (newfd >= tp->nfds) {
-			if (fdtable_expand(tp)) {
-				close(newfd);
-				break;
-			}
-		}
-		memset(&ev, 0, sizeof(ev));
-#ifdef linux
-		ev.events = POLLIN;
-		ev.data.fd = newfd;
-		epoll_ctl(epfd, EPOLL_CTL_ADD, newfd, &ev);
-#else
-		EV_SET(&ev, newfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-		kevent(epfd, &ev, 1, NULL, 0, NULL);
-#endif
-	}
-	return 0;
 }
 
 static int
@@ -658,7 +532,6 @@ writesync(char *buf, ssize_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
-#ifdef WITH_KVS
 static inline void
 unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 {
@@ -666,7 +539,6 @@ unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 	*off = (p & 0x00000000ffff0000) >> 16;
 	*len = p & 0x000000000000ffff;
 }
-#endif /* WITH_KVS */
 
 static inline uint64_t
 pack(uint32_t idx, uint16_t off, uint16_t len)
@@ -675,7 +547,6 @@ pack(uint32_t idx, uint16_t off, uint16_t len)
 }
 
 
-#ifdef WITH_KVS
 static struct netmap_slot *
 set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 {
@@ -735,17 +606,16 @@ whose_slot(struct netmap_slot *slot, struct netmap_ring *ring,
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
 #define KVS_SLOT_OFF 8
 static inline void
-embed_slot(struct netmap_slot *slot, char *buf)
+embed(struct netmap_slot *slot, char *buf)
 {
 	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
 }
 
 static inline struct netmap_slot*
-unembed_slot(char *nmb, u_int coff)
+unembed(char *nmb, u_int coff)
 {
 	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
 }
-#endif /* WITH_KVS */
 
 #if 0
 static inline int
@@ -770,7 +640,8 @@ nmidx_bplus(gfile_t *vp, btree_key key, struct netmap_slot *slot, size_t off, si
 	rc = btree_insert(vp, key, packed);
 	if (rc == 0)
 		unique++;
-	ND("key %lu val %lu idx %u off %lu len %lu", key, packed, slot->buf_idx, off, len);
+	ND("key %lu val %lu idx %u off %lu len %lu",
+			key, packed, slot->buf_idx, off, len);
 }
 #endif /* WITH_BPLUS */
 
@@ -870,199 +741,185 @@ httpreq(const char *p)
 	return req;
 }
 
-/* We assume GET/POST appears in the beginning of netmap buffer */
-int
-do_nm_ring(struct nm_targ *targ, int ring_nr)
+void
+tinyhttpd_data(struct nm_msg *m)
 {
+	struct nm_targ *targ = m->targ;
 	struct nm_garg *g = targ->g;
-	struct glpriv *gp = container_of(g, struct glpriv, g);
-	struct thpriv *tp = targ->td_private;
-	struct dbctx *db = tp->db;
+	struct gpriv *gp = (struct gpriv *)g->garg_private;
+	struct dbctx *db = targ->opaque;
 
-	struct netmap_ring *rxr = NETMAP_RXRING(targ->nmd->nifp, ring_nr);
-	struct netmap_ring *txr = NETMAP_TXRING(targ->nmd->nifp, ring_nr);
-	u_int const rxtail = rxr->tail;
-	u_int rxcur = rxr->cur;
+	struct netmap_ring *rxr = m->rxring;
+	struct netmap_ring *txr = m->txring;
+	struct netmap_slot *rxs = m->slot;
 	ssize_t msglen = gp->msglen;
 
 	const int type = db->type;
 	const int flags = db->flags;
 	const size_t dbsiz = db->size;
 
-	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
-		struct netmap_slot *rxs = &rxr->slot[rxcur];
-		int off, len, thisclen = 0, o = IPV4TCP_HDRLEN, no_ok = 0;
-		int *fde = &tp->fds[rxs->fd];
-		char *rxbuf, *cbuf, *content = NULL;
+	int off, len, thisclen = 0, o = IPV4TCP_HDRLEN, no_ok = 0;
+	int *fde = &targ->fdtable[rxs->fd];
+	char *rxbuf, *cbuf, *content = NULL;
 #ifdef MYHZ
-		struct timespec ts1, ts2, ts3;
-		user_clock_gettime(&ts1);
+	struct timespec ts1, ts2, ts3;
+	user_clock_gettime(&ts1);
 #endif
-		off = g->virt_header + rxs->offset;
-		rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
-	       	len = rxs->len - off;
-		if (unlikely(len == 0)) {
-			continue;
-		}
-
-		switch (httpreq(rxbuf)) {
-		uint64_t key;
-		int coff, clen;
-#ifdef WITH_KVS
-		uint64_t datum;
-		int rc;
-		enum slot t;
-		uint32_t _idx;
-		uint16_t _off, _len;
-		struct netmap_slot *s;
-		char *_buf;
-#endif
-		case NONE:
-			if (*fde <= 0)
-				continue;
-			*fde -= len;
-			if (unlikely(*fde < 0)) {
-				RD(1, "bad leftover %d", *fde);
-				*fde = 0;
-			} else if (*fde > 0) {
-				no_ok = 1;
-			}
-			thisclen = len;
-			break;
-		case POST:
-			clen = parse_post(rxbuf, &coff, &key);
-			if (unlikely(clen < 0))
-				continue;
-			thisclen = len - coff;
-			if (unlikely(thisclen < 0)) {
-				D("thisclen %d len %d coff %d",
-					thisclen, len, coff);
-			}
-			if (clen > thisclen) {
-				*fde = clen - thisclen;
-			}
-			if (*fde > 0)
-				no_ok = 1;
-			cbuf = rxbuf + coff;
-
-			if (type != DT_DUMB)
-				break;
-			if (flags & DF_PASTE) {
-				u_int i = 0;
-#ifdef WITH_KVS
-				struct netmap_slot tmp, *extra;
-#endif
-				uint32_t extra_i = get_extra(tp, &db->cur);
-
-					/* flush data buffer */
-				for (; i < thisclen; i += CLSIZ) {
-					_mm_clflush(cbuf + i);
-				}
-#ifdef WITH_BPLUS
-				if (db->vp) {
-					nmidx_bplus(db->vp, key, rxs,
-						off + coff, thisclen);
-				} else
-#endif
-				if (db->paddr) {
-					nmidx_wal(db->paddr, &db->cur, dbsiz,
-					    rxs, off + coff, thisclen);
-				}
-
-				/* swap out buffer */
-#ifdef WITH_KVS
-				extra = &tp->extra[extra_i];
-				tmp = *rxs;
-				rxs->buf_idx = extra->buf_idx;
-				rxs->flags |= NS_BUF_CHANGED;
-				*extra = tmp;
-				extra->flags &= ~NS_BUF_CHANGED;
-
-				/* record current slot */
-				if (db->flags & DF_KVS) {
-					embed_slot(extra, cbuf);
-				}
-#else
-				i = rxs->buf_idx;
-				rxs->buf_idx = tp->extra[extra_i];
-				rxs->flags |= NS_BUF_CHANGED;
-				tp->extra[extra_i] = i;
-#endif
-
-			} else if (db->paddr) {
-				copy_and_log(db->paddr, &db->cur, dbsiz, cbuf,
-				    thisclen, thisclen, is_pm(db) ? 0 :
-				    db->pgsiz, is_pm(db), db->vp, key);
-			} else {
-				if (writesync(cbuf, len, dbsiz, db->dumbfd,
-				    &db->cur, flags & DF_FDSYNC)) {
-					return -1;
-				}
-			}
-			break;
-#ifdef WITH_KVS
-		case GET:
-			if (!db->vp)
-				break;
-			key = parse_get_key(rxbuf);
-			rc = btree_lookup(db->vp, key, &datum);
-			if (rc == ENOENT)
-				break;
-			unpack(datum, &_idx, &_off, &_len);
-
-			if (!(flags & DF_PASTE)) {
-				content = db->paddr + NETMAP_BUF_SIZE * _idx;
-				msglen = _len;
-				break;
-			}
-
-			_buf = NETMAP_BUF(rxr, _idx);
-			s = unembed_slot(_buf, _off);
-			t = whose_slot(s, txr, tp->extra, tp->extra_num);
-			if (t == SLOT_UNKNOWN) {
-				msglen = _len;
-			} else if (t == SLOT_KERNEL ||
-				   s->flags & NS_BUF_CHANGED) {
-				msglen = _len;
-				content = _buf + _off;
-			} else { // zero copy
-				struct netmap_slot *txs;
-				u_int hl;
-
-				txs = set_to_nm(txr, s);
-				txs->fd = rxs->fd;
-				txs->len = _off + _len; // XXX
-				embed_slot(txs, _buf + _off);
-				hl = generate_httphdr(_len, _buf + off);
-				if (unlikely(hl != _off - off)) {
-					RD(1, "mismatch");
-				}
-				no_ok = 1;
-			}
-			break;
-#endif /* WITH_KVS */
-		default:
-			break;
-		}
-
-		if (!no_ok) {
-			generate_http_nm(msglen, txr, g->virt_header, o,
-		    		rxs->fd, gp->http, gp->httplen, content);
-		}
-#ifdef WITH_KVS
-#endif /* WITH_KVS */
-		nm_update_ctr(targ, 1, len);
-#ifdef MYHZ
-		user_clock_gettime(&ts2);
-		ts3 = timespec_sub(ts2, ts1);
-		RD(1, "loop %lu.%lu", ts3.tv_sec, ts3.tv_nsec);
-#endif /* MYHZ */
+	off = g->virt_header + rxs->offset;
+	rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
+       	len = rxs->len - off;
+	if (unlikely(len == 0)) {
+		return;
 	}
-	rxr->head = rxr->cur = rxcur;
-	return 0;
+
+	switch (httpreq(rxbuf)) {
+	uint64_t key;
+	int coff, clen;
+#ifdef WITH_BPLUS
+	uint64_t datum;
+	int rc;
+	enum slot t;
+	uint32_t _idx;
+	uint16_t _off, _len;
+	struct netmap_slot *s;
+	char *_buf;
+
+#endif
+	case NONE:
+		if (*fde <= 0)
+			return;
+		*fde -= len;
+		if (unlikely(*fde < 0)) {
+			D("bad leftover %d (len %d fd %d)", *fde, len, rxs->fd);
+			*fde = 0;
+		} else if (*fde > 0) {
+			no_ok = 1;
+		}
+		thisclen = len;
+		break;
+	case POST:
+		clen = parse_post(rxbuf, &coff, &key);
+		if (unlikely(clen < 0))
+			return;
+		thisclen = len - coff;
+		if (unlikely(thisclen < 0)) {
+			D("thisclen %d len %d coff %d", thisclen, len, coff);
+		}
+		if (clen > thisclen) {
+			*fde = clen - thisclen;
+		}
+		if (*fde > 0) {
+			no_ok = 1;
+		}
+		cbuf = rxbuf + coff;
+
+		if (type != DT_DUMB)
+			break;
+		if (flags & DF_PASTE) {
+			u_int i = 0;
+			struct netmap_slot tmp, *extra;
+			uint32_t extra_i = netmap_extra_next(targ, &db->cur, 1);
+
+				/* flush data buffer */
+			for (; i < thisclen; i += CLSIZ) {
+				_mm_clflush(cbuf + i);
+			}
+#ifdef WITH_BPLUS
+			if (db->vp) {
+				nmidx_bplus(db->vp, key, rxs,
+					off + coff, thisclen);
+			} else
+#endif
+			if (db->paddr) {
+				nmidx_wal(db->paddr, &db->cur, dbsiz,
+				    rxs, off + coff, thisclen);
+			}
+
+			/* swap out buffer */
+			extra = &targ->extra[extra_i];
+			tmp = *rxs;
+			rxs->buf_idx = extra->buf_idx;
+			rxs->flags |= NS_BUF_CHANGED;
+			*extra = tmp;
+			extra->flags &= ~NS_BUF_CHANGED;
+
+			/* record current slot */
+			if (db->flags & DF_KVS) {
+				embed(extra, cbuf);
+			}
+		} else if (db->paddr) {
+			copy_and_log(db->paddr, &db->cur, dbsiz, cbuf,
+				thisclen, thisclen, is_pm(db) ? 0 : db->pgsiz,
+				is_pm(db), db->vp, key);
+		} else {
+			if (writesync(cbuf, len, dbsiz, db->fd,
+				      &db->cur, flags & DF_FDSYNC)) {
+				return; // XXX notify error
+			}
+		}
+		break;
+	case GET:
+#ifdef WITH_BPLUS
+		if (!(flags & DF_KVS))
+			break;
+		if (!db->vp)
+			break;
+		key = parse_get_key(rxbuf);
+		rc = btree_lookup(db->vp, key, &datum);
+		if (rc == ENOENT)
+			break;
+		unpack(datum, &_idx, &_off, &_len);
+		ND("found key %lu val %lu idx %u off %lu len %lu",
+			key, datum, _idx, _off, _len);
+
+		if (!(flags & DF_PASTE)) {
+			content = db->paddr + NETMAP_BUF_SIZE * _idx;
+			msglen = _len;
+			break;
+		}
+
+		_buf = NETMAP_BUF(rxr, _idx);
+		s = unembed(_buf, _off);
+		t = whose_slot(s, txr, targ->extra, targ->extra_num);
+		if (t == SLOT_UNKNOWN) {
+			msglen = _len;
+		} else if (t == SLOT_KERNEL ||
+			   s->flags & NS_BUF_CHANGED) {
+			msglen = _len;
+			content = _buf + _off;
+		} else { // zero copy
+			struct netmap_slot *txs;
+			u_int hlen;
+
+			txs = set_to_nm(txr, s);
+			txs->fd = rxs->fd;
+			txs->len = _off + _len; // XXX
+			embed(txs, _buf + _off);
+			hlen = generate_httphdr(_len, _buf + off);
+			if (unlikely(hlen != _off - off)) {
+				RD(1, "mismatch");
+			}
+			no_ok = 1;
+		}
+#endif /* WITH_BPLUS */
+		break;
+	default:
+		break;
+	}
+
+	if (!no_ok) {
+		generate_http_nm(msglen, txr, g->virt_header, o,
+	    		rxs->fd, gp->http, gp->httplen, content);
+	}
+#ifdef MYHZ
+	user_clock_gettime(&ts2);
+	ts3 = timespec_sub(ts2, ts1);
+#endif /* MYHZ */
+	return;
 }
 
-int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
+/* We assume GET/POST appears in the beginning of netmap buffer */
+int tinyhttpd_read(int fd, struct nm_targ *targ)
 {
 	char buf[MAXQUERYLEN];
 	char *rxbuf, *cbuf;
@@ -1071,14 +928,14 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 #endif
 	ssize_t len = 0, written;
 	struct nm_garg *g = targ->g;
-	struct thpriv *tp = targ->td_private;
-	struct glpriv *gp = container_of(g, struct glpriv, g);
-	struct dbctx *db = tp->db;
+	struct gpriv *gp = (struct gpriv *)g->garg_private;
+	struct dbctx *db = targ->opaque;
 	size_t max;
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
-	int *fde = &tp->fds[fd];
+	int *fde = &targ->fdtable[fd];
 	int no_ok = 0;
+	ssize_t msglen = gp->msglen;
 
 	if (readmmap) {
 		size_t cur = db->cur;
@@ -1141,8 +998,7 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 				    pm ? 0 : db->pgsiz, pm, db->vp, key);
 			} else {
 				if (writesync(rxbuf + coff, len, db->size,
-				    db->dumbfd, &db->cur,
-				    db->flags & DF_FDSYNC)) {
+				    db->fd, &db->cur, db->flags & DF_FDSYNC)) {
 					return -1;
 				}
 			}
@@ -1169,7 +1025,9 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 #endif /* SQLITE */
 		break;
 	case GET:
-#ifdef WITH_KVS
+#ifdef WITH_BPLUS
+		if (db->flags & DF_KVS)
+			break;
 		key = parse_get_key(rxbuf);
 		if (db->vp) {
 			uint32_t _idx;
@@ -1183,7 +1041,7 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 				msglen = _len;
 			}
 		}
-#endif
+#endif /* WITH_BPLUS */
 		break;
 	default:
 		return 0;
@@ -1206,14 +1064,13 @@ int do_read(int fd, ssize_t msglen, struct nm_targ *targ)
 	return 0;
 }
 
-#define container_of(ptr, type, member) ({                      \
-		      const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
-		      (type *)( (char *)__mptr - offsetof(type,member) );})
 static int
-create_db(struct dbargs *args, struct dbctx *db)
+dbinit(struct dbargs *args, struct dbctx *db)
 {
 	int fd = 0;
 
+	if (args->type == DT_NONE)
+		return 0;
 	bzero(db, sizeof(*db));
 	db->type = args->type;
 	db->flags = args->flags;
@@ -1221,9 +1078,6 @@ create_db(struct dbargs *args, struct dbctx *db)
 	db->pgsiz = args->pgsiz;
 
 	ND("map %p", map);
-
-	if (db->type == DT_NONE)
-		return 0;
 #ifdef WITH_SQLITE
        	if (db->type == DT_SQLITE) {
 	    do {
@@ -1285,7 +1139,7 @@ error:
 		snprintf(db->metapath, sizeof(db->metapath),
 				"%s%d", args->metaprefix, args->i);
 		rc = btree_create_btree(db->metapath, ((gfile_t **)&db->vp));
-		D("btree_create_btree() done (%d)", rc);
+		D("btree_create_btree() done (%d) %s", rc, db->metapath);
 		if (rc != 0)
 			return -1;
 		else if (db->flags & DF_PASTE)
@@ -1304,206 +1158,29 @@ error:
 			close(fd);
 			return -1;
 		}
-		db->paddr = _do_mmap(fd, db->size);
+		db->paddr = do_mmap(fd, db->size);
 		if (db->paddr == NULL) {
 			close(fd);
 			return -1;
 		}
 	}
-	db->dumbfd = fd;
+	db->fd = fd;
 	return 0;
 }
 
-static void *
-_worker(void *data)
+static int
+tinyhttpd_thread(struct nm_targ *targ)
 {
-	struct nm_targ *targ = (struct nm_targ *) data;
-	struct thpriv *tp = targ->td_private;
 	struct nm_garg *g = targ->g;
-	struct glpriv *gp = container_of(g, struct glpriv, g);
-	//struct dbargs *dbargs = &gp->dbargs;
-	struct dbctx db;
-	struct pollfd pfd[2] = {{ .fd = targ->fd }};
-	int msglen = gp->msglen;
-	struct dbargs dbargs = gp->dbargs;
+	struct gpriv *gp = (struct gpriv *)g->garg_private;
+	struct dbargs dbargs = gp->dbargs; // copy
 
-	/* create db */
 	dbargs.size = dbargs.size / g->nthreads;
 	dbargs.i = targ->me;
-	if (create_db(&dbargs, &db)) {
-		D("error on create_db");
-		goto quit;
+	if (dbinit(&dbargs, (struct dbctx *)targ->opaque)) {
+		D("error on dbinit");
+		return ENOMEM;
 	}
-	tp->db = &db;
-
-	/* allocate fd table */
-	tp->fds = calloc(sizeof(*tp->fds), DEFAULT_NFDS);
-	if (!tp->fds){
-		perror("calloc");
-		goto quit;
-	}
-	tp->nfds = DEFAULT_NFDS;
-
-	/* import extra buffers */
-	if (g->dev_type == DEV_NETMAP) {
-		const struct nmreq *req = &targ->nmd->req;
-		const struct netmap_if *nifp = targ->nmd->nifp;
-		const struct netmap_ring *any_ring = targ->nmd->some_ring;
-		uint32_t i, next = nifp->ni_bufs_head;
-		const u_int n = req->nr_arg3;
-
-		D("have %u extra buffers from %u ring %p", n, next, any_ring);
-		tp->extra = calloc(sizeof(*tp->extra), n);
-		if (!tp->extra) {
-			perror("calloc");
-			goto quit;
-		}
-		for (i = 0; i < n && next; i++) {
-			char *p;
-#ifdef WITH_KVS
-			tp->extra[i].buf_idx = next;
-#else
-			tp->extra[i] = next;
-#endif
-			p = NETMAP_BUF(any_ring, next);
-			next = *(uint32_t *)p;
-		}
-		tp->extra_num = i;
-		D("imported %u extra buffers", i);
-		tp->ifreq = gp->ifreq;
-	} else if (g->dev_type == DEV_SOCKET) {
-#ifdef linux
-		struct epoll_event ev;
-
-		targ->fd = epoll_create1(EPOLL_CLOEXEC);
-		if (targ->fd < 0) {
-			perror("epoll_create1");
-			targ->cancel = 1;
-			goto quit;
-		}
-
-		bzero(&ev, sizeof(ev));
-		ev.events = POLLIN;
-		ev.data.fd = gp->sd;
-		if (epoll_ctl(targ->fd, EPOLL_CTL_ADD, ev.data.fd, &ev)) {
-			perror("epoll_ctl");
-			targ->cancel = 1;
-			goto quit;
-		}
-#else /* !linux */
-		struct kevent ev;
-
-		targ->fd = kqueue();
-		if (targ->fd < 0) {
-			perror("kqueue");
-			targ->cancel = 1;
-			goto quit;
-		}
-		EV_SET(&ev, gp->sd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-		if (kevent(targ->fd, &ev, 1, NULL, 0, NULL)) {
-			perror("kevent");
-			targ->cancel = 1;
-			goto quit;
-		}
-#endif /* linux */
-	}
-
-	while (!targ->cancel) {
-		if (g->dev_type == DEV_NETMAP) {
-			u_int first_ring = targ->nmd->first_rx_ring;
-			u_int last_ring = targ->nmd->last_rx_ring;
-			int i;
-
-			pfd[0].fd = targ->fd;
-			pfd[0].events = POLLIN;
-			pfd[1].fd = gp->sd;
-			pfd[1].events = POLLIN;
-
-			i = poll(pfd, 2, g->polltimeo);
-			if (i < 0) {
-				perror("poll");
-				goto quit;
-			}
-			/*
-			 * check the listen socket
-			 */
-			if (pfd[1].revents & POLLIN) {
-				struct sockaddr_storage tmp;
-				struct nm_ifreq *ifreq = &tp->ifreq;
-				int newfd;
-				socklen_t len = sizeof(tmp);
-
-				newfd = accept(pfd[1].fd, (struct sockaddr *)
-					    &tmp, &len);
-				if (newfd < 0) {
-					RD(1, "accept error");
-					/* ignore this socket */
-					goto accepted;
-				}
-				memcpy(ifreq->data, &newfd, sizeof(newfd));
-				if (ioctl(targ->fd, NIOCCONFIG, ifreq)) {
-					perror("ioctl");
-					close(newfd);
-					close(pfd[1].fd);
-					/* be conservative to this error... */
-					goto quit;
-				}
-				if (unlikely(newfd >= tp->nfds)) {
-					if (fdtable_expand(tp)) {
-						close(newfd);
-						goto quit;
-					}
-				}
-			}
-accepted:
-			/*
-			 * check the netmap socket
-			 */
-			if (!(pfd[0].revents & POLLIN)) {
-				continue;
-			}
-
-			for (i = first_ring; i <= last_ring; i++) {
-				do_nm_ring(targ, i);
-			}
-		} else if (g->dev_type == DEV_SOCKET) {
-			int i, nfd, epfd = targ->fd;
-			int sd = gp->sd;
-			int nevts = ARRAYSIZ(tp->evts);
-#ifdef linux
-			struct epoll_event *evts = tp->evts;
-
-			nfd = epoll_wait(epfd, evts, nevts, g->polltimeo);
-			if (nfd < 0) {
-				perror("epoll_wait");
-				goto quit;
-			}
-#else
-			struct kevent *evts = tp->evts;
-
-			nfd = kevent(epfd, NULL, 0, evts, nevts, g->polltimeo_ts);
-#endif
-			for (i = 0; i < nfd; i++) {
-#ifdef linux	
-				int fd = evts[i].data.fd;
-#else
-				int fd = evts[i].ident;
-#endif
-
-				if (fd == sd) {
-					if (do_accept(tp, sd, epfd) < 0)
-						break;
-				} else {
-					do_read(fd, msglen, targ);
-				}
-			}
-		}
-	}
-quit:
-	free_if_exist(tp->extra);
-	free_if_exist(tp->fds);
-	close_db(&db);
-	return (NULL);
 }
 
 void
@@ -1534,27 +1211,36 @@ main(int argc, char **argv)
 	struct sockaddr_in sin;
 	const int on = 1;
 	int port = 60000;
-	struct glpriv gp;
+	struct gpriv gp;
+	struct nm_garg garg, *g;
 	struct dbargs *dbargs = &gp.dbargs;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
+	int error = 0;
+	struct netmap_events e;
+
+	bzero(&garg, sizeof(garg));
+	garg.nmr_config = "";
+	garg.nthreads = 1;
+	garg.polltimeo = 2000;
+	garg.dev_type = DEV_SOCKET;
+	garg.td_type = TD_TYPE_OTHER;
+	garg.targ_opaque_len = sizeof(struct dbctx);
+
+	bzero(&e, sizeof(e));
+	e.thread = tinyhttpd_thread;
+	e.read = tinyhttpd_read;
 
 	bzero(&gp, sizeof(gp));
 	gp.msglen = 64;
-	gp.g.nmr_config = "";
-	gp.g.nthreads = 1;
-	gp.g.td_privbody = _worker;
-	gp.g.polltimeo = 2000;
-	gp.g.dev_type = DEV_SOCKET;
-	gp.g.td_type = TD_TYPE_OTHER;
-	gp.g.td_private_len = sizeof(struct thpriv);
-
 	dbargs->pgsiz = getpagesize();
 
-	signal(SIGPIPE, SIG_IGN); // XXX
 
-	while ((ch = getopt(argc, argv, "P:l:b:md:DNi:PcC:a:p:x:L:BkM:F")) != -1) {
+	//signal(SIGPIPE, SIG_IGN); // XXX
+
+	while ((ch = getopt(argc, argv,
+			    "P:l:b:md:DNi:PcC:a:p:x:L:BkF")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1567,7 +1253,7 @@ main(int argc, char **argv)
 			gp.msglen = atoi(optarg);
 			break;
 		case 'b': /* give the epoll_wait() timeo argument -1 */
-			gp.g.polltimeo = atoi(optarg);
+			garg.polltimeo = atoi(optarg);
 			break;
 		case 'd':
 			{
@@ -1599,48 +1285,42 @@ main(int argc, char **argv)
 			dbargs->flags |= DF_READMMAP;
 			break;
 		case 'i':
-			gp.g.dev_type = DEV_NETMAP;
+			garg.dev_type = DEV_NETMAP;
 			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
+			e.read = NULL;
+			e.data = tinyhttpd_data;
 			break;
 		case 'x': /* PASTE */
 			dbargs->flags |= DF_PASTE;
-			gp.g.extmem_siz = atol(optarg) * 1000000; // MB to B
+			garg.extmem_siz = atol(optarg) * 1000000; // MB to B
 			// believe 90 % is available for bufs
-			gp.g.extra_bufs = (gp.g.extmem_siz / NETMAP_BUF_SIZE) /
-				 10 * 9;
-			dbargs->size = gp.g.extra_bufs * 8 * 2;
-			D("extra_bufs request %u", gp.g.extra_bufs);
-
-			if (!dbargs->nmprefix) {
-				dbargs->nmprefix = PMEMFILE;
-			}
-			break;
-		case 'M':
-			dbargs->nmprefix = optarg;
+			garg.extra_bufs =
+			    (garg.extmem_siz / NETMAP_BUF_SIZE) / 10 * 9;
+			dbargs->size = garg.extra_bufs * 8 * 2;
+			D("extra_bufs request %u", garg.extra_bufs);
+			dbargs->nmprefix = PMEMFILE;
 			break;
 		case 'c':
 			gp.httplen = 1;
 			break;
 		case 'a':
-			gp.g.affinity = atoi(optarg);
+			garg.affinity = atoi(optarg);
 			break;
 		case 'p':
-			gp.g.nthreads = atoi(optarg);
+			garg.nthreads = atoi(optarg);
 			break;
 		case 'C':
-			gp.g.nmr_config = strdup(optarg);
+			garg.nmr_config = strdup(optarg);
 			break;
 #ifdef WITH_BPLUS
 		case 'B':
 			dbargs->flags |= DF_BPLUS;
-			dbargs->metaprefix = "BPLUSFILE";
+			dbargs->metaprefix = BPLUSFILE;
 			break;
-#endif /* WITH_BPLUS */
-#ifdef WITH_KVS
 		case 'k':
 			dbargs->flags |= DF_KVS;
 			break;
-#endif /* WITH_KVS */
+#endif /* WITH_BPLUS */
 #ifdef WITH_NOFLUSH
 		case 'F': // just to tell the script to use tinyhttpd-f
 			break;
@@ -1712,86 +1392,58 @@ main(int argc, char **argv)
 		goto close_socket;
 	}
 
-	if (strlen(gp.ifname) > 0) {
-		char *p = gp.g.ifname;
-		struct nm_ifreq *ifreq = &gp.ifreq;
-#ifdef WITH_EXTMEM
-		struct netmap_pools_info *pi;
-#endif /* WITH_EXTMEM */
+	if (dbargs->flags & DF_PASTE) {
+		int fd, mode = O_RDWR|O_CREAT;
 
-		if (strlen(ST_NAME) + 1 + strlen(gp.ifname) > ST_NAME_MAX) {
-			D("too long name %s", gp.ifname);
+		fd = open(dbargs->nmprefix, mode, S_IRWXU);
+                if (fd < 0) {
+                        perror("open");
+                        goto close_socket;
+                }
+		gp.extmemfd = fd;
+		if (fallocate(fd, 0, 0, garg.extmem_siz) < 0) {
+			D("error %s", dbargs->nmprefix);
+			perror("fallocate");
 			goto close_socket;
 		}
-		strcat(strcat(strcpy(p, ST_NAME), "+"), gp.ifname);
-
-		/* pre-initialize ifreq for accept() */
-		bzero(ifreq, sizeof(*ifreq));
-		strncpy(ifreq->nifr_name, ST_NAME, sizeof(ifreq->nifr_name));
-
-#ifdef WITH_EXTMEM
-		if (dbargs->flags & DF_PASTE) {
-			int fd;
-
-			fd = gp.extmemfd = open(dbargs->nmprefix,
-					O_RDWR|O_CREAT, S_IRWXU);
-	                if (fd < 0) {
-	                        perror("open");
-	                        goto close_socket;
-	                }
-			if (fallocate(fd, 0, 0, gp.g.extmem_siz) < 0) {
-				D("error %s", dbargs->nmprefix);
-				perror("fallocate");
-				goto close_socket;
-			}
-	                gp.g.extmem = _do_mmap(fd, gp.g.extmem_siz);
-	                if (gp.g.extmem == NULL) {
-				D("mmap failed");
-	                        goto close_socket;
-	                }
-			pi = (struct netmap_pools_info *)gp.g.extmem;
-			pi->memsize = gp.g.extmem_siz;
-			D("mmap success %p %lu bytes", gp.g.extmem, pi->memsize);
-
-			pi->if_pool_objtotal = IF_OBJTOTAL;
-			pi->ring_pool_objtotal = RING_OBJTOTAL;
-			pi->ring_pool_objsize = RING_OBJSIZE;
-			pi->buf_pool_objtotal = gp.g.extra_bufs + 800000;
-		}
-#endif
+                garg.extmem = do_mmap(fd, garg.extmem_siz);
+                if (garg.extmem == NULL) {
+			D("mmap failed");
+                        goto close_socket;
+                }
 	}
 #ifdef __FreeBSD__
 	/* kevent requires struct timespec for timeout */ 
-	if (gp.g.polltimeo >= 0) {
+	if (garg.polltimeo >= 0) {
 		struct timespec *x = calloc(1, sizeof(*x));
 		if (!x) {
 			perror("malloc");
 			usage();
 		}
-		x->tv_sec = gp.g.polltimeo / 1000;
-		x->tv_nsec = (gp.g.polltimeo % 1000) * 1000000;
-		gp.g.polltimeo_ts = x;
+		x->tv_sec = garg.polltimeo / 1000;
+		x->tv_nsec = (garg.polltimeo % 1000) * 1000000;
+		garg.polltimeo_ts = x;
 	}
 #endif /* FreeBSD */
-	if (nm_start(&gp.g) < 0)
+	netmap_eventloop(gp.ifname, (void **)&g, &error, &gp.sd, 1,
+			 &e, &garg, &gp);
+	if (error)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
-	    nm_name, IPV4TCP_HDRLEN, gp.g.nmd->nifp->ni_tx_rings);
+	    nm_name, IPV4TCP_HDRLEN, garg.nmd->nifp->ni_tx_rings);
 
 close_socket:
-#ifdef WITH_EXTMEM
 	if (gp.extmemfd) {
-		if (gp.g.extmem)
-			munmap(gp.g.extmem, gp.g.extmem_siz);
+		if (garg.extmem)
+			munmap(garg.extmem, garg.extmem_siz);
 		close(gp.extmemfd);
 	}
-#endif /* WITH_EXTMEM */
 
 	if (gp.sd > 0)
 		close(gp.sd);
 	free_if_exist(gp.http);
 #ifdef __FreeBSD__
-	free_if_exist(gp.g.polltimeo_ts);
+	free_if_exist(g.polltimeo_ts);
 #endif
 	return 0;
 }
