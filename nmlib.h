@@ -132,6 +132,7 @@ struct nm_garg {
 	int (*thread)(struct nm_targ *);
 	int *fds;
 	int fdnum;
+	int emu_delay;
 	void *garg_private;
 };
 
@@ -837,6 +838,27 @@ static int fdtable_expand(struct nm_targ *t)
 	return 0;
 }
 
+#ifdef WITH_CLFLUSHOPT
+static inline void
+wait_ns(long ns)
+{
+	struct timespec cur, w;
+
+	if (unlikely(ns > 10000 || ns < 100)) {
+		RD(1, "ns %ld may not be apprepriate", ns);
+	}
+	clock_gettime(CLOCK_REALTIME, &cur);
+	for (;;) {
+		clock_gettime(CLOCK_REALTIME, &w);
+		w = timespec_sub(w, cur);
+		if (unlikely(w.tv_sec < 0)) // maybe too short interval
+			continue;
+		else if (w.tv_nsec >= ns || w.tv_sec > 0)
+			break;
+	}
+}
+#endif /* WITH_CLFLUSHOPT */
+
 static int
 do_nm_ring(struct nm_targ *t, int ring_nr)
 {
@@ -862,6 +884,13 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		nm_update_ctr(t, 1, rxs->len - t->g->virt_header - rxs->offset);
 	}
 	rxr->head = rxr->cur = rxcur;
+#ifdef WITH_CLFLUSHOPT
+	_mm_mfence();
+	if (g->emu_delay) {
+		wait_ns(g->emu_delay);
+	}
+#endif /* WITH_CLFLUSHOPT */
+
 }
 
 static int

@@ -75,6 +75,10 @@
 #ifdef WITH_NOFLUSH
 #define _mm_clflush(p) (void)(p)
 #endif
+#ifdef WITH_CLFLUSHOPT
+#define _mm_clflush(p) _mm_clflushopt(p)
+#endif
+
 
 //#define MYHZ	2400000000
 #ifdef MYHZ
@@ -1240,7 +1244,7 @@ main(int argc, char **argv)
 	//signal(SIGPIPE, SIG_IGN); // XXX
 
 	while ((ch = getopt(argc, argv,
-			    "P:l:b:md:DNi:PcC:a:p:x:L:BkF")) != -1) {
+			    "P:l:b:md:DNi:PcC:a:p:x:L:BkFe:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1325,6 +1329,12 @@ main(int argc, char **argv)
 		case 'F': // just to tell the script to use tinyhttpd-f
 			break;
 #endif /* WITH_NOFLUSH */
+#ifdef WITH_CLFLUSHOPT
+		case 'e':
+			g.emu_delay = atoi(optarg);
+			D("emu_delay %d", g.emu_delay);
+			break;
+#endif /* WITH_CLFLUSHOPT */
 		}
 
 	}

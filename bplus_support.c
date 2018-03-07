@@ -13,6 +13,10 @@
 #include <x86intrin.h>
 
 #include <bplus_support.h>
+#ifdef WITH_CLFLUSHOPT
+#define _mm_clflush(p) _mm_clflushopt(p)
+#endif
+
 
 #define MAX_BUFFERS 64
 gbuf_t buffer_table[MAX_BUFFERS];
