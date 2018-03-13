@@ -959,7 +959,7 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 		close(fd);
 		return 0;
 	} else if (unlikely(len < 0)) {
-		//perror("read");
+		perror("read");
 		close(fd);
 		return -1;
 	}

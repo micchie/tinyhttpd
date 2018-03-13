@@ -5,6 +5,7 @@
 #include<sys/cpuset.h>
 #include <pthread_np.h> /* pthread w/ affinity */
 #endif
+#include <x86intrin.h>
 #include<net/netmap.h>
 #include<net/netmap_user.h>
 #include<ctrs.h>
@@ -798,7 +799,6 @@ netmap_swap_out(struct nm_msg *nmsg)
 	struct netmap_ring *ring = nmsg->rxring;
 	struct netmap_slot *slot = nmsg->slot, *extra, tmp;
 	struct nm_targ *t = nmsg->targ;
-	uint32_t i = slot->buf_idx;
 	uint32_t extra_i = netmap_extra_next(t, (size_t *)&t->extra_cur, 0);
 
 	if (extra_i == NM_NOEXTRA)
@@ -872,7 +872,6 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		int off, len, o = IPV4TCP_HDRLEN;
 		int *fde = &t->fdtable[rxs->fd];
-		char *rxbuf, *cbuf, *content = NULL;
 		struct nm_msg m;
 
 		bzero(&m, sizeof(m));
@@ -927,7 +926,7 @@ static int do_accept(struct nm_targ *t, int fd, int epfd)
 	int newfd;
 	//int val = 1;
 	while ((newfd = accept(fd, (struct sockaddr *)&sin, &addrlen)) != -1) {
-		//if (ioctl(fd, FIONBIO, &val) < 0) {
+		//if (ioctl(fd, FIONBIO, &(int){1}) < 0) {
 		//	perror("ioctl");
 		//}
 		//int yes = 1;
@@ -960,7 +959,6 @@ netmap_worker(void *data)
 	struct nm_garg *g = t->g;
 	struct nm_desc *nmd = t->nmd;
 	struct pollfd pfd[2] = {{ .fd = t->fd }}; // XXX make variable size
-	int i;
 
 	if (g->thread) {
 		int error = g->thread(t);
@@ -1047,7 +1045,7 @@ netmap_worker(void *data)
 		if (g->dev_type == DEV_NETMAP) {
 			u_int first_ring = nmd->first_rx_ring;
 			u_int last_ring = nmd->last_rx_ring;
-			int i;
+			u_int i;
 			struct nm_msg msg;
 			struct netmap_slot slot;
 
@@ -1062,7 +1060,6 @@ netmap_worker(void *data)
 				perror("poll");
 				goto quit;
 			}
-accepted:
 			/*
 			 * check listen sockets
 			 */
@@ -1128,20 +1125,21 @@ close_pfds:
 			nfd = kevent(epfd, NULL, 0, evts, nevts, g->polltimeo_ts);
 #endif
 			for (i = 0; i < nfd; i++) {
+				int j;
 #ifdef linux	
 				int fd = evts[i].data.fd;
 #else
 				int fd = evts[i].ident;
 #endif
 
-				for (i = 0; i < t->g->fdnum; i++) {
-					if (fd != t->g->fds[i]) {
+				for (j = 0; j < t->g->fdnum; j++) {
+					if (fd != t->g->fds[j]) {
 						continue;
 					}
 					do_accept(t, fd, epfd);
 					break;
 				}
-				if (i != t->g->fdnum)
+				if (j != t->g->fdnum)
 					continue;
 				g->read(fd, t);
 			}
@@ -1157,7 +1155,8 @@ quit:
 #define RING_OBJTOTAL	512
 #define RING_OBJSIZE	33024
 
-static char *
+// XXX inline just to scilence compiler
+static inline char *
 do_mmap(int fd, size_t len)
 {
 	char *p;
