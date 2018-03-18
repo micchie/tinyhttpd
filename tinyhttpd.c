@@ -195,36 +195,6 @@ get_aligned(size_t len, size_t align)
 	return d ? len + align - d : len;
 }
 
-#if 0
-/* overflow some */
-static inline void
-set_rubbish(char *buf, int len)
-{
-	static char *r = "A sample content of the tiny HTTP server. "
-			 "Nothing is meaningful"; // 64 characters
-	memcpy(buf, r, min(len, 64));
-}
-
-static inline void
-wait_ns(long ns)
-{
-	struct timespec cur, w;
-
-	if (unlikely(ns > 10000 || ns < 100)) {
-		RD(1, "ns %ld may not be apprepriate", ns);
-	}
-	clock_gettime(CLOCK_REALTIME, &cur);
-	for (;;) {
-		clock_gettime(CLOCK_REALTIME, &w);
-		w = timespec_sub(w, cur);
-		if (unlikely(w.tv_sec < 0)) // maybe too short interval
-			continue;
-		else if (w.tv_nsec >= ns || w.tv_sec > 0)
-			break;
-	}
-}
-#endif /* 0 */
-
 #define CLSIZ	64 /* XXX */
 
 struct wal_hdr { // so far organized for Paste but it is dummy anyways.
@@ -288,12 +258,14 @@ close_db(struct dbctx *db)
 	//remove(db->path);
 }
 
+#ifdef WITH_SQLITE
 int
 print_resp(void *get_prm, int n, char **txts, char **col)
 {
 	printf("%s : %s\n", txts[0], txts[1]);
 	return 0;
 }
+#endif
 
 /* fill rubbish if data is NULL */
 #if 0
@@ -792,6 +764,8 @@ tinyhttpd_data(struct nm_msg *m)
 	case NONE:
 		if (*fde <= 0)
 			return;
+		__leftover(fde, len, &no_ok, &thisclen);
+#if 0
 		*fde -= len;
 		if (unlikely(*fde < 0)) {
 			D("bad leftover %d (len %d fd %d)", *fde, len, rxs->fd);
@@ -800,6 +774,7 @@ tinyhttpd_data(struct nm_msg *m)
 			no_ok = 1;
 		}
 		thisclen = len;
+#endif
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
@@ -922,6 +897,24 @@ tinyhttpd_data(struct nm_msg *m)
 	return;
 }
 
+static inline void
+__leftover(int *fde, ssize_t len, int *is_leftover, int *thisclen)
+{
+	*fde -= len;
+	if (unlikely(*fde < 0)) {
+		RD(1, "bad leftover %d", *fde);
+		*fde = 0;
+	} else if (*fde > 0) {
+		*is_leftover = 1;
+	}
+	*thisclen = len;
+}
+
+static inline void
+__post()
+{
+}
+
 /* We assume GET/POST appears in the beginning of netmap buffer */
 int tinyhttpd_read(int fd, struct nm_targ *targ)
 {
@@ -969,8 +962,10 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 	int coff, clen, thisclen;
 
 	case NONE: 
-		if (unlikely(*fde <= 0))
+		if (*fde <= 0)
 			return 0;
+		__leftover(fde, len, &no_ok, &thisclen);
+#if 0
 		*fde -= len;
 		if (unlikely(*fde < 0)) {
 			RD(1, "bad leftover %d", *fde);
@@ -979,6 +974,7 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 			no_ok = 1;
 		}
 		thisclen = len;
+#endif /* 0 */
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
@@ -1069,7 +1065,7 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 }
 
 static int
-dbinit(struct dbargs *args, struct dbctx *db)
+init_db(struct dbargs *args, struct dbctx *db)
 {
 	int fd = 0;
 
@@ -1177,12 +1173,12 @@ tinyhttpd_thread(struct nm_targ *targ)
 {
 	struct nm_garg *g = targ->g;
 	struct gpriv *gp = (struct gpriv *)g->garg_private;
-	struct dbargs dbargs = gp->dbargs; // copy
+	struct dbargs args = gp->dbargs; // copy
 
-	dbargs.size = dbargs.size / g->nthreads;
-	dbargs.i = targ->me;
-	if (dbinit(&dbargs, (struct dbctx *)targ->opaque)) {
-		D("error on dbinit");
+	args.size = args.size / g->nthreads;
+	args.i = targ->me;
+	if (init_db(&args, (struct dbctx *)targ->opaque)) {
+		D("error on init_db");
 		return ENOMEM;
 	}
 }
@@ -1449,8 +1445,9 @@ close_socket:
 		close(gp.extmemfd);
 	}
 
-	if (gp.sd > 0)
+	if (gp.sd > 0) {
 		close(gp.sd);
+	}
 	free_if_exist(gp.http);
 #ifdef __FreeBSD__
 	free_if_exist(g.polltimeo_ts);
