@@ -765,32 +765,13 @@ tinyhttpd_data(struct nm_msg *m)
 		if (*fde <= 0)
 			return;
 		__leftover(fde, len, &no_ok, &thisclen);
-#if 0
-		*fde -= len;
-		if (unlikely(*fde < 0)) {
-			D("bad leftover %d (len %d fd %d)", *fde, len, rxs->fd);
-			*fde = 0;
-		} else if (*fde > 0) {
-			no_ok = 1;
-		}
-		thisclen = len;
-#endif
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
 		if (unlikely(clen < 0))
 			return;
-		thisclen = len - coff;
-		if (unlikely(thisclen < 0)) {
-			D("thisclen %d len %d coff %d", thisclen, len, coff);
-		}
-		if (clen > thisclen) {
-			*fde = clen - thisclen;
-		}
-		if (*fde > 0) {
-			no_ok = 1;
-		}
 		cbuf = rxbuf + coff;
+		__leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
 
 		if (type != DT_DUMB)
 			break;
@@ -911,8 +892,14 @@ __leftover(int *fde, ssize_t len, int *is_leftover, int *thisclen)
 }
 
 static inline void
-__post()
+__leftover_post(int *fde, const ssize_t len, const ssize_t clen,
+		const int coff, int *thisclen, int *is_leftover)
 {
+	*thisclen = len - *coff;
+	if (clen > *thisclen) {
+		*fde = clen - *thisclen;
+		*is_leftover = 1;
+	}
 }
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
@@ -982,13 +969,8 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 			RD(1, "invalid clen");
 			return 0;
 		}
-		thisclen = len - coff;
-		if (clen > thisclen) {
-			*fde = clen - thisclen;
-		}
-		if (*fde > 0)
-			no_ok = 1;
 		cbuf = rxbuf + coff;
+		__leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
 
 		if (db->type == DT_DUMB) {
 			int pm = is_pm(db);
