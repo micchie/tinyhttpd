@@ -169,7 +169,7 @@ struct dbargs {
 	char *nmprefix;
 };
 
-struct gpriv {
+struct tinyhttpd_global {
 	char ifname[IFNAMSIZ + 64];
 	int extmemfd;
 	int sd;
@@ -717,18 +717,47 @@ httpreq(const char *p)
 	return req;
 }
 
+static inline void
+__leftover(int *fde, const ssize_t len, int *is_leftover, int *thisclen)
+{
+	if (*fde <= 0) {
+		/* XXX OOB message? Just suppress response */
+		*is_leftover = 1;
+		return;
+	}
+	*fde -= len;
+	if (unlikely(*fde < 0)) {
+		RD(1, "bad leftover %d", *fde);
+		*fde = 0;
+	} else if (*fde > 0) {
+		*is_leftover = 1;
+	}
+	*thisclen = len;
+}
+
+static inline void
+__leftover_post(int *fde, const ssize_t len, const ssize_t clen,
+		const int coff, int *thisclen, int *is_leftover)
+{
+	*thisclen = len - coff;
+	if (clen > *thisclen) {
+		*fde = clen - *thisclen;
+		*is_leftover = 1;
+	}
+}
+
 void
 tinyhttpd_data(struct nm_msg *m)
 {
 	struct nm_targ *targ = m->targ;
 	struct nm_garg *g = targ->g;
-	struct gpriv *gp = (struct gpriv *)g->garg_private;
+	struct tinyhttpd_global *tg = (struct tinyhttpd_global *)g->garg_private;
 	struct dbctx *db = targ->opaque;
 
 	struct netmap_ring *rxr = m->rxring;
 	struct netmap_ring *txr = m->txring;
 	struct netmap_slot *rxs = m->slot;
-	ssize_t msglen = gp->msglen;
+	ssize_t msglen = tg->msglen;
 
 	const int type = db->type;
 	const int flags = db->flags;
@@ -762,8 +791,6 @@ tinyhttpd_data(struct nm_msg *m)
 
 #endif
 	case NONE:
-		if (*fde <= 0)
-			return;
 		__leftover(fde, len, &no_ok, &thisclen);
 		break;
 	case POST:
@@ -869,37 +896,13 @@ tinyhttpd_data(struct nm_msg *m)
 
 	if (!no_ok) {
 		generate_http_nm(msglen, txr, g->virt_header, o,
-	    		rxs->fd, gp->http, gp->httplen, content);
+	    		rxs->fd, tg->http, tg->httplen, content);
 	}
 #ifdef MYHZ
 	user_clock_gettime(&ts2);
 	ts3 = timespec_sub(ts2, ts1);
 #endif /* MYHZ */
 	return;
-}
-
-static inline void
-__leftover(int *fde, ssize_t len, int *is_leftover, int *thisclen)
-{
-	*fde -= len;
-	if (unlikely(*fde < 0)) {
-		RD(1, "bad leftover %d", *fde);
-		*fde = 0;
-	} else if (*fde > 0) {
-		*is_leftover = 1;
-	}
-	*thisclen = len;
-}
-
-static inline void
-__leftover_post(int *fde, const ssize_t len, const ssize_t clen,
-		const int coff, int *thisclen, int *is_leftover)
-{
-	*thisclen = len - *coff;
-	if (clen > *thisclen) {
-		*fde = clen - *thisclen;
-		*is_leftover = 1;
-	}
 }
 
 /* We assume GET/POST appears in the beginning of netmap buffer */
@@ -912,14 +915,14 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 #endif
 	ssize_t len = 0, written;
 	struct nm_garg *g = targ->g;
-	struct gpriv *gp = (struct gpriv *)g->garg_private;
+	struct tinyhttpd_global *tg = (struct tinyhttpd_global *)g->garg_private;
 	struct dbctx *db = targ->opaque;
 	size_t max;
 	int readmmap = !!(db->flags & DF_READMMAP);
 	char *content = NULL;
 	int *fde = &targ->fdtable[fd];
 	int no_ok = 0;
-	ssize_t msglen = gp->msglen;
+	ssize_t msglen = tg->msglen;
 
 	if (readmmap) {
 		size_t cur = db->cur;
@@ -948,20 +951,8 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 	uint64_t key;
 	int coff, clen, thisclen;
 
-	case NONE: 
-		if (*fde <= 0)
-			return 0;
+	case NONE:
 		__leftover(fde, len, &no_ok, &thisclen);
-#if 0
-		*fde -= len;
-		if (unlikely(*fde < 0)) {
-			RD(1, "bad leftover %d", *fde);
-			*fde = 0;
-		} else if (*fde > 0) {
-			no_ok = 1;
-		}
-		thisclen = len;
-#endif /* 0 */
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
@@ -1031,9 +1022,9 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 
 	if (no_ok)
 		return 0;
-	if (gp->httplen && content == NULL) {
-		memcpy(buf, gp->http, gp->httplen);
-		len = gp->httplen + msglen;
+	if (tg->httplen && content == NULL) {
+		memcpy(buf, tg->http, tg->httplen);
+		len = tg->httplen + msglen;
 	} else {
 		len = generate_http(msglen, buf, content);
 	}
@@ -1154,8 +1145,8 @@ static int
 tinyhttpd_thread(struct nm_targ *targ)
 {
 	struct nm_garg *g = targ->g;
-	struct gpriv *gp = (struct gpriv *)g->garg_private;
-	struct dbargs args = gp->dbargs; // copy
+	struct tinyhttpd_global *tg = (struct tinyhttpd_global *)g->garg_private;
+	struct dbargs args = tg->dbargs; // copy
 
 	args.size = args.size / g->nthreads;
 	args.i = targ->me;
@@ -1193,9 +1184,9 @@ main(int argc, char **argv)
 	struct sockaddr_in sin;
 	const int on = 1;
 	int port = 60000;
-	struct gpriv gp;
+	struct tinyhttpd_global tg;
 	struct nm_garg garg, *g;
-	struct dbargs *dbargs = &gp.dbargs;
+	struct dbargs *dbargs = &tg.dbargs;
 #ifdef WITH_SQLITE
 	int ret = 0;
 #endif /* WITH_SQLITE */
@@ -1214,9 +1205,10 @@ main(int argc, char **argv)
 	e.thread = tinyhttpd_thread;
 	e.read = tinyhttpd_read;
 
-	bzero(&gp, sizeof(gp));
-	gp.msglen = 64;
+	bzero(&tg, sizeof(tg));
+	tg.msglen = 64;
 	dbargs->pgsiz = getpagesize();
+	dbargs->nmprefix = PMEMFILE;
 
 
 	//signal(SIGPIPE, SIG_IGN); // XXX
@@ -1232,7 +1224,7 @@ main(int argc, char **argv)
 			port = atoi(optarg);
 			break;
 		case 'l': /* HTTP OK content length */
-			gp.msglen = atoi(optarg);
+			tg.msglen = atoi(optarg);
 			break;
 		case 'b': /* give the epoll_wait() timeo argument -1 */
 			garg.polltimeo = atoi(optarg);
@@ -1268,7 +1260,7 @@ main(int argc, char **argv)
 			break;
 		case 'i':
 			garg.dev_type = DEV_NETMAP;
-			strncpy(gp.ifname, optarg, sizeof(gp.ifname));
+			strncpy(tg.ifname, optarg, sizeof(tg.ifname));
 			e.read = NULL;
 			e.data = tinyhttpd_data;
 			break;
@@ -1280,10 +1272,9 @@ main(int argc, char **argv)
 			    (garg.extmem_siz / NETMAP_BUF_SIZE) / 10 * 9;
 			dbargs->size = garg.extra_bufs * 8 * 2;
 			D("extra_bufs request %u", garg.extra_bufs);
-			dbargs->nmprefix = PMEMFILE;
 			break;
 		case 'c':
-			gp.httplen = 1;
+			tg.httplen = 1;
 			break;
 		case 'a':
 			garg.affinity = atoi(optarg);
@@ -1326,44 +1317,48 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if (!port || !gp.msglen)
+	if (!port || !tg.msglen)
 		usage();
-	else if (dbargs->flags & DF_PASTE && strlen(gp.ifname) == 0)
+	else if (dbargs->flags & DF_PASTE && strlen(tg.ifname) == 0)
 		usage();
 	else if (dbargs->type != DT_DUMB && dbargs->flags)
 		usage();
 	else if (dbargs->flags & DF_READMMAP && !(dbargs->flags & DF_MMAP))
 		usage();
+#ifdef WITH_BPLUS
+	else if (dbargs->flags & DF_BPLUS && !(dbargs->flags & DF_MMAP))
+		usage();
+#endif /* WITH_BPLUS */
 
 	/* Preallocate HTTP header */
-	if (gp.httplen) {
-		gp.http = calloc(1, MAX_HTTPLEN);
-		if (!gp.http) {
+	if (tg.httplen) {
+		tg.http = calloc(1, MAX_HTTPLEN);
+		if (!tg.http) {
 			perror("calloc");
 			usage();
 		}
-		gp.httplen = generate_httphdr(gp.msglen, gp.http);
-		D("preallocated http hdr %d", gp.httplen);
+		tg.httplen = generate_httphdr(tg.msglen, tg.http);
+		D("preallocated http hdr %d", tg.httplen);
 	}
 
-	gp.sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (gp.sd < 0) {
+	tg.sd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (tg.sd < 0) {
 		perror("socket");
 		return 0;
 	}
-	if (setsockopt(gp.sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+	if (setsockopt(tg.sd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (setsockopt(gp.sd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+	if (setsockopt(tg.sd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (setsockopt(gp.sd, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
+	if (setsockopt(tg.sd, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
 		perror("setsockopt");
 		goto close_socket;
 	}
-	if (ioctl(gp.sd, FIONBIO, &on) < 0) {
+	if (ioctl(tg.sd, FIONBIO, &on) < 0) {
 		perror("ioctl");
 		goto close_socket;
 	}
@@ -1371,11 +1366,11 @@ main(int argc, char **argv)
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = htonl(INADDR_ANY);
 	sin.sin_port = htons(port);
-	if (bind(gp.sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+	if (bind(tg.sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
 		perror("bind");
 		goto close_socket;
 	}
-	if (listen(gp.sd, SOMAXCONN) != 0) {
+	if (listen(tg.sd, SOMAXCONN) != 0) {
 		perror("listen");
 		goto close_socket;
 	}
@@ -1388,7 +1383,7 @@ main(int argc, char **argv)
                         perror("open");
                         goto close_socket;
                 }
-		gp.extmemfd = fd;
+		tg.extmemfd = fd;
 		if (fallocate(fd, 0, 0, garg.extmem_siz) < 0) {
 			D("error %s", dbargs->nmprefix);
 			perror("fallocate");
@@ -1413,24 +1408,24 @@ main(int argc, char **argv)
 		garg.polltimeo_ts = x;
 	}
 #endif /* FreeBSD */
-	netmap_eventloop(gp.ifname, (void **)&g, &error, &gp.sd, 1,
-			 &e, &garg, &gp);
+	netmap_eventloop(tg.ifname, (void **)&g, &error, &tg.sd, 1,
+			 &e, &garg, &tg);
 	if (error)
 		goto close_socket;
 	ND("nm_open() %s done (offset %u ring_num %u)",
 	    nm_name, IPV4TCP_HDRLEN, garg.nmd->nifp->ni_tx_rings);
 
 close_socket:
-	if (gp.extmemfd) {
+	if (tg.extmemfd) {
 		if (garg.extmem)
 			munmap(garg.extmem, garg.extmem_siz);
-		close(gp.extmemfd);
+		close(tg.extmemfd);
 	}
 
-	if (gp.sd > 0) {
-		close(gp.sd);
+	if (tg.sd > 0) {
+		close(tg.sd);
 	}
-	free_if_exist(gp.http);
+	free_if_exist(tg.http);
 #ifdef __FreeBSD__
 	free_if_exist(g.polltimeo_ts);
 #endif

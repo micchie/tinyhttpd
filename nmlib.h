@@ -872,13 +872,15 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
 		int off, len, o = IPV4TCP_HDRLEN;
 		int *fde = &t->fdtable[rxs->fd];
-		struct nm_msg m;
+		struct nm_msg m = {.rxring = rxr, .txring = txr, .slot = rxs, .targ = t} ;
 
+		/*
 		bzero(&m, sizeof(m));
 		m.rxring = rxr;
 		m.txring = txr;
 		m.slot = rxs;
 		m.targ = t;
+		*/
 		t->g->data(&m);
 		nm_update_ctr(t, 1, rxs->len - t->g->virt_header - rxs->offset);
 	}
