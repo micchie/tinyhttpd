@@ -718,7 +718,7 @@ httpreq(const char *p)
 }
 
 static inline void
-__leftover(int *fde, const ssize_t len, int *is_leftover, int *thisclen)
+leftover(int *fde, const ssize_t len, int *is_leftover, int *thisclen)
 {
 	if (*fde <= 0) {
 		/* XXX OOB message? Just suppress response */
@@ -736,7 +736,7 @@ __leftover(int *fde, const ssize_t len, int *is_leftover, int *thisclen)
 }
 
 static inline void
-__leftover_post(int *fde, const ssize_t len, const ssize_t clen,
+leftover_post(int *fde, const ssize_t len, const ssize_t clen,
 		const int coff, int *thisclen, int *is_leftover)
 {
 	*thisclen = len - coff;
@@ -791,14 +791,14 @@ tinyhttpd_data(struct nm_msg *m)
 
 #endif
 	case NONE:
-		__leftover(fde, len, &no_ok, &thisclen);
+		leftover(fde, len, &no_ok, &thisclen);
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
 		if (unlikely(clen < 0))
 			return;
 		cbuf = rxbuf + coff;
-		__leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
+		leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
 
 		if (type != DT_DUMB)
 			break;
@@ -952,7 +952,7 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 	int coff, clen, thisclen;
 
 	case NONE:
-		__leftover(fde, len, &no_ok, &thisclen);
+		leftover(fde, len, &no_ok, &thisclen);
 		break;
 	case POST:
 		clen = parse_post(rxbuf, &coff, &key);
@@ -961,7 +961,7 @@ int tinyhttpd_read(int fd, struct nm_targ *targ)
 			return 0;
 		}
 		cbuf = rxbuf + coff;
-		__leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
+		leftover_post(fde, len, clen, coff, &thisclen, &no_ok);
 
 		if (db->type == DT_DUMB) {
 			int pm = is_pm(db);
