@@ -1269,7 +1269,7 @@ main(int argc, char **argv)
 			garg.extmem_siz = atol(optarg) * 1000000; // MB to B
 			// believe 90 % is available for bufs
 			garg.extra_bufs =
-			    (garg.extmem_siz / NETMAP_BUF_SIZE) / 10 * 9;
+			    (garg.extmem_siz * 9 /10) / NETMAP_BUF_SIZE;
 			dbargs->size = garg.extra_bufs * 8 * 2;
 			D("extra_bufs request %u", garg.extra_bufs);
 			break;

@@ -1229,8 +1229,6 @@ netmap_eventloop(char *ifname, void **ret, int *error, int *fds, int fdnum,
 	g->fdnum = fdnum;
 	*ret = g;
 
-	g->extra_bufs = g->extmem_siz / 2048;
-
 	for (i = 0; i < fdnum; i++) {
 		if (do_setsockopt(fds[i]) < 0) {
 			perror("setsockopt");
