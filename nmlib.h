@@ -22,6 +22,8 @@
 	printf(""fmt"\n", ##__VA_ARGS__)
 #endif
 
+int normalize = 1;
+
 #define MAX_IFNAMELEN	64
 #define VIRT_HDR_1	10	/* length of a base vnet-hdr */
 #define VIRT_HDR_2	12	/* length of the extenede vnet-hdr */
@@ -85,7 +87,7 @@ tx_output(struct my_ctrs *cur, double delta, const char *msg)
 	abs = cur->pkts / (double)(cur->events);
 
 	printf("Speed: %spps Bandwidth: %sbps (raw %sbps). Average batch: %.2f pkts\n",
-		norm(b1, pps), norm(b2, bw), norm(b3, raw_bw), abs);
+		norm(b1, pps, normalize), norm(b2, bw, normalize), norm(b3, raw_bw, normalize), abs);
 }
 
 struct nm_msg {
@@ -135,6 +137,7 @@ struct nm_garg {
 	int fdnum;
 	int emu_delay;
 	void *garg_private;
+	char ifname2[MAX_IFNAMELEN];
 };
 
 struct nm_targ {
@@ -477,13 +480,13 @@ nm_main_thread(struct nm_garg *g)
 			ppsdev = sqrt(ppsdev);
 
 			snprintf(b4, sizeof(b4), "[avg/std %s/%s pps]",
-				 norm(b1, ppsavg), norm(b2, ppsdev));
+				 norm(b1, ppsavg, normalize), norm(b2, ppsdev, normalize));
 		}
 
 		D("%spps %s(%spkts %sbps in %llu usec) %.2f avg_batch %d min_space",
-			norm(b1, pps), b4,
-			norm(b2, (double)x.pkts),
-			norm(b3, (double)x.bytes*8),
+			norm(b1, pps, normalize), b4,
+			norm(b2, (double)x.pkts, normalize),
+			norm(b3, (double)x.bytes*8, normalize),
 			(unsigned long long)usec,
 			abs, (int)cur.min_space);
 		prev = cur;
@@ -598,11 +601,6 @@ nm_start(struct nm_garg *g)
 		D("Invalid name '%s': %s", g->ifname, errmsg);
 		return -EINVAL;
 	}
-	if (strlen(base_nmd.req.nr_extname) > 0) {
-		strncpy(req.nr_extname, base_nmd.req.nr_extname,
-				sizeof(req.nr_extname));
-		bzero(base_nmd.req.nr_extname, sizeof(base_nmd.req.nr_extname));
-	}
 
 	/*
 	 * Open the netmap device using nm_open().
@@ -675,6 +673,37 @@ nm_start(struct nm_garg *g)
 			struct netmap_ring *ring = NETMAP_RXRING(nifp, i);
 			D("   RX%d at 0x%p slots %d", i,
 			    (void *)((char *)ring - (char *)nifp), ring->num_slots);
+		}
+	}
+
+	if (g->ifname2[0] != '\0') {
+		struct nmreq req;
+		u_int memid;
+		int error;
+
+		bzero(&req, sizeof(req));
+		req.nr_version = NETMAP_API;
+		strncpy(req.nr_name, g->ifname, sizeof(req.nr_name));
+		error = ioctl(g->main_fd, NIOCGINFO, &req);
+		if (error < 0) {
+			perror("ioctl");
+			nm_close(g->nmd);
+			g->main_fd = -1;
+		}
+		memid = req.nr_arg2;
+		D("mem_id %u", memid);
+
+		bzero(&req, sizeof(req));
+		req.nr_version = NETMAP_API;
+		req.nr_cmd = NETMAP_BDG_ATTACH;
+		req.nr_flags = NR_REG_ALL_NIC;
+		req.nr_arg1 = NETMAP_BDG_HOST;
+		req.nr_arg2 = memid;
+		strncpy(req.nr_name, g->ifname2, sizeof(req.nr_name));
+		error = ioctl(g->main_fd, NIOCREGIF, &req);
+		if (error < 0) {
+			nm_close(g->nmd);
+			g->main_fd = -1;
 		}
 	}
 
@@ -1240,7 +1269,6 @@ netmap_eventloop(char *ifname, void **ret, int *error, int *fds, int fdnum,
 	signal(SIGPIPE, SIG_IGN);
 
 	if (ifname && strlen(ifname)) {
-		char *p = g->ifname;
 		struct nm_ifreq *ifreq = &g->ifreq;
 
 		if (strlen(ST_NAME) + 1 + strlen(ifname) > ST_NAME_MAX) {
@@ -1248,7 +1276,8 @@ netmap_eventloop(char *ifname, void **ret, int *error, int *fds, int fdnum,
 			*error = -EINVAL;
 			return;
 		}
-		strcat(strcat(strcpy(p, ST_NAME), "+"), ifname);
+		strncpy(g->ifname, ST_NAME, sizeof(g->ifname));
+		strncpy(g->ifname2, ifname, sizeof(g->ifname2));
 
 		/* pre-initialize ifreq for accept() */
 		bzero(ifreq, sizeof(*ifreq));
