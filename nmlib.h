@@ -633,7 +633,7 @@ nm_start(struct nm_garg *g)
 	}
 
 	g->main_fd = g->nmd->fd;
-	D("mapped %lu at %p", g->nmd->req.nr_memsize>>10, g->nmd->mem);
+	D("mapped %lu at %p", (unsigned long)g->nmd->req.nr_memsize>>10, g->nmd->mem);
 
 	if (g->virt_header) {
 		/* Set the virtio-net header length, since the user asked
@@ -758,7 +758,7 @@ out:
 
 
 #define IPV4TCP_HDRLEN	66
-static int
+static inline int
 netmap_sendmsg (struct nm_msg *msgp, void *data, size_t len)
 {
 	struct nm_targ *t = msgp->targ;
@@ -825,7 +825,6 @@ netmap_copy_out(struct nm_msg *nmsg)
 static int inline
 netmap_swap_out(struct nm_msg *nmsg)
 {
-	struct netmap_ring *ring = nmsg->rxring;
 	struct netmap_slot *slot = nmsg->slot, *extra, tmp;
 	struct nm_targ *t = nmsg->targ;
 	uint32_t extra_i = netmap_extra_next(t, (size_t *)&t->extra_cur, 0);
@@ -888,19 +887,19 @@ wait_ns(long ns)
 }
 #endif /* WITH_CLFLUSHOPT */
 
-static int
+static void
 do_nm_ring(struct nm_targ *t, int ring_nr)
 {
-	struct nm_garg *g;
 	struct netmap_ring *rxr = NETMAP_RXRING(t->nmd->nifp, ring_nr);
 	struct netmap_ring *txr = NETMAP_TXRING(t->nmd->nifp, ring_nr);
 	u_int const rxtail = rxr->tail;
 	u_int rxcur = rxr->cur;
+#ifdef WITH_CLFLUSHOPT
+	struct nm_garg *g;
+#endif /* WITH_CLFLUSHOPT*/
 
 	for (; rxcur != rxtail; rxcur = nm_ring_next(rxr, rxcur)) {
 		struct netmap_slot *rxs = &rxr->slot[rxcur];
-		int off, len, o = IPV4TCP_HDRLEN;
-		int *fde = &t->fdtable[rxs->fd];
 		struct nm_msg m = {.rxring = rxr, .txring = txr, .slot = rxs, .targ = t} ;
 
 		/*
@@ -920,7 +919,6 @@ do_nm_ring(struct nm_targ *t, int ring_nr)
 		wait_ns(g->emu_delay);
 	}
 #endif /* WITH_CLFLUSHOPT */
-
 }
 
 static int

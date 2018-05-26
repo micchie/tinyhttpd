@@ -523,6 +523,7 @@ pack(uint32_t idx, uint16_t off, uint16_t len)
 }
 
 
+#ifdef WITH_BPLUS
 static struct netmap_slot *
 set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 {
@@ -545,6 +546,7 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 	txr->cur = txr->head = nm_ring_next(txr, txr->cur);
 	return txs;
 }
+#endif /* WITH_BPLUS */
 
 enum slot {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 
@@ -1154,6 +1156,7 @@ tinyhttpd_thread(struct nm_targ *targ)
 		D("error on init_db");
 		return ENOMEM;
 	}
+	return 0;
 }
 
 void
