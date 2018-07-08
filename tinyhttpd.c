@@ -117,17 +117,6 @@ user_clock_gettime(struct timespec *ts)
 #define min(a, b) (((a) < (b)) ? (a) : (b)) 
 #define max(a, b) (((a) > (b)) ? (a) : (b)) 
 
-#ifndef linux
-#define SOL_TCP	SOL_SOCKET
-#define fallocate(a, b, c, d)	posix_fallocate(a, c, d)
-#define mempcpy(d, s, l)	(memcpy(d, s, l) + l)
-#endif
-
-#ifndef D
-#define D(fmt, ...) \
-	printf(""fmt"\n", ##__VA_ARGS__)
-#endif
-
 #define EPOLLEVENTS 2048
 #define MAXQUERYLEN 32767
 
@@ -464,12 +453,6 @@ parse_post(char *post, int *coff, uint64_t *key)
 	return clen;
 }
 
-static inline uint64_t
-parse_get_key(char *get)
-{
-	return *(uint64_t *)(get + GET_LEN + 1); // jump '/'
-}
-
 static void
 usage(void)
 {
@@ -508,6 +491,20 @@ writesync(char *buf, ssize_t len, size_t space, int fd, size_t *pos, int fdsync)
 	return 0;
 }
 
+static inline uint64_t
+pack(uint32_t idx, uint16_t off, uint16_t len)
+{
+	return (uint64_t)idx << 32 | off<< 16 | len;
+}
+
+#define KVS_SLOT_OFF 8
+#ifdef WITH_BPLUS
+static inline uint64_t
+parse_get_key(char *get)
+{
+	return *(uint64_t *)(get + GET_LEN + 1); // jump '/'
+}
+
 static inline void
 unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 {
@@ -516,14 +513,6 @@ unpack(uint64_t p, uint32_t *idx, uint16_t *off, uint16_t *len)
 	*len = p & 0x000000000000ffff;
 }
 
-static inline uint64_t
-pack(uint32_t idx, uint16_t off, uint16_t len)
-{
-	return (uint64_t)idx << 32 | off<< 16 | len;
-}
-
-
-#ifdef WITH_BPLUS
 static struct netmap_slot *
 set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 {
@@ -546,7 +535,6 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 	txr->cur = txr->head = nm_ring_next(txr, txr->cur);
 	return txs;
 }
-#endif /* WITH_BPLUS */
 
 enum slot {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 
@@ -582,17 +570,17 @@ whose_slot(struct netmap_slot *slot, struct netmap_ring *ring,
 
 //POST http://www.micchie.net/ HTTP/1.1\r\nHost: 192.168.11.3:60000\r\nContent-Length: 1280\r\n\r\n2
 //HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nServer: //Apache/2.2.800\r\nContent-Length: 1280\r\n\r\n
-#define KVS_SLOT_OFF 8
-static inline void
-embed(struct netmap_slot *slot, char *buf)
-{
-	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
-}
-
 static inline struct netmap_slot*
 unembed(char *nmb, u_int coff)
 {
 	return *(struct netmap_slot **)(nmb + coff + KVS_SLOT_OFF);
+}
+#endif /* WITH_BPLUS */
+
+static inline void
+embed(struct netmap_slot *slot, char *buf)
+{
+	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
 }
 
 #if 0
@@ -732,6 +720,7 @@ leftover(int *fde, const ssize_t len, int *is_leftover, int *thisclen)
 		RD(1, "bad leftover %d", *fde);
 		*fde = 0;
 	} else if (*fde > 0) {
+		D("still have leftover %d", *fde);
 		*is_leftover = 1;
 	}
 	*thisclen = len;
@@ -1409,6 +1398,7 @@ main(int argc, char **argv)
 		x->tv_sec = garg.polltimeo / 1000;
 		x->tv_nsec = (garg.polltimeo % 1000) * 1000000;
 		garg.polltimeo_ts = x;
+		D("tv_sec %lu tv_nsec %lu", x->tv_sec, x->tv_nsec);
 	}
 #endif /* FreeBSD */
 	netmap_eventloop(tg.ifname, (void **)&g, &error, &tg.sd, 1,
@@ -1430,7 +1420,7 @@ close_socket:
 	}
 	free_if_exist(tg.http);
 #ifdef __FreeBSD__
-	free_if_exist(g.polltimeo_ts);
+	free_if_exist(garg.polltimeo_ts);
 #endif
 	return 0;
 }

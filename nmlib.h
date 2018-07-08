@@ -30,6 +30,12 @@ int normalize = 1;
 #define VIRT_HDR_MAX	VIRT_HDR_2
 #define MAP_HUGETLB	0x40000
 #define EPOLLEVENTS 2048
+#define DEBUG_SOCKET	1
+#ifndef linux
+#define SOL_TCP	SOL_SOCKET
+#define fallocate(a, b, c, d)	posix_fallocate(a, c, d)
+#define mempcpy(d, s, l)	(memcpy(d, s, l) + l)
+#endif
 
 enum dev_type { DEV_NONE, DEV_NETMAP, DEV_SOCKET };
 enum { TD_TYPE_SENDER = 1, TD_TYPE_RECEIVER, TD_TYPE_OTHER, TD_TYPE_DUMMY };
@@ -193,6 +199,7 @@ sigint_h(int sig)
 	(void)sig;	/* UNUSED */
 	D("received control-C on thread %p", (void *)pthread_self());
 	for (i = 0; i < global_nthreads; i++) {
+		D("canceling targs[i] %p", &targs[i]);
 		targs[i].cancel = 1;
 	}
 }
@@ -443,8 +450,9 @@ nm_main_thread(struct nm_garg *g)
 			cur.events += targs[i].ctr.events;
 			cur.min_space += targs[i].ctr.min_space;
 			targs[i].ctr.min_space = 99999;
-			if (targs[i].used == 0)
+			if (targs[i].used == 0) {
 				done++;
+			}
 		}
 		x.pkts = cur.pkts - prev.pkts;
 		x.bytes = cur.bytes - prev.bytes;
@@ -988,6 +996,11 @@ netmap_worker(void *data)
 	struct nm_garg *g = t->g;
 	struct nm_desc *nmd = t->nmd;
 	struct pollfd pfd[2] = {{ .fd = t->fd }}; // XXX make variable size
+#if DEBUG_SOCKET
+	int acceptfds[DEFAULT_NFDS];
+
+	bzero(acceptfds, sizeof(acceptfds));
+#endif /* DEBUG_SOCKET */
 
 	if (g->thread) {
 		int error = g->thread(t);
@@ -1077,6 +1090,7 @@ netmap_worker(void *data)
 			u_int i;
 			struct nm_msg msg;
 			struct netmap_slot slot;
+			int n;
 
 			pfd[0].fd = t->fd;
 			pfd[0].events = POLLIN;
@@ -1085,7 +1099,8 @@ netmap_worker(void *data)
 				pfd[i+1].fd = t->g->fds[i];
 				pfd[i+1].events = POLLIN;
 			}
-			if ((poll(pfd, i+1, t->g->polltimeo)) < 0) {
+			n = poll(pfd, i+1, t->g->polltimeo);
+			if (n < 0) {
 				perror("poll");
 				goto quit;
 			}
@@ -1110,13 +1125,15 @@ netmap_worker(void *data)
 				memcpy(ifreq->data, &newfd, sizeof(newfd));
 				if (ioctl(t->fd, NIOCCONFIG, ifreq)) {
 					perror("ioctl");
-					close(newfd);
+					if (errno == -ENOMEM) {
+						perror("ioctl");
+						close(newfd);
 close_pfds:
-					for (i = 1; i < g->fdnum; i++) {
-						close(pfd[i].fd);
+						for (i = 1; i < g->fdnum; i++) {
+							close(pfd[i].fd);
+						}
+						goto quit;
 					}
-					/* be conservative to this error... */
-					goto quit;
 				}
 				if (unlikely(newfd >= t->fdtable_siz)) {
 					if (fdtable_expand(t)) {
@@ -1127,6 +1144,9 @@ close_pfds:
 				msg.slot = &slot;
 				if (g->connection)
 					g->connection(&msg);
+#if DEBUG_SOCKET
+				acceptfds[newfd] = newfd;
+#endif
 			}
 
 			/* check the netmap fd */
@@ -1174,6 +1194,15 @@ close_pfds:
 			}
 		}
 	}
+#if DEBUG_SOCKET
+	if (t->cancel) {
+		int i;
+		D("canceled, closing sockets");
+		for (i = 0; i < DEFAULT_NFDS; i++) {
+			close(acceptfds[i]);
+		}
+	}
+#endif /* DEBUG_SOCKET */
 quit:
 	free_if_exist(t->extra);
 	free_if_exist(t->fdtable);
@@ -1208,10 +1237,6 @@ do_mmap(int fd, size_t len)
 
 #define ST_NAME "stack:0"
 #define ST_NAME_MAX	64
-
-#define IF_OBJTOTAL	128
-#define RING_OBJTOTAL	512
-#define RING_OBJSIZE	33024
 
 struct netmap_events {
 	void (*data)(struct nm_msg *);
@@ -1254,6 +1279,9 @@ netmap_eventloop(char *ifname, void **ret, int *error, int *fds, int fdnum,
 	g->thread = e->thread;
 	g->fds = fds;
 	g->fdnum = fdnum;
+#ifdef __FreeBSD__
+	g->polltimeo_ts = args->polltimeo_ts;
+#endif /* FreeBSD */
 	*ret = g;
 
 	for (i = 0; i < fdnum; i++) {
