@@ -257,58 +257,6 @@ print_resp(void *get_prm, int n, char **txts, char **col)
 #endif
 
 /* fill rubbish if data is NULL */
-#if 0
-static int
-copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
-		int len, int off0, int off, int fd)
-{
-	u_int const tail = ring->tail;
-	u_int cur = ring->cur;
-	u_int copied = 0;
-	int space = nm_ring_space(ring);
-	struct netmap_slot *slot = &ring->slot[cur];
-	char *p = NETMAP_BUF(ring, slot->buf_idx) + off0 + virt_header;
-
-	__builtin_prefetch(p);
-
-	if (unlikely(space * MAX_PAYLOAD < len)) {
-		RD(1, "no space (%d slots)", space);
-		return -1;
-	}
-
-	/* XXX adjust to real offset */
-	off0 += virt_header;
-	off += virt_header;
-
-	do {
-		u_int next_cur = nm_ring_next(ring, cur);
-		struct netmap_slot *next_slot = &ring->slot[next_cur];
-		char *next_buf = NETMAP_BUF(ring, next_slot->buf_idx) + off;
-		int l = min(MAX_PAYLOAD, len - copied);
-
-		if (data)
-			nm_pkt_copy(data + copied, p, l);
-		else
-			set_rubbish(p, l);
-		slot->len = off0 + l;
-		slot->offset = off - virt_header; // XXX change API...
-		slot->fd = fd;
-		copied += l;
-		off0 = off;
-		cur = next_cur;
-
-		if (copied >= len || unlikely(next_cur == tail))
-			break;
-
-		__builtin_prefetch(next_buf);
-
-		p = next_buf;
-		slot = next_slot;
-	} while (1);
-	ring->cur = ring->head = cur;
-	return len;
-}
-#endif
 static int
 copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		int len, int off0, int off, int fd)
@@ -336,6 +284,8 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 			nm_pkt_copy(data + copied, p, l);
 		}
 		slot->len = off0 + l;
+		if (slot->len == 110)
+			D("off0 %d l %d", off0, l);
 		slot->offset = off - virt_header; // XXX change API...
 		slot->fd = fd;
 		copied += l;
@@ -765,6 +715,7 @@ tinyhttpd_data(struct nm_msg *m)
 	rxbuf = NETMAP_BUF(rxr, rxs->buf_idx) + off;
        	len = rxs->len - off;
 	if (unlikely(len == 0)) {
+		close(rxs->fd);
 		return;
 	}
 
