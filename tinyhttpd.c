@@ -256,7 +256,6 @@ print_resp(void *get_prm, int n, char **txts, char **col)
 }
 #endif
 
-/* fill rubbish if data is NULL */
 static int
 copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 		int len, int off0, int off, int fd)
@@ -264,7 +263,7 @@ copy_to_nm(struct netmap_ring *ring, int virt_header, const char *data,
 	u_int const tail = ring->tail;
 	u_int cur = ring->cur;
 	u_int copied = 0;
-	int space = nm_ring_space(ring);
+	const int space = nm_ring_space(ring);
 
 	if (unlikely(space * MAX_PAYLOAD < len)) {
 		RD(1, "no space (%d slots)", space);
@@ -390,7 +389,7 @@ parse_post(char *post, int *coff, uint64_t *key)
 	*coff = 0;
 	if (unlikely(!p))
 		return -1;
-	pp = p + 16; // "Content-Length: "
+	pp = p + 16; // strlen("Content-Length: ")
 	clen = strtol(pp, &end, 10);
 	if (unlikely(end == pp))
 		return -1;
@@ -489,16 +488,16 @@ set_to_nm(struct netmap_ring *txr, struct netmap_slot *any_slot)
 enum slot {SLOT_UNKNOWN=0, SLOT_EXTRA, SLOT_USER, SLOT_KERNEL};
 
 static inline int
-_between(u_int x, u_int a, u_int b)
+between(u_int x, u_int a, u_int b)
 {
 	return x >= a && x < b;
 }
 
 /* no handle on x > a && x > b */
 static inline int
-_between_wrap(u_int x, u_int a, u_int b)
+between_wrap(u_int x, u_int a, u_int b)
 {
-	return a <= b ? _between(x, a, b) : !_between(x, b, a);
+	return a <= b ? between(x, a, b) : !between(x, b, a);
 }
 
 #define U(x)	((uintptr_t)(x))
@@ -506,12 +505,12 @@ static inline int
 whose_slot(struct netmap_slot *slot, struct netmap_ring *ring,
 		struct netmap_slot *extra, u_int extra_num)
 {
-	if (_between(U(slot), U(ring->slot), U(ring->slot + ring->num_slots))) {
-		if (_between_wrap(slot - ring->slot, ring->head, ring->tail))
+	if (between(U(slot), U(ring->slot), U(ring->slot + ring->num_slots))) {
+		if (between_wrap(slot - ring->slot, ring->head, ring->tail))
 			return SLOT_USER;
 		else
 			return SLOT_KERNEL;
-	} else if (_between(U(slot), U(extra), U(extra + extra_num))) {
+	} else if (between(U(slot), U(extra), U(extra + extra_num))) {
 		return SLOT_EXTRA;
 	}
 	return SLOT_UNKNOWN; // not on ring or extra, maybe kernel's extra
@@ -532,16 +531,6 @@ embed(struct netmap_slot *slot, char *buf)
 {
 	*(struct netmap_slot **)(buf + KVS_SLOT_OFF) = slot;
 }
-
-#if 0
-static inline int
-str_to_key(uint64_t *k)
-{
-	char c[8];
-	strncpy(c, (char *)k, sizeof(c));
-	return atoi(c);
-}
-#endif /* 0 */
 
 #ifdef WITH_BPLUS
 static inline void
